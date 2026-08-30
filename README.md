@@ -246,6 +246,7 @@ Below the graph: per-interface rates with 60-second sparklines, four-hop latency
 | Guide | What's in it |
 |-------|--------------|
 | **[Feature reference](docs/REFERENCE.md)** | Every keybinding, the display-filter language, protocol decoder list, themes, and config options. |
+| **[Configuration](docs/REFERENCE.md#configuration)** | The config file's location and every key in it, with defaults — including `graph_style` / `graph_fade` for the btop-style braille charts. |
 | **[TLS 1.3 decryption](docs/REFERENCE.md#tls-13-decryption)** | How `SSLKEYLOGFILE` decryption works, supported cipher suites, and what it can and can't read. |
 | **[Threat hunting with JA4](docs/REFERENCE.md#threat-hunting-with-ja4)** | Fingerprinting clients and pivoting across flows. |
 | **[Security &amp; the Landlock sandbox](docs/REFERENCE.md#security--forensics)** | The threat model, capability dropping, and the filesystem allow-list. |

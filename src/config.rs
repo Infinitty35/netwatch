@@ -58,9 +58,11 @@ pub struct NetwatchConfig {
     #[serde(default = "default_view")]
     pub view: String,
 
-    /// Hero-panel graph style (bars, btop). Applies only to the aggregated
-    /// RX/TX charts on the dashboard and interfaces tabs; in-row sparklines
-    /// always use the default `bars` style regardless of this setting.
+    /// Chart style for every sparkline in the app (`bars` or `dots`) —
+    /// aggregate RX/TX panels, in-row connection lines, RTT history,
+    /// timeline layers and Lite's charts all route through `graph::render`.
+    /// The Dense view's mirrored throughput plot is the exception: it is
+    /// braille unconditionally and reads neither this nor `graph_fade`.
     pub graph_style: String,
 
     /// btop-style fade + faint grid effect. When `true`, every chart in

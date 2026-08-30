@@ -56,8 +56,8 @@ Wireshark uses. It is read-only and debugging-oriented: it decrypts traffic *you
 never third-party or malware traffic.
 
 ```bash
-# 1. Set the keylog path in Settings (,) → "TLS keylog", or in your config.
-#    Default starter path is /tmp/sslkeylog.txt.
+# 1. Point netwatch at a keylog file: set `tls_keylog_path` in your config
+#    (see Configuration). Empty by default — nothing is decrypted until you set it.
 
 # 2. Launch the client with the SAME path:
 SSLKEYLOGFILE=/tmp/sslkeylog.txt curl https://example.com
@@ -424,20 +424,111 @@ foreground and background use your terminal's own defaults. If you theme your wh
 with pywal, matugen, or a terminal profile, this is the one that follows along. It's also
 accepted under the names `system` and `ansi` in a config file.
 
+Chart rendering is a separate axis from the theme: `graph_style = "dots"` swaps every
+sparkline's solid blocks for the btop-style braille area plot, and `graph_fade = true` adds
+the fade and grid. Both live in [Configuration](#configuration).
+
 ---
 
 ## Configuration
 
-NetWatch runs well with zero setup, but you can persist preferences for theme, default tab,
-refresh rate, capture interface, GeoIP database paths, TLS keylog path, packet-follow
-behavior, BPF filter, and alert thresholds.
+NetWatch runs with zero setup — every key below has a working default, and the file doesn't
+exist until you write one.
+
+| Platform | Config file |
+|----------|-------------|
+| Linux | `~/.config/netwatch/config.toml` |
+| macOS | `~/Library/Application Support/netwatch/config.toml` |
+| Windows | `%APPDATA%\netwatch\config.toml` |
+
+Two ways to write it. From the shell:
 
 ```bash
-netwatch --generate-config
+netwatch --generate-config    # writes every key at its default value, then exits
 ```
 
-That writes a starter config to your platform config directory. You can also edit settings
-live with `,` and save with `S`.
+Or live in the TUI: `,` opens Settings, `↑`/`↓` moves, `←`/`→` cycles the enum-valued rows
+(theme, view, default tab, graph style, graph fade, sandbox, group folding), `Enter` edits
+the free-text ones, `S` saves. Most changes apply the moment you make them — `sandbox` is the
+exception, because Landlock and dropped capabilities can't be undone inside a running
+process, so it takes effect on the next launch.
+
+A hand-edited file can't cost you the tool: missing keys fall back to their defaults,
+out-of-range numbers are clamped, and an unrecognised value falls back rather than refusing
+to start.
+
+### Appearance
+
+| Key | Default | Values | What it does |
+|-----|---------|--------|--------------|
+| `theme` | `"dark"` | `dark` `terminal` `ocean` `solarized` `dracula` `nord` `sky` `paper` | Color theme. `terminal` is also accepted as `system` or `ansi`. See [Themes](#themes). |
+| `view` | `"full"` | `full` `lite` `dense` | Which view starts. `--view` overrides it for one run; an unknown name falls back to `full`. |
+| `default_tab` | `"dashboard"` | `dashboard` `connections` `interfaces` `packets` `stats` `topology` `timeline` `processes` `insights` | Tab shown on launch in the full view. |
+| `graph_style` | `"bars"` | `bars` `dots` | Chart rendering for every sparkline in the app. `bars` is solid blocks; `dots` is the btop-style braille area plot, four times the vertical resolution in the same cells. |
+| `graph_fade` | `false` | `true` `false` | The other half of the btop look: columns fade right-bright to left-dim (newest at full intensity, oldest at ~30%), over a faint dot grid that makes magnitude easier to read. |
+| `groups_start_collapsed` | `true` | `true` `false` | Whether the grouped tables (Connections, Egress) open folded. Folded answers "what is on this machine" in one glance; `false` is closer to the old flat tables. |
+
+**The btop look**, both keys together:
+
+```toml
+graph_style = "dots"
+graph_fade  = true
+```
+
+Two notes on where `graph_style` reaches. It governs *every* chart routed through the graph
+module — the aggregate RX/TX panels, per-interface sparklines, in-row connection lines, RTT
+history, timeline severity layers, and Lite's charts — from v0.28.0 onward; before that, Lite
+hardcoded blocks and ignored it. The Dense view's mirrored throughput graph is the one thing
+it doesn't touch: that plot is braille unconditionally, at two samples per cell column, and
+reads neither key. If braille is what you're after and you have the terminal for it,
+`netwatch --view dense` gets you there with no configuration at all.
+
+### Refresh and capture
+
+| Key | Default | Values | What it does |
+|-----|---------|--------|--------------|
+| `refresh_rate_ms` | `1000` | 100–5000 | Tick rate in milliseconds. Values outside the range are clamped, not rejected. |
+| `capture_interface` | `""` | interface name | Interface to capture on, e.g. `"en0"`. Empty auto-detects. |
+| `bpf_filter` | `""` | BPF expression | Capture filter applied at the kernel, e.g. `"tcp port 443"`. Empty captures everything. |
+| `packet_follow` | `true` | `true` `false` | Auto-scroll the Packets tab to newest. |
+| `timeline_window` | `"5m"` | `1m` `5m` `15m` `30m` `1h` | Timeline tab's default window. |
+| `tls_keylog_path` | `""` | file path | NSS keylog file to read session secrets from, for [TLS decryption](#tls-13--12-decryption). Config-file only — there is no Settings row for it. |
+
+### GeoIP
+
+| Key | Default | Values | What it does |
+|-----|---------|--------|--------------|
+| `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
+| `geoip_db` | `""` | file path | MaxMind GeoLite2-City or GeoLite2-Country `.mmdb`. Empty falls back to online ip-api.com lookups. |
+| `geoip_asn_db` | `""` | file path | MaxMind GeoLite2-ASN `.mmdb`, for AS numbers. Optional. |
+
+### Security
+
+| Key | Default | Values | What it does |
+|-----|---------|--------|--------------|
+| `sandbox` | `"on"` | `on` `strict` `off` | Sandbox enforcement. `on` is best-effort, `strict` refuses to start if the platform backend can't apply it, `off` skips it. `--no-sandbox` and `--sandbox-strict` override for one run. Applies at next launch. See [the Landlock sandbox](#landlock-sandbox-linux). |
+| `egress_violation_cooldown_secs` | `300` | seconds | How long before the same violating flow — one (process, destination, port) — warns again on egress policy drift. `0` warns on every refresh. Config-file only. |
+
+### Alerts
+
+Under a `[alerts]` table:
+
+```toml
+[alerts]
+bandwidth_threshold   = 100000000   # bytes/sec; 0 disables
+port_scan_threshold   = 20          # distinct ports within the window
+port_scan_window_secs = 30          # detection window
+```
+
+`port_scan_window_secs` is config-file only; the other two have Settings rows.
+
+### AI Insights
+
+| Key | Default | Values | What it does |
+|-----|---------|--------|--------------|
+| `insights_enabled` | `false` | `true` `false` | Enables the Insights tab. Opt-in — see [AI Insights](#ai-insights). |
+| `insights_model` | `"llama3.2"` | model name | Model for the Ollama or cloud endpoint. |
+| `insights_endpoint` | `"local"` | `local` or base URL | `local` means `http://localhost:11434`; anything else is used as a base URL. |
 
 ---
 
@@ -449,7 +540,7 @@ rendered in the TUI: anomalies, beaconing patterns, suspicious DNS, health regre
 
 Enable via Settings (`,`) → AI Insights. Supports local [Ollama](https://ollama.com)
 (default), a remote Ollama host, or Ollama **cloud models** — no API keys in NetWatch. See
-[INSIGHTS.md](../INSIGHTS.md) for setup.
+[INSIGHTS.md](INSIGHTS.md) for setup.
 
 ---
 
