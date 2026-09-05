@@ -58,21 +58,26 @@ pub struct NetwatchConfig {
     #[serde(default = "default_view")]
     pub view: String,
 
-    /// Chart style for every sparkline in the app (`bars` or `dots`) —
-    /// aggregate RX/TX panels, in-row connection lines, RTT history,
-    /// timeline layers and Lite's charts all route through `graph::render`.
-    /// The Dense view's mirrored throughput plot is the exception: it is
-    /// braille unconditionally and reads neither this nor `graph_fade`.
+    /// Chart style for every sparkline in the app (`dots` or `bars`) —
+    /// hero tiles, in-row connection lines, RTT history, timeline layers and
+    /// Lite's charts all route through `graph::render`.
+    ///
+    /// `dots` is the default and is the braille area plot the Dense view and
+    /// the Dashboard's throughput graph draw: two samples per cell column, so
+    /// a sparkline carries twice the history in the same width. `bars` is the
+    /// pre-v0.21 block look, kept for terminals whose font has no braille
+    /// coverage — there the area plot renders as empty boxes.
     pub graph_style: String,
 
-    /// btop-style fade + faint grid effect. When `true`, every chart in
-    /// the app — hero RX/TX panels, in-row sparklines, RTT history,
-    /// timeline severity layers — renders columns with progressively
-    /// dimmer color from right (newest, full intensity) to left (oldest,
-    /// ~30% intensity), and overlays a faint dot grid behind the data so
-    /// the magnitude is easier to read. Off by default; the solid-color
-    /// look matches the original UI exactly.
-    #[serde(default)]
+    /// The magnitude gradient. When `true`, every chart colours each cell by
+    /// how high it sits — dim at the baseline, the series colour in the
+    /// middle, lightened at the peak — and overlays a faint dot grid so the
+    /// magnitude is easier to read.
+    ///
+    /// On by default: it is what makes a filled area read as depth rather
+    /// than as a block. Themes that defer to the terminal palette switch it
+    /// off regardless, having no 16-colour gradient to degrade to.
+    #[serde(default = "default_graph_fade")]
     pub graph_fade: bool,
 
     /// Sandbox enforcement mode — `"on"` (best-effort, default),
@@ -121,6 +126,17 @@ fn default_view() -> String {
     "full".into()
 }
 
+/// The braille area plot. `bars` remains selectable for terminals whose font
+/// has no braille coverage.
+fn default_graph_style() -> String {
+    "dots".into()
+}
+
+/// On: the gradient is what makes a filled area read as depth.
+fn default_graph_fade() -> bool {
+    true
+}
+
 fn default_sandbox() -> String {
     "on".into()
 }
@@ -158,8 +174,8 @@ impl Default for NetwatchConfig {
             insights_endpoint: "local".into(),
             theme: "dark".into(),
             view: default_view(),
-            graph_style: "bars".into(),
-            graph_fade: false,
+            graph_style: default_graph_style(),
+            graph_fade: default_graph_fade(),
             sandbox: default_sandbox(),
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
@@ -213,7 +229,7 @@ impl NetwatchConfig {
             self.theme = "dark".into();
         }
         if self.graph_style.is_empty() {
-            self.graph_style = "bars".into();
+            self.graph_style = default_graph_style();
         }
         // An unknown view name falls back to `full` rather than refusing to
         // start: a typo in a config file must not cost you the tool.
@@ -261,7 +277,9 @@ impl NetwatchConfig {
             "topology" => Tab::Topology,
             "timeline" => Tab::Timeline,
             "processes" => Tab::Processes,
-            "insights" => Tab::Insights,
+            // Kept as an alias: the Insights tab folded into Diagnose,
+            // and a config naming it should land somewhere sensible.
+            "diagnose" | "insights" => Tab::Diagnose,
             _ => Tab::Dashboard,
         }
     }

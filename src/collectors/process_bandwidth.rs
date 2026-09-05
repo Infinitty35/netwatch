@@ -104,10 +104,10 @@ impl ProcessBandwidthCollector {
             if conn.state == "LISTEN" || conn.state == "CLOSED" {
                 continue;
             }
-            let name = conn
-                .process_name
-                .clone()
-                .unwrap_or_else(|| format!("pid:{}", conn.pid.map_or(0, |p| p)));
+            let name = crate::collectors::connections::process_label(
+                conn.process_name.as_deref(),
+                conn.pid,
+            );
             let key = (name, conn.pid);
             *process_conns.entry(key.clone()).or_insert(0) += 1;
             total_active += 1;

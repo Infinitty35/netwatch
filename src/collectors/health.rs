@@ -5,7 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-const RTT_HISTORY_MAX: usize = 60;
+// One sample per probe — i.e. one per `HEALTH_PROBE_TICKS` refresh ticks —
+// retained for `HISTORY_WINDOW_SECS`. This was a bare 60, which at a 5-tick
+// probe cadence covered five minutes against the traffic series' ten, so any
+// plot stacking the two had one track that stopped half-way and stayed there.
+const RTT_HISTORY_MAX: usize = crate::app::probe_history_len(1000);
 
 #[derive(Clone)]
 pub struct HealthStatus {
@@ -30,7 +34,7 @@ pub struct HealthStatus {
 /// 1.1.1.1 over 443: anycast (so the RTT reflects the nearest POP rather than
 /// a transcontinental hop), and the same ICMP→TCP fallback as the gateway
 /// probe applies — plenty of networks drop echo but pass TCP.
-const INTERNET_TARGET: &str = "1.1.1.1";
+pub const INTERNET_TARGET: &str = "1.1.1.1";
 
 pub struct HealthProber {
     /// Latest probe results, shared via the `Arc<RwLock<Arc<…>>>` snapshot

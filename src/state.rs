@@ -176,8 +176,17 @@ pub struct AppUiState {
     /// on a single keystroke.
     pub egress_pending_removal: Option<String>,
 
+    /// Dashboard throughput graph on a log scale. Off by default: linear is
+    /// the honest default for a rate. It exists because autoscaling to peak
+    /// means one 200 KB/s spike flattens an hour of 2 KB/s into the zero line,
+    /// and the shape of that hour is the thing worth seeing.
+    pub dashboard_log_scale: bool,
+
     // ── Packet-tab specifics ──
     pub packet_follow: bool,
+    /// Show only packets the expert classifier flagged `Warn` or `Error`.
+    /// A display filter, not a capture one — nothing stops being captured.
+    pub packet_expert_only: bool,
     /// When true, the detail pane grows to fill most of the visible
     /// area (and the packet list shrinks). Toggled with `d`. Useful
     /// when the selected packet has a lot of DPI/JA4 output that
@@ -250,7 +259,9 @@ impl AppUiState {
             connection_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             egress_pending_removal: None,
 
+            dashboard_log_scale: false,
             packet_follow: cfg.packet_follow,
+            packet_expert_only: false,
             packet_detail_expanded: false,
             stream_view_open: false,
             stream_view_index: None,

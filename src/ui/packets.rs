@@ -3,10 +3,58 @@ use crate::collectors::packets::{
     matches_packet, parse_filter, port_label, CapturedPacket, ExpertSeverity, FilterExpr,
     StreamDirection,
 };
+use crate::ui::stream_context;
+use crate::ui::widgets;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
+
+/// Below this the decode and the stream will not both fit, so the decode
+/// takes the row on its own.
+const STREAM_COLUMN_MIN_WIDTH: u16 = 120;
+
+/// Split the lower pane into decode and stream columns.
+///
+/// **This depends on the area and nothing else** — in particular not on the
+/// selected packet. That is the whole point of it being a function.
+///
+/// It used to reserve the stream column only when the selected packet had a
+/// `stream_index`, so arrowing from a TCP packet onto an ARP or ICMP one made
+/// the right-hand panel vanish and the decode double in width, re-wrapping
+/// every line in it. Walking a capture is the primary thing an operator does
+/// on this screen, and the screen rearranged itself under them on every
+/// keypress. A panel that has nothing to say says so; it does not resize its
+/// neighbour.
+fn lower_panes(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < STREAM_COLUMN_MIN_WIDTH {
+        return (area, None);
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+    (cols[0], Some(cols[1]))
+}
+
+/// Split the decode column into protocol detail, payload and hex.
+///
+/// Fixed proportions, for the same reason as [`lower_panes`]: sizing the
+/// protocol box to its own line count made the payload and hex boxes below it
+/// slide up and down by several rows on every arrow keypress, because a dns
+/// reply and a tcp ack do not decode to the same number of lines. The boxes
+/// below have to stay where they are; a decode that overruns its box is a
+/// smaller problem than three boxes that never sit still.
+fn detail_rows(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
+        .split(area)
+}
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // Detail-pane sizing: in default mode the packet list takes most
@@ -24,6 +72,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
+            Constraint::Length(1), // capture control strip
             list_constraint,       // packet list
             detail_constraint,     // detail pane
             Constraint::Length(3), // footer
@@ -32,13 +81,108 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     let packets = app.packet_collector.get_packets();
     render_header(f, app, chunks[0], packets.len());
-    render_packet_list(f, app, &packets, chunks[1]);
+    render_capture_strip(f, app, &packets, chunks[1]);
+    render_packet_list(f, app, &packets, chunks[2]);
     if app.ui.stream_view_open {
-        render_stream_view(f, app, chunks[2]);
+        // `s` opens the full conversation, which wants the whole row.
+        render_stream_view(f, app, chunks[3]);
     } else {
-        render_detail(f, app, &packets, chunks[2]);
+        // Decode on the left, the flow it belongs to on the right. A decoded
+        // packet without its stream is a sentence without the paragraph: the
+        // reply is 41ms, and whether that matters is a property of the other
+        // thirty-seven queries this resolver answered in the last minute.
+        let (detail, stream) = lower_panes(chunks[3]);
+        render_detail(f, app, &packets, detail);
+        if let Some(stream) = stream {
+            render_stream_summary(f, app, &packets, stream);
+        }
     }
-    render_footer(f, app, chunks[3]);
+    render_footer(f, app, chunks[4]);
+}
+
+/// What the capture is doing, on its own row.
+///
+/// This used to be `● CAPTURING on eth0 (N pkts)` appended to the tab bar,
+/// which is what clipped the bar's right corner to `● CA` / `○ ST` at 150
+/// columns. It also never showed drops — and a packet list with no drop
+/// counter cannot be trusted, because a filter matching nothing and a kernel
+/// buffer overflowing look identical on screen.
+fn render_capture_strip(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
+    let t = &app.theme;
+    let capturing = app.packet_collector.is_capturing();
+    let stats = &app.packet_collector.stats;
+
+    let controls = vec![
+        // In demo mode the list holds a recorded conversation, and the strip
+        // is the only place that says so. Every other demo surface carries a
+        // non-suppressible marker for the same reason: packets a viewer can
+        // mistake for their own traffic are worse than no packets.
+        if app.diagnose.is_demo() {
+            crate::ui::widgets::Control::state("capture", "DEMO recorded conversation")
+        } else if capturing {
+            crate::ui::widgets::Control::state("capture", format!("● {}", app.capture_interface))
+        } else {
+            crate::ui::widgets::Control::state(
+                "capture",
+                format!("○ {} stopped", app.capture_interface),
+            )
+        },
+        crate::ui::widgets::Control::state(
+            "filter",
+            match effective_packet_filter(app) {
+                Some(_) => app
+                    .ui
+                    .packet_filter_active
+                    .clone()
+                    .unwrap_or_else(|| app.ui.packet_filter_text.clone()),
+                None => "none".to_string(),
+            },
+        ),
+    ];
+
+    let shown = visible_packets(app, packets).len();
+    let dropped = stats.dropped();
+    let mut meta = vec![
+        Span::styled(
+            format!(
+                "ring {} · {shown} shown · ",
+                crate::collectors::packets::RING_CAPACITY
+            ),
+            Style::default().fg(t.text_muted),
+        ),
+        // Drops are the one number here that changes what the list means, so
+        // they are the one number that takes a colour.
+        Span::styled(
+            format!("drops {dropped}"),
+            Style::default().fg(if dropped > 0 {
+                t.status_warn
+            } else {
+                t.text_muted
+            }),
+        ),
+    ];
+    if capturing {
+        meta.push(Span::styled(
+            format!(" · {} pkt/s", stats.rate_pps()),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+
+    let hints = [
+        crate::ui::widgets::hint("/", "filter"),
+        crate::ui::widgets::hint("s", "stream"),
+        crate::ui::widgets::hint(
+            "x",
+            if app.ui.packet_expert_only {
+                "expert only ✓"
+            } else {
+                "expert only"
+            },
+        ),
+        crate::ui::widgets::hint("c", if capturing { "stop" } else { "capture" }),
+    ];
+
+    crate::ui::widgets::render_control_strip(f, t, area, &controls, meta, &hints);
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
@@ -51,17 +195,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
         Span::styled("○ STOPPED", Style::default().fg(app.theme.text_muted))
     };
 
-    let iface_name = app.capture_interface.as_str();
-
-    let mut extra = vec![
-        Span::raw("  "),
-        cap_status,
-        Span::raw(format!("  on {iface_name}  ({pkt_count} pkts)")),
-    ];
+    // Capture state lives in the control strip below, not up here — this row
+    // is the tab bar, and appending to it is what clipped its right corner.
+    // The BPF filter is a capture-time filter rather than a display one, so it
+    // still rides here where it cannot be confused with `/`.
+    let _ = (cap_status, pkt_count);
+    let mut extra: Vec<Span<'static>> = Vec::new();
     if let Some(ref bpf) = app.bpf_filter_active {
         extra.push(Span::raw("  "));
         extra.push(Span::styled(
-            "BPF: ",
+            "bpf ",
             Style::default().fg(app.theme.key_hint).bold(),
         ));
         extra.push(Span::styled(
@@ -70,7 +213,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
         ));
     }
 
-    if let Some(e) = app.packet_collector.get_error() {
+    // `--demo` seeds the list instead of capturing, so a libpcap failure is
+    // reporting on something the user did not ask for — and it shouted over
+    // eleven packets that are plainly on screen.
+    let capture_error = app
+        .packet_collector
+        .get_error()
+        .filter(|_| !app.diagnose.is_demo());
+    if let Some(e) = capture_error {
         let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
         let lines = vec![
             line1,
@@ -85,24 +235,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect, pkt_count: usize) {
                 .border_style(Style::default().fg(app.theme.border)),
         );
         f.render_widget(header, area);
-    } else if let Some(ref status) = app.ui.export_status {
-        let line1 = crate::ui::widgets::build_header_line(app, Some(extra));
-        let lines = vec![
-            line1,
-            Line::from(vec![
-                Span::raw(" ✓ "),
-                Span::styled(
-                    status.clone(),
-                    Style::default().fg(app.theme.status_good).bold(),
-                ),
-            ]),
-        ];
-        let header = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(app.theme.border)),
-        );
-        f.render_widget(header, area);
+    // No export-status branch here: the toast belongs to the footer, which
+    // draws it for every tab. Packets used to render its own because the
+    // header's copy was suppressed on this tab; with one owner, a second
+    // copy is just the same sentence twice on one screen.
     } else {
         crate::ui::widgets::render_header_with_extra(f, app, area, extra);
     }
@@ -349,38 +485,46 @@ pub fn effective_packet_filter(app: &App) -> Option<FilterExpr> {
 /// Packets visible under the active filter, in capture order. Borrows the
 /// passed slice; callers hold the packet-store guard for its lifetime.
 pub fn visible_packets<'a>(app: &App, packets: &'a [CapturedPacket]) -> Vec<&'a CapturedPacket> {
-    match effective_packet_filter(app) {
-        Some(expr) => packets
-            .iter()
-            .filter(|p| matches_packet(&expr, p))
-            .collect(),
-        None => packets.iter().collect(),
-    }
+    let expr = effective_packet_filter(app);
+    packets
+        .iter()
+        .filter(|p| expr.as_ref().is_none_or(|e| matches_packet(e, p)))
+        .filter(|p| !app.ui.packet_expert_only || is_expert(p))
+        .collect()
+}
+
+/// Whether the expert classifier flagged this packet as something to look at.
+///
+/// `Chat` and `Note` are the ordinary run of a capture — a SYN, a DNS query, a
+/// clean FIN. Only `Warn` and `Error` are findings, and they are what `x`
+/// narrows to and `n` walks between.
+pub fn is_expert(p: &CapturedPacket) -> bool {
+    matches!(p.expert, ExpertSeverity::Warn | ExpertSeverity::Error)
 }
 
 fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
-    let header = Row::new(vec![
-        Cell::from("!").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("#").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Time").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Source").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Destination").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Proto").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Len").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Stream").style(Style::default().fg(app.theme.brand).bold()),
-        Cell::from("Info").style(Style::default().fg(app.theme.brand).bold()),
-    ])
+    let header = Row::new(
+        [
+            "!",
+            "#",
+            "time",
+            "source",
+            "destination",
+            "proto",
+            "len",
+            "stream",
+            "info",
+        ]
+        .map(|h| Cell::from(h).style(Style::default().fg(app.theme.text_muted))),
+    )
     .height(1);
 
-    // Apply display filter (shared with the detail pane and scroll/selection).
-    let filter_expr = effective_packet_filter(app);
-    let filtered: Vec<&CapturedPacket> = match &filter_expr {
-        Some(expr) => packets.iter().filter(|p| matches_packet(expr, p)).collect(),
-        None => packets.iter().collect(),
-    };
+    // One definition of "visible", shared with the detail pane, the capture
+    // strip and scroll/selection. Two of them meant a selection could land on
+    // a packet the list was not drawing.
+    let filtered = visible_packets(app, packets);
 
     let visible_height = area.height.saturating_sub(3) as usize;
-    let total_all = packets.len();
     let total = filtered.len();
 
     let offset = if app.ui.packet_follow && total > visible_height {
@@ -625,16 +769,22 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
             // the fade only touches the cells with explicit colors —
             // looks visually inconsistent across the row.
             let unstyled_fg = fade(Style::default().fg(app.theme.text_primary));
+            // `text_muted` on `selection_bg` is the one combination that does
+            // not survive. The id and stream columns are both muted, so they
+            // vanished on whichever row the cursor was on — the row the reader
+            // is most likely to be looking at, and the one whose id they need
+            // to quote. Lift them for the selected row only.
+            let dim = |s: Style| fade(readable_when_selected(s, selected, &app.theme));
             Row::new(vec![
                 Cell::from(expert_icon).style(fade(expert_style)),
                 Cell::from(pkt.id.to_string())
-                    .style(fade(Style::default().fg(app.theme.text_muted))),
+                    .style(dim(Style::default().fg(app.theme.text_muted))),
                 Cell::from(pkt.timestamp.clone()).style(unstyled_fg),
                 Cell::from(src_display).style(unstyled_fg),
                 Cell::from(dst_display).style(unstyled_fg),
                 Cell::from(pkt.protocol.clone()).style(fade(proto_style)),
                 Cell::from(pkt.length.to_string()).style(unstyled_fg),
-                Cell::from(stream_label).style(fade(Style::default().fg(app.theme.text_muted))),
+                Cell::from(stream_label).style(dim(Style::default().fg(app.theme.text_muted))),
                 // Truncate well above the typical narrow-terminal column
                 // width so ratatui's own column clipping handles narrow
                 // cases, and wide terminals show the full string —
@@ -664,23 +814,56 @@ fn render_packet_list(f: &mut Frame, app: &App, packets: &[CapturedPacket], area
     .header(header)
     .block({
         let bm_count = app.caches.bookmarks.len();
-        let bm_label = if bm_count > 0 {
-            format!(" ★{bm_count}")
-        } else {
-            String::new()
-        };
-        let title = if filter_expr.is_some() {
-            format!(" Packets ({total} / {total_all}){bm_label} ")
-        } else {
-            format!(" Packets ({total_all}){bm_label} ")
-        };
-        Block::default()
-            .title(Line::from(Span::styled(
-                title,
-                Style::default().fg(app.theme.brand).bold(),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border))
+        // Counts and the filter now live in the capture strip; the panel's
+        // metadata carries what the list itself found. `n` is advertised only
+        // when there is somewhere for it to go.
+        let t = &app.theme;
+        let warns = filtered
+            .iter()
+            .filter(|p| p.expert == ExpertSeverity::Warn)
+            .count();
+        let errors = filtered
+            .iter()
+            .filter(|p| p.expert == ExpertSeverity::Error)
+            .count();
+        let mut meta = vec![
+            Span::styled("expert: ", Style::default().fg(t.text_muted)),
+            Span::styled(
+                format!("{warns} warn"),
+                Style::default().fg(if warns > 0 {
+                    t.status_warn
+                } else {
+                    t.text_muted
+                }),
+            ),
+            Span::styled(" · ", Style::default().fg(t.separator)),
+            Span::styled(
+                format!("{errors} error"),
+                Style::default().fg(if errors > 0 {
+                    t.status_error
+                } else {
+                    t.text_muted
+                }),
+            ),
+        ];
+        if warns + errors > 0 {
+            meta.push(Span::styled("  ", Style::default()));
+            meta.push(Span::styled("n", Style::default().fg(t.key_hint).bold()));
+            meta.push(Span::styled(
+                " next expert",
+                Style::default().fg(t.text_muted),
+            ));
+        }
+        if bm_count > 0 {
+            meta.insert(
+                0,
+                Span::styled(format!("★{bm_count} · "), Style::default().fg(t.text_muted)),
+            );
+        }
+        widgets::Panel::new("packets")
+            .meta_styled(meta)
+            .fit(area.width)
+            .block(&app.theme)
     });
 
     f.render_widget(table, area);
@@ -890,6 +1073,63 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
+            // DNS query→reply latency, against the resolver's own baseline.
+            //
+            // A reply that took 41ms is unremarkable on its own and alarming
+            // when the resolver normally answers in 1.2 — and the packet list
+            // is where a reader is looking when they want to know which. The
+            // baseline is the same one the Diagnose tab reasons from, so the
+            // two cannot disagree about what "slow" means here.
+            if let Some(latency) = dns_reply_latency(pkt, packets) {
+                detail_lines.push(Line::from(Span::styled(
+                    "  timing",
+                    Style::default().fg(app.theme.brand).bold(),
+                )));
+                detail_lines.push(Line::from(Span::styled(
+                    format!(
+                        "    query #{} {} → reply +{:.1}ms",
+                        latency.query_id, latency.query_time, latency.ms
+                    ),
+                    Style::default().fg(app.theme.text_primary),
+                )));
+
+                let subject = pkt.src_ip.clone();
+                if let Some(base) =
+                    app.diagnose
+                        .baselines
+                        .get(&subject, "dns.rtt_p50")
+                        .filter(|_| {
+                            app.diagnose
+                                .baselines
+                                .readiness(&subject, "dns.rtt_p50")
+                                .is_ready()
+                        })
+                {
+                    let multiple = if base.mean > 0.0 {
+                        latency.ms / base.mean
+                    } else {
+                        1.0
+                    };
+                    let color = if multiple >= 10.0 {
+                        app.theme.status_error
+                    } else if multiple >= 3.0 {
+                        app.theme.status_warn
+                    } else {
+                        app.theme.text_muted
+                    };
+                    detail_lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    baseline {:.1}ms σ{:.1}", base.mean, base.sigma()),
+                            Style::default().fg(app.theme.text_muted),
+                        ),
+                        Span::styled(
+                            format!(" · {multiple:.0}× baseline"),
+                            Style::default().fg(color),
+                        ),
+                    ]));
+                }
+            }
+
             // TCP handshake timing (if this packet belongs to a stream with handshake data)
             if let Some(stream_idx) = pkt.stream_index {
                 if let Some(stream) = app.packet_collector.get_stream(stream_idx) {
@@ -914,53 +1154,41 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                 }
             }
 
-            // Size the detail pane to the lines we *actually have* —
-            // including geo, whois, TLS-decoded, QUIC-decoded, and
-            // handshake-timing extras appended above. The previous
-            // implementation sized from `pkt.details.len()` only, so
-            // the appended lines (JA4, ECH) were rendered into the
-            // Paragraph but immediately clipped off the bottom.
-            // Cap the Protocol Detail box so the Payload / Hex / ASCII
-            // sub-dialogs below it stay on screen. Compact view caps at
-            // `area - 4`; the expanded (`d`) 3/4 view has a large pane, so
-            // bound the detail box to ~60% and keep showing the same
-            // sub-dialogs as the main view. The decrypted payload lives in
-            // the detail box, but the user still wants the other panes
-            // visible alongside it rather than a protocol-only view.
-            let detail_cap = if app.ui.packet_detail_expanded {
-                (area.height * 3 / 5).max(5)
-            } else {
-                area.height.saturating_sub(4)
-            };
-            let detail_height = (detail_lines.len() as u16 + 2).min(detail_cap);
-            let rows = if has_payload {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(detail_height),
-                        Constraint::Min(3),
-                        Constraint::Min(3),
-                    ])
-                    .split(area)
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(detail_height), Constraint::Min(4)])
-                    .split(area)
-            };
+            // Three boxes, always, at the same three heights. `d` expands
+            // the whole column when a packet decodes to more lines than the
+            // protocol box can hold — that is the affordance for a long
+            // decode, rather than the box quietly growing and shoving the
+            // payload and hex down the screen.
+            let rows = detail_rows(area);
 
+            // Titled with what it is decoding, the way the design names its
+            // detail panes: `#29321 · dns reply` says more than "Protocol
+            // Detail" and costs the same row.
             let proto_detail = Paragraph::new(detail_lines).block(
-                Block::default()
-                    .title(Line::from(Span::styled(
-                        " Protocol Detail ",
+                widgets::Panel::styled(vec![
+                    Span::styled(
+                        format!("#{}", pkt.id),
                         Style::default().fg(app.theme.brand).bold(),
-                    )))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.theme.border)),
+                    ),
+                    Span::styled(
+                        format!(" · {}", pkt.protocol.to_lowercase()),
+                        Style::default().fg(app.theme.text_secondary),
+                    ),
+                ])
+                .meta_styled(vec![
+                    Span::styled(
+                        format!("{} bytes  ", pkt.length),
+                        Style::default().fg(app.theme.text_muted),
+                    ),
+                    Span::styled("y", Style::default().fg(app.theme.key_hint).bold()),
+                    Span::styled(" copy", Style::default().fg(app.theme.text_muted)),
+                ])
+                .fit(rows[0].width)
+                .block(&app.theme),
             );
             f.render_widget(proto_detail, rows[0]);
 
-            if has_payload {
+            {
                 // Payload content. For a TLS flow the on-wire payload is
                 // ciphertext (so `payload_text` is just "[N bytes binary
                 // data]"); when we decrypted it, show the actual plaintext
@@ -995,22 +1223,31 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                             " Payload Content (TLS decrypted) "
                         };
                         (body, title, Style::default().fg(app.theme.status_good))
-                    } else {
+                    } else if has_payload {
                         (
                             pkt.payload_text.clone(),
                             " Payload Content ",
                             Style::default().fg(app.theme.text_primary),
                         )
+                    } else {
+                        // The box stays; only its contents change. Saying
+                        // "headers only" is information — it tells you the
+                        // capture is not truncating anything — and it keeps
+                        // the hex box below at a fixed row.
+                        (
+                            format!("headers only · {} bytes on the wire", pkt.length),
+                            " Payload Content ",
+                            Style::default().fg(app.theme.text_muted),
+                        )
                     };
                 let payload = Paragraph::new(payload_body)
                     .style(payload_style)
                     .block(
-                        Block::default()
+                        widgets::panel_block(&app.theme)
                             .title(Line::from(Span::styled(
                                 payload_title,
                                 Style::default().fg(app.theme.brand).bold(),
                             )))
-                            .borders(Borders::ALL)
                             .border_style(Style::default().fg(app.theme.border)),
                     )
                     .wrap(Wrap { trim: false });
@@ -1023,27 +1260,15 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     .split(rows[2]);
 
                 render_hex_ascii(f, pkt, hex_ascii, &app.theme);
-            } else {
-                // Hex + ASCII side by side (no payload text)
-                let hex_ascii = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .split(rows[1]);
-
-                render_hex_ascii(f, pkt, hex_ascii, &app.theme);
             }
         }
         None => {
             let hint = Paragraph::new(" Select a packet with ↑↓ to inspect")
                 .style(Style::default().fg(app.theme.text_muted))
                 .block(
-                    Block::default()
-                        .title(Line::from(Span::styled(
-                            " Packet Detail ",
-                            Style::default().fg(app.theme.brand).bold(),
-                        )))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(app.theme.border)),
+                    widgets::Panel::new("packet detail")
+                        .fit(area.width)
+                        .block(&app.theme),
                 );
             f.render_widget(hint, area);
         }
@@ -1059,12 +1284,11 @@ fn render_hex_ascii(
     let hex = Paragraph::new(pkt.raw_hex.clone())
         .style(Style::default().fg(theme.status_good))
         .block(
-            Block::default()
+            widgets::panel_block(theme)
                 .title(Line::from(Span::styled(
                     " Hex Dump ",
                     Style::default().fg(theme.brand).bold(),
                 )))
-                .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border)),
         )
         .wrap(Wrap { trim: false });
@@ -1073,12 +1297,11 @@ fn render_hex_ascii(
     let ascii = Paragraph::new(pkt.raw_ascii.clone())
         .style(Style::default().fg(theme.status_warn))
         .block(
-            Block::default()
+            widgets::panel_block(theme)
                 .title(Line::from(Span::styled(
-                    " ASCII ",
+                    " ascii ",
                     Style::default().fg(theme.brand).bold(),
                 )))
-                .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border)),
         )
         .wrap(Wrap { trim: false });
@@ -1193,12 +1416,11 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
             let hint = Paragraph::new(" No stream selected")
                 .style(Style::default().fg(app.theme.text_muted))
                 .block(
-                    Block::default()
+                    widgets::panel_block(&app.theme)
                         .title(Line::from(Span::styled(
                             " Stream View ",
                             Style::default().fg(app.theme.brand).bold(),
                         )))
-                        .borders(Borders::ALL)
                         .border_style(Style::default().fg(app.theme.border)),
                 );
             f.render_widget(hint, area);
@@ -1212,12 +1434,11 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
             let hint = Paragraph::new(format!(" Stream #{stream_index} not found"))
                 .style(Style::default().fg(app.theme.status_error))
                 .block(
-                    Block::default()
+                    widgets::panel_block(&app.theme)
                         .title(Line::from(Span::styled(
                             " Stream View ",
                             Style::default().fg(app.theme.brand).bold(),
                         )))
-                        .borders(Borders::ALL)
                         .border_style(Style::default().fg(app.theme.border)),
                 );
             f.render_widget(hint, area);
@@ -1328,11 +1549,7 @@ fn render_stream_view(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let content = Paragraph::new(visible_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(app.theme.border)),
-        )
+        .block(widgets::panel_block(&app.theme).border_style(Style::default().fg(app.theme.border)))
         .wrap(Wrap { trim: false });
     f.render_widget(content, chunks[1]);
 
@@ -1433,61 +1650,511 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut hints = if app.ui.stream_view_open {
+    use crate::ui::widgets::hint;
+    // State rides in the label of the key that toggles it, rather than in a
+    // `[FOLLOW]` / `[FILTER: …]` badge wedged among the keys. A footer is a
+    // keymap; a bracketed status word in the middle of one reads as a key the
+    // user cannot find.
+    let hints = if app.ui.stream_view_open {
         vec![
-            Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Close  "),
-            Span::styled("→←", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Direction  "),
-            Span::styled("h", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Hex/Text"),
+            hint("esc", "close"),
+            hint("←→", "direction"),
+            hint("h", "hex/text"),
         ]
     } else {
-        let capture_key = if app.packet_collector.is_capturing() {
-            "Stop"
-        } else {
-            "Capture"
-        };
-        vec![
-            Span::styled("c", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(format!(":{capture_key}  ")),
-            Span::styled("i", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Iface  "),
-            Span::styled("/", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Filter  "),
-            Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Stream  "),
-            Span::styled("f", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Follow"),
-        ]
+        // `c` / `/` / `s` / `x` are advertised in the capture strip directly
+        // above; repeating them here would spend the row twice on one keymap.
+        let mut v = vec![hint("n", "next expert"), hint("i", "iface")];
+        v.push(hint(
+            "f",
+            if app.ui.packet_follow {
+                "follow stream"
+            } else {
+                "follow"
+            },
+        ));
+        v.push(hint("w", "write pcap"));
+        v.push(hint("m", "mark"));
+        if !app.caches.bookmarks.is_empty() {
+            v.push(hint("][", "marks"));
+        }
+        v.push(hint("X", "clear"));
+        v
     };
-
-    let follow_indicator = if app.ui.packet_follow {
-        Span::styled(
-            " [FOLLOW]",
-            Style::default().fg(app.theme.status_good).bold(),
-        )
-    } else {
-        Span::raw("")
-    };
-    hints.push(follow_indicator);
-
-    if let Some(ref ft) = app.ui.packet_filter_active {
-        hints.push(Span::styled(
-            " [FILTER: ",
-            Style::default().fg(app.theme.key_hint).bold(),
-        ));
-        hints.push(Span::styled(
-            ft.clone(),
-            Style::default().fg(app.theme.text_primary),
-        ));
-        hints.push(Span::styled(
-            "]",
-            Style::default().fg(app.theme.key_hint).bold(),
-        ));
-    }
 
     crate::ui::widgets::render_footer(f, app, area, hints);
+}
+
+/// Lift a muted style so it stays legible on the selection background.
+///
+/// Muted grey is chosen to recede against the panel background; against
+/// `selection_bg` it recedes all the way to invisible. Only muted is
+/// promoted — a cell that already carries a status or protocol colour is
+/// legible on the band and must keep the colour it is carrying.
+fn readable_when_selected(base: Style, selected: bool, t: &crate::theme::Theme) -> Style {
+    if selected && base.fg == Some(t.text_muted) {
+        return base.fg(t.text_secondary);
+    }
+    base
+}
+
+/// The packet the cursor is on, if it is still in the visible set.
+pub fn selected_packet<'a>(app: &App, packets: &'a [CapturedPacket]) -> Option<&'a CapturedPacket> {
+    let id = app.ui.scroll.packet_selected?;
+    visible_packets(app, packets)
+        .into_iter()
+        .find(|p| p.id == id)
+}
+
+/// The flow the selected packet belongs to: how much of it there is, how long
+/// it took, and — when it is DNS — how this resolver has been behaving.
+///
+/// The resolver block is the reason this panel exists. One reply's latency is
+/// an anecdote; `queries 38 · replies 38 · timeouts 0` with a p50 beside the
+/// learned baseline is the finding, and it is available right here without
+/// leaving the packet the reader is already looking at.
+/// Rows the summary block above the ladder occupies: counters, timing, and
+/// the `sequence` heading with its blank line.
+const SUMMARY_ROWS: usize = 4;
+/// Rows the dns resolver section occupies when the flow is dns.
+const DNS_ROWS: usize = 4;
+
+/// `1.2s`, `340ms` — a duration a reader does not have to convert.
+fn format_duration_ms(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.1}s", ms / 1000.0)
+    } else {
+        format!("{ms:.0}ms")
+    }
+}
+
+/// Columns a rung spends on everything except the label: the cursor marker,
+/// the packet id, the offset, the direction arrow and the byte count.
+const LADDER_FIXED_COLS: usize = 27;
+/// Below this a label says nothing useful, so the panel gives it this much
+/// even when that costs the note its spelled-out form.
+const MIN_LABEL_COLS: usize = 10;
+
+/// The sequence ladder: what happened, in order, around the selected packet.
+///
+/// This is the substance of the panel. A conversation is a sequence, and the
+/// question an operator has when they select a packet mid-capture — "what is
+/// this, and what happened either side of it" — is only answerable by showing
+/// the neighbours. The selected rung is marked and the arrows point away from
+/// whichever end opened the flow, so direction reads consistently down the
+/// column instead of flipping with every packet's src/dst.
+fn ladder_lines<'a>(
+    convo: &stream_context::Conversation,
+    t: &crate::theme::Theme,
+    width: u16,
+) -> Vec<Line<'a>> {
+    use crate::ui::stream_context::Role;
+
+    let mut out: Vec<Line> = vec![Line::raw("")];
+    out.push(Line::from(vec![
+        Span::styled("sequence", Style::default().fg(t.text_secondary)),
+        Span::styled(
+            match convo.position {
+                Some(p) => format!("  packet {p} of {}", convo.total),
+                None => format!("  {} packets", convo.total),
+            },
+            Style::default().fg(t.text_muted),
+        ),
+        // Say when the window is hiding something, so a ladder that starts at
+        // "data" is not mistaken for a conversation with no handshake.
+        Span::styled(
+            match (convo.truncated_above, convo.truncated_below) {
+                (true, true) => "  ⋯ trimmed both ends".to_string(),
+                (true, false) => "  ⋯ earlier packets above".to_string(),
+                (false, true) => "  ⋯ later packets below".to_string(),
+                (false, false) => String::new(),
+            },
+            Style::default().fg(t.text_muted),
+        ),
+    ]));
+
+    // Give the label whatever the fixed columns leave. A hard 20 threw away
+    // the end of every dns summary on a panel with room to spare.
+    //
+    // The note has to be in the budget too, or a rung carrying "retransmit"
+    // runs past the panel edge — and that is the rung most worth reading. On
+    // a panel too narrow to spell it, the note keeps its column as a glyph
+    // rather than being dropped: losing the label's tail costs less than
+    // losing the fact that the segment was resent.
+    let longest_note = convo
+        .rungs
+        .iter()
+        .filter_map(|r| r.note)
+        .map(|n| n.label().chars().count())
+        .max();
+    let (note_w, spell_notes) = match longest_note {
+        None => (0, false),
+        Some(n) => {
+            let spelled = n + 2;
+            if (width as usize) >= LADDER_FIXED_COLS + MIN_LABEL_COLS + spelled {
+                (spelled, true)
+            } else {
+                (3, false)
+            }
+        }
+    };
+    let label_w = (width as usize)
+        .saturating_sub(LADDER_FIXED_COLS + note_w)
+        .clamp(MIN_LABEL_COLS, 44);
+
+    for rung in &convo.rungs {
+        let role_colour = if rung.role.is_alarming() {
+            t.status_error
+        } else if matches!(rung.role, Role::Syn | Role::SynAck | Role::Fin) {
+            t.status_info
+        } else if matches!(rung.role, Role::Ack | Role::Other) {
+            t.text_muted
+        } else {
+            t.text_primary
+        };
+        // The cursor bar is the same mark the issue list and chronology use
+        // for "this is the one you are on".
+        let (marker, base) = if rung.selected {
+            ("▌", Style::default().bg(t.selection_bg))
+        } else {
+            (" ", Style::default())
+        };
+        // Muted grey on the selection background is the one combination that
+        // does not survive: the row the operator is looking at lost its id
+        // and its timestamp.
+        let gutter = if rung.selected {
+            t.text_secondary
+        } else {
+            t.text_muted
+        };
+
+        let mut spans = vec![
+            Span::styled(marker, Style::default().fg(t.brand).bold()),
+            Span::styled(
+                format!("#{:<6}", rung.packet_id),
+                Style::default().fg(gutter),
+            ),
+            Span::styled(
+                format!("{:>8}  ", format_offset(rung.offset_ms)),
+                Style::default().fg(gutter),
+            ),
+            // Arrows point away from the initiator, so a column of → is one
+            // side talking and an alternating column is a conversation.
+            Span::styled(
+                if rung.from_initiator { "→ " } else { "← " },
+                Style::default().fg(if rung.from_initiator {
+                    t.tx_rate
+                } else {
+                    t.rx_rate
+                }),
+            ),
+            Span::styled(
+                format!("{:<label_w$}", truncate_info(&rung.label, label_w)),
+                Style::default().fg(role_colour),
+            ),
+            Span::styled(
+                format!("{:>7}", format_bytes(rung.bytes as u64)),
+                Style::default().fg(gutter),
+            ),
+        ];
+        if let Some(note) = rung.note {
+            spans.push(Span::styled(
+                if spell_notes {
+                    format!("  {}", note.label())
+                } else {
+                    format!("  {}", note.glyph())
+                },
+                Style::default().fg(t.status_warn),
+            ));
+        }
+        out.push(Line::from(spans).style(base));
+    }
+    out
+}
+
+/// Draw the stream panel's body into its inner rect.
+///
+/// The wrap mode is the point of this function existing. `trim: true` strips
+/// leading whitespace from every line, which ate the one-space gutter on each
+/// unselected rung while the selected one's `▌` survived — shifting every
+/// other row of the ladder left by a column, so the arrows no longer formed a
+/// column and the ladder stopped reading as one. The rungs are formatted to
+/// width already; nothing here wants re-trimming.
+fn render_stream_body(f: &mut Frame, lines: Vec<Line>, inner: Rect) {
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(2),
+            ..inner
+        },
+    );
+}
+
+/// Offsets from the conversation's first packet, at a resolution that keeps
+/// a handshake legible without printing six decimals for a long flow.
+fn format_offset(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("+{:.2}s", ms / 1000.0)
+    } else {
+        format!("+{ms:.1}ms")
+    }
+}
+
+fn render_stream_summary(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
+    let t = &app.theme;
+    // The column is reserved whatever the selection, so every one of these
+    // cases has to say something. Three bare `return`s left an unbordered
+    // blank rectangle beside a fully drawn decode, which reads as a panel
+    // that failed to load rather than one with nothing to report — and the
+    // three cases are not the same fact: no selection, a packet that stands
+    // alone, and a conversation that has aged out of the ring are three
+    // different things for an operator to know.
+    let selected = selected_packet(app, packets);
+    let resolved = selected
+        .and_then(|p| p.stream_index)
+        .and_then(|i| app.packet_collector.get_stream(i).map(|s| (i, s)));
+
+    let (Some(pkt), Some((idx, stream))) = (selected, resolved) else {
+        let msg = match selected {
+            None => "Select a packet with ↑↓ to see the conversation it belongs to.",
+            Some(p) if p.stream_index.is_none() => {
+                "This packet stands alone — arp, icmp and broadcast traffic are not \
+                 part of a conversation."
+            }
+            Some(_) => "The conversation this packet belongs to has aged out of the ring.",
+        };
+        f.render_widget(
+            Paragraph::new(msg)
+                .style(Style::default().fg(t.text_muted))
+                .wrap(Wrap { trim: true })
+                .block(widgets::Panel::new("stream").fit(area.width).block(t)),
+            area,
+        );
+        return;
+    };
+
+    let app_label = stream.app_protocol.as_ref().map(app_protocol_summary);
+
+    // The ladder gets whatever rows are left after the summary block and the
+    // dns section, so the panel never asks for more rungs than it can draw.
+    let is_dns = matches!(pkt.protocol.as_str(), "DNS");
+    let overhead = SUMMARY_ROWS + if is_dns { DNS_ROWS } else { 0 };
+    let ladder_rows = (area.height as usize)
+        .saturating_sub(2)
+        .saturating_sub(overhead);
+
+    let convo = stream_context::conversation(&stream, packets, idx, Some(pkt.id), ladder_rows);
+
+    let title = vec![
+        Span::styled(
+            format!("stream #{idx}"),
+            Style::default().fg(t.brand).bold(),
+        ),
+        Span::styled(
+            match (&convo.initiator, &convo.peer) {
+                // Naming the initiator first turns an unordered pair into the
+                // sentence "this end called that one".
+                (Some(a), Some(b)) => format!("  {a} → {b}"),
+                _ => format!("  {} ↔ {}", stream.key.addr_a.0, stream.key.addr_b.0),
+            },
+            Style::default().fg(t.text_secondary),
+        ),
+    ];
+    let inner = widgets::Panel::styled(title)
+        .meta_styled(vec![
+            Span::styled(
+                stream_context::nature(&stream, convo.phase, app_label.as_deref()),
+                Style::default().fg(if convo.phase == stream_context::Phase::Reset {
+                    t.status_error
+                } else {
+                    t.text_muted
+                }),
+            ),
+            Span::styled("  f", Style::default().fg(t.key_hint).bold()),
+            Span::styled(" follow", Style::default().fg(t.text_muted)),
+        ])
+        .fit(area.width)
+        .render(f, t, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Counters first: how much, how long, and whether the flow is healthy.
+    let mut counters = vec![
+        Span::styled(
+            format!("{} packets", stream.packet_count),
+            Style::default().fg(t.text_primary),
+        ),
+        Span::styled(
+            format!(
+                "  ↑{} ↓{}",
+                format_bytes(convo.bytes_out),
+                format_bytes(convo.bytes_in)
+            ),
+            Style::default().fg(t.text_muted),
+        ),
+    ];
+    if convo.duration_ms >= 1.0 {
+        counters.push(Span::styled(
+            format!("  over {}", format_duration_ms(convo.duration_ms)),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    // Retransmits and reordering are the two numbers that change whether you
+    // trust the flow, so they take a colour and are named separately — a
+    // resend and a reorder have different causes.
+    for (n, label) in [
+        (convo.retransmits, "retransmit"),
+        (convo.out_of_order, "out of order"),
+    ] {
+        if n > 0 {
+            counters.push(Span::styled(
+                format!("  {n} {label}{}", if n == 1 { "" } else { "s" }),
+                Style::default().fg(t.status_warn),
+            ));
+        }
+    }
+    let mut lines: Vec<Line> = vec![Line::from(counters)];
+
+    // Timing: the dns round trip when we have it, the tcp handshake otherwise.
+    let timing = match dns_reply_latency(pkt, packets) {
+        Some(l) => Some((format!("{:.1}ms round trip", l.ms), t.text_primary)),
+        None => stream.handshake.as_ref().and_then(|h| {
+            h.total_ms().map(|ms| {
+                let detail = match (h.syn_to_syn_ack_ms(), h.syn_ack_to_ack_ms()) {
+                    (Some(a), Some(b)) => {
+                        format!("{ms:.1}ms handshake  (syn→syn·ack {a:.1}  →ack {b:.1})")
+                    }
+                    _ => format!("{ms:.1}ms handshake"),
+                };
+                (detail, t.text_muted)
+            })
+        }),
+    };
+    if let Some((text, colour)) = timing {
+        lines.push(Line::from(Span::styled(text, Style::default().fg(colour))));
+    }
+
+    lines.extend(ladder_lines(&convo, t, inner.width.saturating_sub(2)));
+
+    // Resolver behaviour over the capture, when this flow is DNS.
+    if matches!(pkt.protocol.as_str(), "DNS") {
+        lines.push(Line::raw(""));
+        let resolver = if pkt.src_port == Some(53) {
+            pkt.src_ip.clone()
+        } else {
+            pkt.dst_ip.clone()
+        };
+        let mine: Vec<&CapturedPacket> = packets
+            .iter()
+            .filter(|p| p.protocol == "DNS" && (p.src_ip == resolver || p.dst_ip == resolver))
+            .collect();
+        let queries = mine.iter().filter(|p| p.dst_ip == resolver).count();
+        let replies = mine.iter().filter(|p| p.src_ip == resolver).count();
+
+        let mut latencies: Vec<f64> = mine
+            .iter()
+            .filter(|p| p.src_ip == resolver)
+            .filter_map(|p| dns_reply_latency(p, packets).map(|l| l.ms))
+            .collect();
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        lines.push(Line::from(vec![
+            Span::styled("resolver ", Style::default().fg(t.text_muted)),
+            Span::styled(resolver.clone(), Style::default().fg(t.text_primary)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "queries {queries} · replies {replies} · unanswered {}",
+                queries.saturating_sub(replies)
+            ),
+            Style::default().fg(t.text_muted),
+        )));
+
+        if !latencies.is_empty() {
+            let pct = |p: f64| latencies[(((latencies.len() - 1) as f64) * p).round() as usize];
+            let mut spans = vec![
+                Span::styled("p50 ", Style::default().fg(t.text_muted)),
+                Span::styled(
+                    format!("{:.0}ms", pct(0.5)),
+                    Style::default().fg(t.text_primary),
+                ),
+                Span::styled("  p95 ", Style::default().fg(t.text_muted)),
+                Span::styled(
+                    format!("{:.0}ms", pct(0.95)),
+                    Style::default().fg(t.text_primary),
+                ),
+            ];
+            if let Some(base) = app
+                .diagnose
+                .baselines
+                .get(&resolver, "dns.rtt_p50")
+                .filter(|_| {
+                    app.diagnose
+                        .baselines
+                        .readiness(&resolver, "dns.rtt_p50")
+                        .is_ready()
+                })
+            {
+                spans.push(Span::styled(
+                    format!("   base p50 {:.1}ms", base.mean),
+                    Style::default().fg(t.text_muted),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    render_stream_body(f, lines, inner);
+}
+
+/// A DNS reply paired with the query it answers.
+pub struct DnsLatency {
+    pub query_id: u64,
+    pub query_time: String,
+    pub ms: f64,
+}
+
+/// Pair a DNS reply with its query and measure the gap.
+///
+/// Matched on the question — name and type — plus reversed endpoints, walking
+/// backwards from the reply. The transaction id would be stronger, but it is
+/// not carried on `AppProtocol::Dns`; the question is unique enough in
+/// practice because a resolver that has two identical questions in flight to
+/// the same client is already the problem being investigated.
+pub fn dns_reply_latency(reply: &CapturedPacket, packets: &[CapturedPacket]) -> Option<DnsLatency> {
+    use crate::dpi::AppProtocol::Dns;
+    let Some(Dns {
+        qname,
+        qtype,
+        rcode: Some(_),
+    }) = &reply.app_protocol
+    else {
+        return None;
+    };
+
+    let query = packets
+        .iter()
+        .rev()
+        .skip_while(|p| p.id >= reply.id)
+        .find(|p| {
+            matches!(
+                &p.app_protocol,
+                Some(Dns { qname: qn, qtype: qt, rcode: None }) if qn == qname && qt == qtype
+            ) && p.src_ip == reply.dst_ip
+                && p.dst_ip == reply.src_ip
+        })?;
+
+    // Capture timestamps are monotonic within a run, but a reply that somehow
+    // precedes its query is a broken pairing rather than a negative latency.
+    let ns = reply.timestamp_ns.checked_sub(query.timestamp_ns)?;
+    Some(DnsLatency {
+        query_id: query.id,
+        query_time: query.timestamp.clone(),
+        ms: ns as f64 / 1_000_000.0,
+    })
 }
 
 fn protocol_color(proto: &str, theme: &crate::theme::Theme) -> Style {
@@ -1554,6 +2221,206 @@ mod tests {
         }
     }
 
+    /// Render the ladder to plain text, the way the panel draws it.
+    fn ladder_text(convo: &stream_context::Conversation, width: u16) -> Vec<String> {
+        let theme = crate::theme::by_name("default");
+        ladder_lines(convo, &theme, width)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn demo_conversation(selected: Option<u64>) -> stream_context::Conversation {
+        let c = crate::collectors::packets::PacketCollector::default();
+        c.seed_demo_capture();
+        let packets = c.get_packets().clone();
+        // Stream #1 is the tls connection seeded by the demo.
+        let stream = c.get_stream(1).expect("the demo seeds a tcp stream");
+        stream_context::conversation(&stream, &packets, 1, selected, 12)
+    }
+
+    /// Every rung lines up. The cursor marker replaces a space rather than
+    /// being inserted before one, so the selected row cannot shift the
+    /// columns of the row above it.
+    #[test]
+    fn the_ladder_columns_line_up_on_every_rung() {
+        let convo = demo_conversation(Some(5));
+        let rows = ladder_text(&convo, 80);
+        let rungs: Vec<&String> = rows.iter().filter(|r| r.contains('#')).collect();
+        assert!(rungs.len() >= 6, "{rows:#?}");
+
+        let arrow_col = |s: &str| {
+            s.chars()
+                .position(|c| c == '→' || c == '←')
+                .unwrap_or_else(|| panic!("no arrow in {s:?}"))
+        };
+        let first = arrow_col(rungs[0]);
+        for r in &rungs {
+            assert_eq!(arrow_col(r), first, "misaligned rung: {r:?}");
+        }
+        assert!(
+            rungs.iter().any(|r| r.starts_with('▌')),
+            "the selected rung is marked: {rungs:#?}"
+        );
+        // The marked row keeps its id and its offset.
+        let marked = rungs.iter().find(|r| r.starts_with('▌')).unwrap();
+        assert!(marked.contains("#5"), "{marked:?}");
+        assert!(marked.contains("ms"), "{marked:?}");
+    }
+
+    /// The ladder is the conversation: the handshake, the tls exchange, the
+    /// resend and the reset, in order, with direction relative to the caller.
+    #[test]
+    fn the_ladder_tells_the_story_of_the_connection() {
+        let convo = demo_conversation(Some(5));
+        let rows = ladder_text(&convo, 80).join("\n");
+        for expected in [
+            "syn",
+            "syn·ack",
+            "ack",
+            "tls client hello",
+            "tls server hello",
+            "tls certificate",
+            "data",
+            "rst",
+        ] {
+            assert!(rows.contains(expected), "missing {expected:?} in:\n{rows}");
+        }
+        // Packet #5 is the third packet *of this stream* — the ladder counts
+        // within the conversation, not within the capture.
+        assert!(rows.contains("packet 3 of 9"), "position is shown:\n{rows}");
+        assert_eq!(convo.phase, stream_context::Phase::Reset);
+
+        // Exactly one resend — the client re-sending its unacknowledged data.
+        // The pure ACK that reuses the next segment's sequence number is not
+        // one, and used to be counted as one.
+        assert_eq!(convo.retransmits, 1, "{:#?}", convo.rungs);
+        assert_eq!(
+            rows.matches("retransmit").count(),
+            1,
+            "the ladder and the counter must agree:\n{rows}"
+        );
+    }
+
+    /// The arrows form a column *on screen*, not just in the line builder.
+    ///
+    /// They did not: the panel drew its body with `Wrap { trim: true }`,
+    /// which strips leading whitespace per line — so every unselected rung
+    /// lost its one-space gutter while the selected rung's `▌` survived, and
+    /// the ladder was shifted a column against itself. Asserting on
+    /// `ladder_lines` alone missed it, because the defect was in how those
+    /// lines were painted.
+    #[test]
+    fn the_arrows_form_a_column_once_painted() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // The selection matters: the shift only appears when one rung starts
+        // with `▌` and the rest start with a space, so a conversation with
+        // nothing selected cannot show the defect.
+        let convo = demo_conversation(Some(5));
+        assert!(
+            convo.rungs.iter().any(|r| r.selected),
+            "the fixture must have a selected rung or this test proves nothing"
+        );
+        let theme = crate::theme::by_name("default");
+        let lines = ladder_lines(&convo, &theme, 78);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| render_stream_body(f, lines, Rect::new(0, 0, 80, 20)))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let mut cols = Vec::new();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.get(x, y).symbol())
+                .collect();
+            if let Some(c) = row.chars().position(|c| c == '→' || c == '←') {
+                cols.push((y, c, row.trim_end().to_string()));
+            }
+        }
+        assert!(cols.len() >= 2, "expected several rungs, got {cols:#?}");
+        let first = cols[0].1;
+        for (y, c, row) in &cols {
+            assert_eq!(*c, first, "row {y} is shifted: {row:?}");
+        }
+    }
+
+    /// A narrow panel keeps the columns and shortens the label; it does not
+    /// wrap a rung onto two lines.
+    #[test]
+    fn a_narrow_ladder_shortens_the_label_rather_than_wrapping() {
+        let convo = demo_conversation(Some(6));
+        for width in [40u16, 44, 52, 60, 100] {
+            for row in ladder_text(&convo, width) {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "rung overflows {width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// The stream column is reserved from the area alone. Walking a capture
+    /// is the main thing done on this screen, and it used to rearrange itself
+    /// on every arrow key: the column appeared only when the selected packet
+    /// had a stream, so stepping onto an arp frame doubled the decode's width
+    /// and re-wrapped every line in it.
+    #[test]
+    fn the_stream_column_depends_on_width_and_nothing_else() {
+        let wide = Rect::new(0, 0, 160, 16);
+        let (detail, stream) = lower_panes(wide);
+        let stream = stream.expect("a wide pane reserves the stream column");
+        assert_eq!(detail.x, wide.x);
+        assert_eq!(
+            detail.width + stream.width,
+            wide.width,
+            "the two columns must tile the pane exactly"
+        );
+        assert_eq!(stream.x, detail.x + detail.width, "no gap between them");
+        assert_eq!(detail.height, wide.height);
+        assert_eq!(stream.height, wide.height);
+
+        // Narrow: the decode takes the row on its own rather than being
+        // squeezed to 55% of too little.
+        let narrow = Rect::new(0, 0, STREAM_COLUMN_MIN_WIDTH - 1, 16);
+        let (detail, stream) = lower_panes(narrow);
+        assert!(stream.is_none());
+        assert_eq!(detail, narrow);
+    }
+
+    /// The three boxes in the decode column keep their heights whatever is
+    /// selected. Sizing the protocol box to its own line count made the
+    /// payload and hex boxes slide several rows on every keypress, because a
+    /// dns reply and a tcp ack do not decode to the same number of lines.
+    #[test]
+    fn the_decode_column_always_has_three_boxes_at_fixed_heights() {
+        for height in [16u16, 24, 40] {
+            let area = Rect::new(0, 0, 90, height);
+            let rows = detail_rows(area);
+            assert_eq!(rows.len(), 3, "protocol, payload, hex");
+            assert_eq!(
+                rows.iter().map(|r| r.height).sum::<u16>(),
+                height,
+                "the boxes must tile the column at height {height}"
+            );
+            // Stacked, in order, with no gaps.
+            assert_eq!(rows[0].y, area.y);
+            assert_eq!(rows[1].y, rows[0].y + rows[0].height);
+            assert_eq!(rows[2].y, rows[1].y + rows[1].height);
+            // The decode gets the majority; the other two are equal.
+            assert!(rows[0].height > rows[1].height, "at height {height}");
+            assert_eq!(rows[1].height, rows[2].height, "at height {height}");
+        }
+    }
+
     #[test]
     fn clipboard_includes_full_decrypted_payload() {
         // A payload longer than the on-screen cap must still appear in full
@@ -1581,5 +2448,130 @@ mod tests {
         assert_eq!(full.len(), 5000);
         let capped = preview_decrypted_bytes(&bytes, 100);
         assert!(capped.ends_with('…'));
+    }
+
+    fn dns_packet(
+        id: u64,
+        src: &str,
+        dst: &str,
+        qname: &str,
+        rcode: Option<u8>,
+        ns: u64,
+    ) -> CapturedPacket {
+        CapturedPacket {
+            id,
+            timestamp: format!("06:49:20.{id:03}"),
+            src_ip: src.into(),
+            dst_ip: dst.into(),
+            src_host: None,
+            dst_host: None,
+            protocol: "DNS".into(),
+            length: 71,
+            src_port: Some(if rcode.is_some() { 53 } else { 58248 }),
+            dst_port: Some(if rcode.is_some() { 58248 } else { 53 }),
+            info: qname.into(),
+            details: Vec::new(),
+            payload_text: String::new(),
+            raw_hex: String::new(),
+            raw_ascii: String::new(),
+            raw_bytes: Vec::new(),
+            stream_index: Some(1),
+            tcp_flags: None,
+            tcp_seq: None,
+            expert: ExpertSeverity::Chat,
+            timestamp_ns: ns,
+            app_protocol: Some(crate::dpi::AppProtocol::Dns {
+                qname: qname.into(),
+                qtype: 1,
+                rcode,
+            }),
+            decrypted_plaintext: None,
+        }
+    }
+
+    /// The id and stream columns are muted, and muted grey on the selection
+    /// background is invisible — so both vanished on whichever row the cursor
+    /// was on. That is the row whose id a reader most likely wants to quote.
+    #[test]
+    fn muted_cells_stay_legible_on_the_selected_row() {
+        let t = crate::theme::by_name("dark");
+        let muted = Style::default().fg(t.text_muted);
+
+        assert_eq!(
+            readable_when_selected(muted, true, &t).fg,
+            Some(t.text_secondary),
+            "a muted cell must lift on the selected row"
+        );
+        assert_eq!(
+            readable_when_selected(muted, false, &t).fg,
+            Some(t.text_muted),
+            "and stay muted everywhere else"
+        );
+
+        // A cell already carrying meaning keeps it — the expert and protocol
+        // columns are legible on the band and must not be recoloured.
+        for carried in [t.status_error, t.status_warn, t.brand, t.text_primary] {
+            let styled = Style::default().fg(carried);
+            assert_eq!(
+                readable_when_selected(styled, true, &t).fg,
+                Some(carried),
+                "{carried:?} must survive selection unchanged"
+            );
+        }
+    }
+
+    /// The reply is paired with *its own* query — matched on the question and
+    /// on reversed endpoints, so a second name in flight to the same resolver
+    /// cannot borrow the wrong start time.
+    #[test]
+    fn dns_latency_pairs_a_reply_with_its_own_query() {
+        let packets = vec![
+            dns_packet(1, "10.0.0.4", "169.254.1.1", "example.com", None, 0),
+            dns_packet(2, "10.0.0.4", "169.254.1.1", "other.test", None, 1_000_000),
+            dns_packet(
+                3,
+                "169.254.1.1",
+                "10.0.0.4",
+                "example.com",
+                Some(0),
+                41_200_000,
+            ),
+        ];
+        let l = dns_reply_latency(&packets[2], &packets).expect("a pairing");
+        assert_eq!(l.query_id, 1, "matched the wrong query");
+        assert!((l.ms - 41.2).abs() < 0.01, "{}ms", l.ms);
+    }
+
+    /// A reply with no query in the buffer is not a zero-millisecond reply.
+    #[test]
+    fn dns_latency_is_absent_when_the_query_was_not_captured() {
+        let packets = vec![dns_packet(
+            9,
+            "169.254.1.1",
+            "10.0.0.4",
+            "example.com",
+            Some(0),
+            5,
+        )];
+        assert!(dns_reply_latency(&packets[0], &packets).is_none());
+        // And a query is not a reply.
+        let q = vec![dns_packet(1, "10.0.0.4", "169.254.1.1", "a.test", None, 0)];
+        assert!(dns_reply_latency(&q[0], &q).is_none());
+    }
+
+    /// `x` narrows to findings. Chat and Note are the ordinary run of a
+    /// capture; only Warn and Error are things to look at.
+    #[test]
+    fn only_warnings_and_errors_count_as_expert_findings() {
+        let mut p = dns_packet(1, "a", "b", "x.test", None, 0);
+        for (sev, expected) in [
+            (ExpertSeverity::Chat, false),
+            (ExpertSeverity::Note, false),
+            (ExpertSeverity::Warn, true),
+            (ExpertSeverity::Error, true),
+        ] {
+            p.expert = sev;
+            assert_eq!(is_expert(&p), expected, "{sev:?}");
+        }
     }
 }

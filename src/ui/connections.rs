@@ -5,10 +5,15 @@ use crate::collectors::traceroute::TracerouteStatus;
 use crate::sort::{
     apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip_addr, SortColumn, TabSortState,
 };
+use crate::ui::widgets;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph},
 };
+
+/// Width of the state column. `state_label` guarantees every state name fits,
+/// so nothing in this column is ever truncated.
+const STATE_COL: usize = 12;
 
 pub const COLUMNS: &[SortColumn] = &[
     SortColumn { name: "Process" },
@@ -84,8 +89,10 @@ fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
 pub(crate) fn table_inner_area(area: Rect) -> Rect {
     let chunks = layout_chunks(area);
     let outer = chunks[2];
-    let block = Block::default().borders(Borders::ALL);
-    block.inner(outer)
+    // Same four-sided inset as the panel the rows are drawn in. Corner style
+    // doesn't affect `inner`, but deriving it from the shared chrome means a
+    // future change to the box can't silently move the click targets.
+    widgets::panel_block(&crate::theme::by_name("default")).inner(outer)
 }
 
 /// Centered-on-selected window top, matching the renderer's auto-scroll
@@ -811,17 +818,18 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
             app.ui.connection_group.label()
         )
     };
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " CONNECTIONS ",
+            " connections ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+            Line::from(Span::styled(
+                title_right,
+                Style::default().fg(t.brand).bold(),
+            ))
+            .alignment(Alignment::Right),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -833,9 +841,9 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
     // is only shown when the user has toggled `g`; it sits between REMOTE and
     // STATE so it qualifies the destination it describes.
     let header_text: &str = if app.ui.show_geo {
-        "  PROCESS              PROTO  REMOTE                          APP                    GEO           STATE         RX/s         TX/s     RTT    AGE"
+        "  process              proto  remote                          app                    geo           state         rx/s         tx/s     rtt    age"
     } else {
-        "  PROCESS              PROTO  REMOTE                          APP                    STATE         RX/s         TX/s     RTT    AGE"
+        "  process              proto  remote                          app                    state         rx/s         tx/s     rtt    age"
     };
     let header_area = Rect {
         x: inner.x + 1,
@@ -947,11 +955,20 @@ fn render_group_row(
     };
 
     let state_cell = if r.state_count == r.conns {
-        truncate(&r.state, 12).to_string()
+        crate::ui::widgets::state_label(&r.state)
     } else {
-        // Mixed states: say which dominates and how many, rather than
-        // picking one and implying the group is uniform.
-        format!("{} {}/{}", truncate(&r.state, 6), r.state_count, r.conns)
+        // Mixed states: say which dominates and how many, rather than picking
+        // one and implying the group is uniform. The longer state names leave
+        // no room for the denominator, and a clipped `time-wait 1…` is worse
+        // than no denominator — the row already says how many connections the
+        // group holds.
+        let label = crate::ui::widgets::state_label(&r.state);
+        let full = format!("{label} {}/{}", r.state_count, r.conns);
+        if full.chars().count() <= STATE_COL {
+            full
+        } else {
+            format!("{label} {}", r.state_count)
+        }
     };
     let state_color = match r.state.as_str() {
         "ESTABLISHED" => t.status_good,
@@ -1029,14 +1046,14 @@ fn render_group_row(
         // Geo is a property of one endpoint, so a rollup has nothing honest
         // to put here. Hold the column so the children stay aligned.
         spans.push(Span::styled(
-            format!(" {:<12}", ""),
+            format!(" {:<width$}", "", width = STATE_COL),
             Style::default().fg(t.text_muted),
         ));
     }
 
     spans.extend([
         Span::styled(
-            format!(" {:<12}", truncate(&state_cell, 12)),
+            format!(" {:<width$}", state_cell, width = STATE_COL),
             Style::default().fg(state_color),
         ),
         Span::styled(format!(" {rx_str:>10}"), Style::default().fg(t.rx_rate)),
@@ -1211,9 +1228,17 @@ fn render_conn_row(
     // at a glance that the flow has TCP retransmits without widening
     // the row layout. OOO without retransmits gets "↹N" in muted color.
     let state_cell = if conn.retransmits > 0 {
-        format!("{} ↻{}", truncate(&conn.state, 8), conn.retransmits)
+        format!(
+            "{} ↻{}",
+            crate::ui::widgets::state_label(&conn.state),
+            conn.retransmits
+        )
     } else if conn.out_of_order > 0 {
-        format!("{} ↹{}", truncate(&conn.state, 8), conn.out_of_order)
+        format!(
+            "{} ↹{}",
+            crate::ui::widgets::state_label(&conn.state),
+            conn.out_of_order
+        )
     } else {
         truncate(&conn.state, 12).to_string()
     };
@@ -1227,7 +1252,7 @@ fn render_conn_row(
 
     spans.extend([
         Span::styled(
-            format!(" {:<12}", truncate(&state_cell, 12)),
+            format!(" {:<width$}", state_cell, width = STATE_COL),
             Style::default().fg(state_span_color),
         ),
         Span::styled(format!(" {:>10}", rx_str), Style::default().fg(t.rx_rate)),
@@ -1326,7 +1351,7 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
             let proc = c.process_name.as_deref().unwrap_or("—");
             let host = host_only(&c.remote_addr);
             format!(
-                " DETAIL  {}  pid {}  → {} ",
+                " detail  {}  pid {}  → {} ",
                 proc,
                 c.pid.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
                 host,
@@ -1335,13 +1360,13 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
         // A group header has no single flow to detail, so the title carries
         // the rollup rather than pretending one child stands for all of them.
         Some(ConnRow::Parent { group, .. }) => format!(
-            " DETAIL  {}  {} connections ",
+            " detail  {}  {} connections ",
             group.key, group.rollup.conns
         ),
-        None => " DETAIL ".to_string(),
+        None => " detail ".to_string(),
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
             title_left,
             Style::default().fg(t.status_warn).bold(),
@@ -1352,9 +1377,7 @@ fn render_detail_strip(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.text_muted),
             ))
             .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1474,7 +1497,7 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
                 Style::default().fg(t.status_info),
             ),
             Span::styled(
-                format!("{}  ", conn.state),
+                format!("{}  ", crate::ui::widgets::state_label(&conn.state)),
                 Style::default().fg(t.text_primary),
             ),
             Span::styled(format!("age {}", age), Style::default().fg(t.text_muted)),
@@ -1607,44 +1630,26 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    use crate::ui::widgets::hint;
     let hints = if app.ui.traceroute_view_open {
-        vec![
-            Span::styled("Esc", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Close  "),
-            Span::styled("q", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Quit"),
-        ]
+        vec![hint("esc", "close")]
     } else {
-        let mut v = vec![
-            Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Sort  "),
-            Span::styled("/", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Filter  "),
-        ];
+        let mut v = vec![hint("s", "sort"), hint("/", "filter")];
         // Only advertise folding when there is something to fold — under
         // `group: none` the key does nothing and the hint would be a lie.
         if !matches!(app.ui.connection_group, ConnectionGroup::None) {
-            v.push(Span::styled(
-                "space",
-                Style::default().fg(app.theme.key_hint).bold(),
-            ));
-            v.push(Span::raw(":Fold  "));
-            v.push(Span::styled(
+            v.push(hint("space", "fold"));
+            v.push(hint(
                 "z",
-                Style::default().fg(app.theme.key_hint).bold(),
+                if app.ui.connection_collapsed.all_collapsed() {
+                    "expand all"
+                } else {
+                    "fold all"
+                },
             ));
-            v.push(Span::raw(if app.ui.connection_collapsed.all_collapsed() {
-                ":Expand all  "
-            } else {
-                ":Fold all  "
-            }));
         }
-        v.extend([
-            Span::styled("T", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":Traceroute  "),
-            Span::styled("Enter", Style::default().fg(app.theme.key_hint).bold()),
-            Span::raw(":→Packets"),
-        ]);
+        v.push(hint("T", "trace"));
+        v.push(hint("↵", "packets"));
         v
     };
     crate::ui::widgets::render_footer(f, app, area, hints);
@@ -1676,9 +1681,8 @@ fn render_traceroute_overlay(f: &mut Frame, app: &App, area: Rect) {
         TracerouteStatus::Error(_) => app.theme.status_error,
         TracerouteStatus::Idle => app.theme.text_muted,
     };
-    let block = Block::default()
+    let block = widgets::panel_block(&app.theme)
         .title(title)
-        .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(overlay);
     f.render_widget(block, overlay);

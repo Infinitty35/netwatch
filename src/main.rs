@@ -32,14 +32,15 @@ async fn main() -> Result<()> {
              OPTIONS:\n    --generate-config         Write a default config file and exit\n    \
              --remote <url>            Stream metrics to a NetWatch Core instance\n    \
              --api-key <key>           API key for remote streaming\n    \
-             --lite                    Start in Lite view: one screen, fits 80×24\n    \
+             --demo                    Replay a recorded incident on the Diagnose tab
+    --lite                    Start in Lite view: one screen, fits 80×24\n    \
              --view <full|lite|dense>  Start in a specific view (dense: four boxes, 130×44)\n    \
              --no-sandbox              Disable the post-startup security sandbox\n    \
              --sandbox-strict          Refuse to start if the sandbox can't be enforced\n    \
              --metrics-addr <addr>     (daemon) Serve Prometheus /metrics + /healthz on addr\n    \
              --metrics                 (daemon) Serve metrics on the default 127.0.0.1:9464\n    \
              -h, --help                Print help\n    -V, --version             Print version\n\n\
-             KEYS (in TUI):\n    1-7   Switch tabs    /     Filter    q   Quit\n    \
+             KEYS (in TUI):\n    1-9,0 Switch tabs    9     Diagnose  /   Filter    q   Quit\n    \
              V     Cycle view (full → lite → dense)\n    \
              L     Toggle Lite view\n    \
              Shift+R/F/E   Flight Recorder: arm / freeze / export",
@@ -98,6 +99,10 @@ async fn main() -> Result<()> {
                 .any(|a| a == "--lite")
                 .then_some(netwatch::app::ViewMode::Lite)
         });
+
+    // Replay the recorded Diagnose scenario instead of the live network.
+    // Opens on the Diagnose tab and labels every frame as a demo.
+    let demo = args.iter().any(|a| a == "--demo");
 
     let sandbox_mode = if args.iter().any(|a| a == "--no-sandbox") {
         netwatch::sandbox::Mode::Disabled
@@ -174,7 +179,14 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(&mut terminal, remote_publisher.as_ref(), sandbox_mode, view).await;
+    let result = app::run(
+        &mut terminal,
+        remote_publisher.as_ref(),
+        sandbox_mode,
+        view,
+        demo,
+    )
+    .await;
 
     disable_raw_mode()?;
     execute!(

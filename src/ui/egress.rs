@@ -16,7 +16,7 @@ use crate::state::EgressSort;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Cell, Paragraph, Row, Table},
 };
 
 const SPARK: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -516,7 +516,7 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
     } = tally(rows);
 
     let mut spans = vec![
-        Span::styled(" Egress ", Style::default().fg(t.brand).bold()),
+        Span::styled(" egress ", Style::default().fg(t.brand).bold()),
         Span::styled(
             format!("· {procs} processes · {dests} destinations"),
             Style::default().fg(t.text_muted),
@@ -594,11 +594,7 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(msg)
                 .style(Style::default().fg(t.text_muted))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(t.border)),
-                ),
+                .block(widgets::panel_block(t)),
             area,
         );
         return;
@@ -726,9 +722,7 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
         )
         .header(header)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(t.border))
+            widgets::panel_block(t)
                 .title_top(summary_line(app, &rows))
                 .title_top(
                     Line::from(Span::styled(right, Style::default().fg(t.text_muted)))
@@ -778,10 +772,7 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) {
         .scroll
         .egress_scroll
         .min(rows.len().saturating_sub(1));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border))
-        .title(" Detail ");
+    let block = widgets::panel_block(t).title(" Detail ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -875,8 +866,7 @@ fn kv(t: &crate::theme::Theme, k: &str, v: String) -> Line<'static> {
 
 fn render_warnings(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = widgets::panel_block(t)
         .border_style(Style::default().fg(t.status_error))
         .title(" Recent drift ");
     let inner = block.inner(area);

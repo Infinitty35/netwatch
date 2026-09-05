@@ -43,7 +43,7 @@ It scales to the question you're asking — in both directions: [`--view dense`]
 
 **Made for** blue-teamers, incident responders, SREs, and homelabbers who need to see what's happening *right now* — not parse a capture file an hour later.
 
-<samp>650+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
+<samp>840+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
 
 And the part no other terminal tool does at all: NetWatch learns what each program on the machine talks to, turns that observed baseline into a policy with one keypress, and tells you the moment a program starts talking somewhere new.
 
@@ -53,6 +53,23 @@ And the part no other terminal tool does at all: NetWatch learns what each progr
 
 <p align="center">
   <em>Observe → promote → warn. The baseline becomes a policy with one keypress; the next new destination arrives as <strong>drift</strong>.</em>
+</p>
+
+And when something *is* wrong, NetWatch does not stop at the graph. It names the
+issue, ranks the explanations by the checks that discriminated between them,
+offers the fix, and closes the issue itself when its own success condition
+holds.
+
+<p align="center">
+  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
+</p>
+
+<p align="center">
+  <em>Issue → probable cause → remediation → verified close. The engine is never
+  told the problem is fixed; it watches the resolver and closes the issue when
+  <code>dns.rtt_p50 &lt; 5ms</code> has held for 60s. Recorded with
+  <code>netwatch --demo</code>, which replays a scenario through the real engine
+  and says so on every frame.</em>
 </p>
 
 ## Why NetWatch
@@ -200,7 +217,7 @@ Ten tabs, switched with `1`–`9` and `0`:
 | 6 | **Topology** | ASCII map of machine → gateway → DNS → top hosts, with traceroute. |
 | 7 | **Timeline** | Connection timeline color-coded by TCP state; security alerts land here. |
 | 8 | **Processes** | Per-process bandwidth ranking with live RX/TX and connection counts. |
-| 9 | **Insights** | *(opt-in)* feeds a snapshot to a local/cloud LLM for plain-language analysis. |
+| 9 | **Diagnose** | What is wrong, why, and what to do about it. Baseline-driven detection over a 25-rule catalogue, ranked causes with the checks that discriminated them, key-bound reversible fixes, and a `report.md` / `report.json` generated from the same objects the screen renders. *(An opt-in AI narrative appears here as commentary — never as a source of facts.)* |
 | 0 | **Egress** | Learns what each process talks to (hostname/AS/port), promotes that baseline to a policy with one keypress, then warns on drift. Observe-only, never blocks. |
 
 The Packets tab is where the forensics live — deep protocol decoding, live TLS 1.3 decryption, JA4 threat-hunting, Wireshark-style display filters, and incident capture. **[See the full feature reference →](docs/REFERENCE.md)**

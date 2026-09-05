@@ -30,47 +30,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
-use crate::graph::{fade_color, BRAILLE_BASE, BRAILLE_BIT};
+use crate::graph::{fade_color, lerp, magnitude_ramp};
 use crate::theme::Theme;
 
 // ── ramps ───────────────────────────────────────────────────────────────────
 
-/// A five-stop colour ramp, sampled 0.0..=1.0.
-///
-/// Flat ramps (one distinct stop) are the 16-colour degrade path and are not a
-/// special case anywhere else — [`Ramp::at`] just always returns the token.
-#[derive(Debug, Clone)]
-pub struct Ramp {
-    stops: Vec<Color>,
-}
-
-impl Ramp {
-    pub fn flat(c: Color) -> Self {
-        Self { stops: vec![c] }
-    }
-
-    /// Sample at `f`, clamped to 0.0..=1.0.
-    pub fn at(&self, f: f32) -> Color {
-        match self.stops.len() {
-            0 => Color::Reset,
-            1 => self.stops[0],
-            n => {
-                let t = f.clamp(0.0, 1.0) * (n - 1) as f32;
-                let i = t.floor() as usize;
-                if i >= n - 1 {
-                    return self.stops[n - 1];
-                }
-                lerp(self.stops[i], self.stops[i + 1], t - i as f32)
-            }
-        }
-    }
-
-    /// The ramp's midpoint — used where a single representative colour is
-    /// wanted (a legend, a label above the graph it describes).
-    pub fn mid(&self) -> Color {
-        self.at(0.55)
-    }
-}
+/// Re-exported so the Dense view's call sites keep naming the ramp where they
+/// use it, while there is only one definition of it.
+pub use crate::graph::Ramp;
 
 /// The four ramps the Dense view draws with.
 ///
@@ -98,155 +65,43 @@ impl Ramps {
             return Self {
                 down: Ramp::flat(t.rx_rate),
                 up: Ramp::flat(t.tx_rate),
-                load: Ramp::flat(t.status_warn),
+                // `load` is the one ramp that still ramps here. The magnitude
+                // ramps collapse because their intermediate values only exist
+                // as synthesised blends, but severity already has three
+                // palette tokens of its own — so the meter steps
+                // good → warn → error instead of losing the vocabulary the
+                // README promises. No colour is invented: `lerp` returns its
+                // lower stop for non-RGB inputs, which quantises the sample to
+                // whichever token it landed on.
+                load: Ramp::new(vec![t.status_good, t.status_warn, t.status_error]),
                 dim: Ramp::flat(t.text_muted),
             };
         }
         Self {
             down: magnitude_ramp(t.rx_rate, t.bg),
             up: magnitude_ramp(t.tx_rate, t.bg),
-            load: Ramp {
-                stops: vec![
-                    t.status_good,
-                    lerp(t.status_good, t.status_warn, 0.5),
-                    t.status_warn,
-                    lerp(t.status_warn, t.status_error, 0.5),
-                    t.status_error,
-                ],
-            },
-            dim: Ramp {
-                stops: vec![
-                    fade_color(t.text_muted, t.bg, 0.45, false),
-                    t.text_muted,
-                    fade_color(t.text_secondary, t.bg, 0.85, false),
-                ],
-            },
+            load: Ramp::new(vec![
+                t.status_good,
+                lerp(t.status_good, t.status_warn, 0.5),
+                t.status_warn,
+                lerp(t.status_warn, t.status_error, 0.5),
+                t.status_error,
+            ]),
+            dim: Ramp::new(vec![
+                fade_color(t.text_muted, t.bg, 0.45, false),
+                t.text_muted,
+                fade_color(t.text_secondary, t.bg, 0.85, false),
+            ]),
         }
     }
-}
-
-/// Deep-and-cool at the baseline through bright at the peak, anchored on a
-/// theme token. Five stops so the eye can rank a spike without an axis.
-fn magnitude_ramp(base: Color, bg: Color) -> Ramp {
-    Ramp {
-        stops: vec![
-            fade_color(base, bg, 0.30, false),
-            fade_color(base, bg, 0.62, false),
-            base,
-            lighten(base, 0.42),
-            lighten(base, 0.76),
-        ],
-    }
-}
-
-fn rgb(c: Color) -> Option<(u8, u8, u8)> {
-    match c {
-        Color::Rgb(r, g, b) => Some((r, g, b)),
-        _ => None,
-    }
-}
-
-/// Linear blend, RGB only. Non-RGB inputs return `a` unchanged rather than
-/// guessing at a palette entry's actual value — the same discipline as
-/// [`crate::graph::fade_color`].
-fn lerp(a: Color, b: Color, f: f32) -> Color {
-    match (rgb(a), rgb(b)) {
-        (Some((ar, ag, ab)), Some((br, bg_, bb))) => {
-            let f = f.clamp(0.0, 1.0);
-            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
-            Color::Rgb(mix(ar, br), mix(ag, bg_), mix(ab, bb))
-        }
-        _ => a,
-    }
-}
-
-fn lighten(c: Color, f: f32) -> Color {
-    lerp(c, Color::Rgb(255, 255, 255), f)
 }
 
 // ── braille area graph ──────────────────────────────────────────────────────
 
-/// Sub-cell height of `v` against `max`, rounded.
-fn sub_height(v: u64, max: u64, sub_h: usize) -> usize {
-    if max == 0 {
-        return 0;
-    }
-    let v = v.min(max) as u128;
-    // Round half up in integer maths: (v * sub_h + max/2) / max.
-    ((v * sub_h as u128 * 2 + max as u128) / (max as u128 * 2)) as usize
-}
-
-/// Braille area plot at two samples per cell column.
-///
-/// `samples` is oldest-first and must already be exactly `2 × area.width`
-/// long — see [`super::resample`], which is where the bucketing lives so that
-/// a spike between samples survives instead of being dropped by decimation.
-///
-/// `flip` grows the plot **downward from the top edge** instead of upward from
-/// the bottom. That is the whole mirrored-graph trick: the upload half is the
-/// same function with `flip = true`, sharing the axis row above it.
-///
-/// Every cell is coloured by its own height in the plot rather than by which
-/// series it belongs to, so severity is pre-attentive — you see the spike
-/// before you read the axis.
-pub fn area_graph(
-    buf: &mut Buffer,
-    area: Rect,
-    samples: &[u64],
-    max: u64,
-    ramp: &Ramp,
-    flip: bool,
-) {
-    if area.width == 0 || area.height == 0 || max == 0 {
-        return;
-    }
-    let w = area.width as usize;
-    let h = area.height as usize;
-    let sub_h = h * 4;
-
-    for cx in 0..w {
-        let lh = sub_height(samples.get(cx * 2).copied().unwrap_or(0), max, sub_h);
-        let rh = sub_height(samples.get(cx * 2 + 1).copied().unwrap_or(0), max, sub_h);
-        // A zero sample still draws its baseline dot. Skipping it leaves holes
-        // in the area wherever traffic went quiet, which reads as "no data"
-        // rather than "no traffic" — and it is what stops this looking like
-        // btop, whose plot is continuous across the whole window.
-        let lh = lh.max(1);
-        let rh = rh.max(1);
-        for cy in 0..h {
-            let mut bits: u8 = 0;
-            for (s, (l_dot, r_dot)) in BRAILLE_BIT[0].iter().zip(BRAILLE_BIT[1]).enumerate() {
-                let from_top = cy * 4 + s;
-                // Depth of this sub-row measured from the growing edge.
-                let depth = if flip { from_top + 1 } else { sub_h - from_top };
-                if lh >= depth {
-                    bits |= 1 << l_dot;
-                }
-                if rh >= depth {
-                    bits |= 1 << r_dot;
-                }
-            }
-            if bits == 0 {
-                continue;
-            }
-            // Sample the ramp at the cell's vertical midpoint, measured along
-            // the direction of growth, so both halves of a mirrored pair
-            // brighten as traffic climbs.
-            let mid = (cy * 4 + 2) as f32;
-            let f = if flip {
-                mid / sub_h as f32
-            } else {
-                (sub_h as f32 - mid) / sub_h as f32
-            };
-            let Some(ch) = char::from_u32(BRAILLE_BASE | bits as u32) else {
-                continue;
-            };
-            let cell = buf.get_mut(area.x + cx as u16, area.y + cy as u16);
-            cell.set_char(ch);
-            cell.set_style(Style::default().fg(ramp.at(f)));
-        }
-    }
-}
+/// Re-exported: the braille area plot lives in [`crate::graph`] so that the
+/// Dense view, the Dashboard and every in-row sparkline are drawn by one
+/// renderer rather than by two that agree only by convention.
+pub use crate::graph::area_graph;
 
 /// Single-row sparkline: [`area_graph`] at height 1.
 pub fn spark(buf: &mut Buffer, x: u16, y: u16, w: u16, samples: &[u64], max: u64, ramp: &Ramp) {
@@ -581,9 +436,7 @@ mod tests {
     /// brighter than its bottom cell.
     #[test]
     fn gradient_tracks_height_in_both_directions() {
-        let ramp = Ramp {
-            stops: vec![Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)],
-        };
+        let ramp = Ramp::new(vec![Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]);
         let mut b = buf(1, 4);
         area_graph(&mut b, Rect::new(0, 0, 1, 4), &[16, 16], 16, &ramp, false);
         let top = b.get(0, 0).fg;
@@ -627,9 +480,7 @@ mod tests {
 
     #[test]
     fn meter_fills_proportionally_and_ramps_by_position() {
-        let ramp = Ramp {
-            stops: vec![Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)],
-        };
+        let ramp = Ramp::new(vec![Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)]);
         let mut b = buf(10, 1);
         meter(&mut b, 0, 0, 10, 0.5, &ramp, Color::Gray);
         assert_eq!(row(&b, 0), "■■■■■·····");
@@ -726,6 +577,30 @@ mod tests {
         assert!(t.defers_to_terminal());
         let r = Ramps::from_theme(&t);
         assert_eq!(r.down.at(0.0), r.down.at(1.0));
+        assert_eq!(r.up.at(0.0), r.up.at(1.0));
+        assert_eq!(r.dim.at(0.0), r.dim.at(1.0));
+    }
+
+    /// The severity ramp is the exception: a latency budget at 10% consumed
+    /// and one at 95% must not paint the same colour just because the theme
+    /// defers to the terminal. Regression — every dense budget meter drew
+    /// flat `status_warn`, so a nominal gateway read as a warning.
+    #[test]
+    fn load_ramp_still_steps_on_terminal_palette_themes() {
+        let t = crate::theme::by_name("terminal");
+        let r = Ramps::from_theme(&t);
+        assert_eq!(r.load.at(0.0), t.status_good, "an empty budget is nominal");
+        assert_eq!(r.load.at(0.75), t.status_warn, "mid-budget warns");
+        assert_eq!(r.load.at(1.0), t.status_error, "a spent budget is an error");
+        // Quantised to the palette, never blended into a 24-bit value the
+        // theme exists to avoid.
+        for step in 0..=20 {
+            let c = r.load.at(step as f32 / 20.0);
+            assert!(
+                matches!(c, Color::Green | Color::Yellow | Color::Red),
+                "sample {step} synthesised {c:?}"
+            );
+        }
     }
 
     #[test]

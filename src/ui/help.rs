@@ -1,8 +1,9 @@
 use crate::app::App;
 use crate::theme::Theme;
+use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -16,9 +17,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Clear, popup);
     crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
 
-    let block = Block::default()
+    let block = widgets::panel_block(&app.theme)
         .title(" Help ")
-        .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -53,16 +53,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ),
     );
 
-    // Footer hint
-    let key = app.theme.key_hint;
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(key).bold()),
-        Span::styled(":Scroll  ", Style::default().fg(app.theme.text_primary)),
-        Span::styled("?", Style::default().fg(key).bold()),
-        Span::styled("/", Style::default().fg(app.theme.text_primary)),
-        Span::styled("Esc", Style::default().fg(key).bold()),
-        Span::styled(":Close", Style::default().fg(app.theme.text_primary)),
-    ]))
+    // Footer hint, in the one key-hint rendering the rest of the tool uses.
+    let footer = Paragraph::new(Line::from(crate::ui::widgets::hint_spans(
+        &app.theme,
+        &[
+            crate::ui::widgets::hint("↑↓", "scroll"),
+            crate::ui::widgets::hint("? esc", "close"),
+        ],
+    )))
     .alignment(Alignment::Center);
     let footer_area = Rect::new(
         inner.x,
@@ -182,7 +180,7 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(
         theme,
         "1-9, 0",
-        "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Proc/Insights/Egress)",
+        "Switch tab (Dash/Conn/Iface/Pkt/Stats/Topo/Time/Proc/Diagnose/Egress)",
     ));
     lines.push(key_line(theme, "p", "Pause/resume data collection"));
     lines.push(key_line(theme, "r", "Force refresh all data"));
@@ -213,7 +211,7 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(
         theme,
         "t",
-        "Cycle theme (dark/ocean/solarized/dracula/nord/sky/paper)",
+        "Cycle theme — except on Dashboard, Stats and Timeline, where t is that tab's scale or range toggle",
     ));
     lines.push(key_line(
         theme,
@@ -227,6 +225,11 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(section_header(theme, "DASHBOARD (Tab 1)"));
     lines.push(key_line(theme, "↑↓ / j/k", "Select interface"));
     lines.push(key_line(theme, "s", "Open sort picker"));
+    lines.push(key_line(
+        theme,
+        "t",
+        "Throughput graph: linear or log scale",
+    ));
     lines.push(Line::raw(""));
 
     // SORT PICKER
@@ -298,13 +301,23 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "s", "Open stream view for selected packet"));
     lines.push(key_line(theme, "w", "Export packets to .pcap file"));
     lines.push(key_line(theme, "f", "Toggle auto-follow"));
-    lines.push(key_line(theme, "x", "Clear all captured packets"));
-    lines.push(key_line(theme, "m", "Toggle bookmark on selected packet"));
-    lines.push(key_line(theme, "n", "Jump to next bookmarked packet"));
+    lines.push(key_line(
+        theme,
+        "x",
+        "Show only expert findings (warnings and errors)",
+    ));
+    lines.push(key_line(theme, "n", "Jump to next expert finding"));
     lines.push(key_line(
         theme,
         "N (shift)",
-        "Jump to previous bookmarked packet",
+        "Jump to previous expert finding",
+    ));
+    lines.push(key_line(theme, "m", "Toggle bookmark on selected packet"));
+    lines.push(key_line(theme, "] / [", "Jump to next/previous bookmark"));
+    lines.push(key_line(
+        theme,
+        "X (shift)",
+        "Clear all captured packets and bookmarks",
     ));
     lines.push(key_line(
         theme,
@@ -347,6 +360,30 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "↑↓ / j/k", "Scroll process list"));
     lines.push(key_line(theme, "s", "Open sort picker"));
     lines.push(key_line(theme, "e", "Export connections to JSON + CSV"));
+    lines.push(Line::raw(""));
+
+    // DIAGNOSE
+    lines.push(section_header(theme, "DIAGNOSE (Tab 9)"));
+    lines.push(key_line(theme, "↑↓ / j/k", "Select issue"));
+    lines.push(key_line(
+        theme,
+        "↵",
+        "Apply the first remediation netwatch can perform (asks first)",
+    ));
+    lines.push(key_line(
+        theme,
+        "a",
+        "Acknowledge — stays open, leaves the verdict line",
+    ));
+    lines.push(key_line(theme, "m", "Mute for one hour"));
+    lines.push(key_line(theme, "o", "Toggle the report preview"));
+    lines.push(key_line(theme, "e", "Export report.md + report.json"));
+    lines.push(key_line(theme, "y", "Copy the one-line summary"));
+    lines.push(key_line(
+        theme,
+        "i",
+        "Regenerate the AI narrative (when enabled)",
+    ));
     lines.push(Line::raw(""));
 
     // EGRESS

@@ -7,10 +7,11 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 use crate::app::App;
+use crate::ui::widgets;
 
 /// One row of the overlay: a bounded data structure and its current size.
 struct Gauge {
@@ -113,9 +114,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Clear, popup);
     crate::ui::widgets::paint_overlay_bg(f, &app.theme, popup);
-    let block = Block::default()
+    let block = widgets::panel_block(&app.theme)
         .title(" Memory ")
-        .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);

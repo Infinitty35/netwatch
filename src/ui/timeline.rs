@@ -3,10 +3,7 @@ use std::time::{Duration, Instant};
 use crate::app::{App, IfaceChangeKind, TimelineFilter};
 use crate::collectors::network_intel::{Alert, AlertSeverity};
 use crate::ui::widgets;
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{prelude::*, widgets::Paragraph};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -138,7 +135,9 @@ fn build_events(app: &App) -> Vec<Event> {
     // 5 * refresh_rate_ms of wall time, not 1 second.
     {
         let hs = app.health_prober.status();
-        let probe_interval_secs = (5 * app.user_config.refresh_rate_ms / 1000).max(1);
+        // The health histories advance once per probe, not once per tick.
+        let probe_interval_secs =
+            (crate::app::HEALTH_PROBE_TICKS as u64 * app.user_config.refresh_rate_ms / 1000).max(1);
         for (label, history) in [
             ("gateway", hs.gateway_rtt_history.as_slices().0),
             ("DNS", hs.dns_rtt_history.as_slices().0),
@@ -317,9 +316,9 @@ fn format_session_duration(d: Duration) -> String {
 
 fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
     let t = &app.theme;
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " ACTIVITY  session ",
+            " activity  session ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
@@ -328,9 +327,7 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
                 Style::default().fg(t.text_muted),
             ))
             .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -374,8 +371,10 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
     }
 
     let chart_w = inner.width as usize;
-    let padded = pad_history(&acc, chart_w);
     let pad = chart_w.saturating_sub(acc.len());
+    // One value per column: the severity split below is indexed by column, so
+    // this chart is bucketed rather than a raw history.
+    let padded = pad_history(&acc, chart_w);
 
     // Three-color overlay: green / yellow / red layers, only the cells
     // matching that severity tier carry data on each layer.
@@ -409,46 +408,54 @@ fn render_activity_strip(f: &mut Frame, app: &App, events: &[Event], area: Rect)
         .unwrap_or(1)
         .max(1);
 
-    // Three overlay layers sharing a y-axis (`global_max`). The renderer
-    // skips zero samples, so each layer paints only its own columns.
-    crate::graph::render_with_max(
+    // Three overlay layers sharing a y-axis (`global_max`). Each paints only
+    // its own columns — `without_baseline` is what keeps that true. With the
+    // floor on, a window containing no critical events still drew a solid red
+    // line the width of the strip, which is the loudest possible way to say
+    // nothing happened.
+    crate::graph::render_bucketed_with_max(
         f,
         inner,
         &green_data,
         global_max,
         app.graph_style,
         t.status_good,
-        t.status_warn,
-        app.graph_opts(),
+        app.graph_opts().without_baseline(),
     );
-    crate::graph::render_with_max(
+    crate::graph::render_bucketed_with_max(
         f,
         inner,
         &yellow_data,
         global_max,
         app.graph_style,
         t.status_warn,
-        t.status_warn,
-        app.graph_opts(),
+        app.graph_opts().without_baseline(),
     );
-    crate::graph::render_with_max(
+    crate::graph::render_bucketed_with_max(
         f,
         inner,
         &red_data,
         global_max,
         app.graph_style,
         t.status_error,
-        t.status_warn,
-        app.graph_opts(),
+        app.graph_opts().without_baseline(),
     );
 
-    // Cyan cursor at the right edge ("now")
+    // "cyan = now": tint the newest column rather than drawing over it.
+    //
+    // This used to paint a `│` in that column. Two things were wrong with
+    // that: the column holds the most recent sample, so the cursor destroyed
+    // the one datum a viewer is most likely to be looking at; and a vertical
+    // bar one column in from the panel's own right border reads as a doubled
+    // border, not as a cursor. Restyling the cells that are already there
+    // keeps the data and makes the legend true.
     let cursor_x = inner.x + inner.width.saturating_sub(1);
+    let buf = f.buffer_mut();
     for y in inner.y..inner.y + inner.height {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("│", Style::default().fg(t.brand)))),
-            Rect::new(cursor_x, y, 1, 1),
-        );
+        let cell = buf.get_mut(cursor_x, y);
+        if cell.symbol() != " " {
+            cell.set_style(Style::default().fg(t.brand));
+        }
     }
 }
 
@@ -475,17 +482,18 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
         .collect();
 
     let title_right = format!(" {} events  newest first ", filtered.len());
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " EVENTS ",
+            " events ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+            Line::from(Span::styled(
+                title_right,
+                Style::default().fg(t.brand).bold(),
+            ))
+            .alignment(Alignment::Right),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -493,7 +501,7 @@ fn render_events(f: &mut Frame, app: &App, events: &[Event], area: Rect) {
         return;
     }
 
-    let header = "  AGE        KIND   CAT    EVENT";
+    let header = "  age        kind   cat    event";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header,
@@ -590,12 +598,9 @@ fn duration_label(d: Duration) -> String {
 // ── helpers ─────────────────────────────────────────────────
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
     let hints = vec![
-        Span::styled("f", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Filter  "),
-        Span::styled("Enter", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":→Connections"),
+        widgets::hint("f", "filter"),
+        widgets::hint("↵", "connections"),
     ];
     widgets::render_footer(f, app, area, hints);
 }

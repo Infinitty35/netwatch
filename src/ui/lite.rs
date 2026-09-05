@@ -635,7 +635,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     render_header(f, app, &l, &health, unhealthy, paused);
     render_throughput(f, app, &l, paused);
     render_axis(f, app, t, &l);
-    render_health_line(f, t, &l, &health, unhealthy);
+    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
+    render_health_line(f, t, &l, &health, unhealthy, &verdict);
     render_table(f, app, &l, paused);
     render_footer(f, t, &l, app);
 }
@@ -885,6 +886,7 @@ fn render_health_line(
     l: &Layout,
     health: &crate::collectors::health::HealthStatus,
     unhealthy: bool,
+    verdict: &crate::diagnose::Verdict,
 ) {
     let end = l.content_x_end();
     let mut x = l.content_x;
@@ -927,7 +929,8 @@ fn render_health_line(
         x += val.width() as u16 + 3;
     }
 
-    let (verdict, style) = if health.gateway_loss_pct > 0.0 || health.gateway_rtt_ms.is_none() {
+    let (verdict_text, style) = if health.gateway_loss_pct > 0.0 || health.gateway_rtt_ms.is_none()
+    {
         ("gateway degraded", Style::default().fg(t.status_error))
     } else if health.dns_loss_pct > 0.0 || health.dns_rtt_ms.is_none() {
         ("dns degraded", Style::default().fg(t.status_error))
@@ -936,12 +939,21 @@ fn render_health_line(
     } else if unhealthy {
         ("degraded", Style::default().fg(t.status_error))
     } else {
-        // A status readout, not chrome — `text_muted` is only 1.69:1 on nord
-        // and 2.79:1 on solarized against their canonical backgrounds, so
-        // nothing load-bearing sits on it.
-        ("all nominal", Style::default().fg(t.text_secondary))
+        // Reachability is fine, so the verdict is the diagnose engine's to
+        // give. It distinguishes "nothing is wrong" from "not enough baseline
+        // to say", which reachability alone cannot — and `text_muted` is only
+        // 1.69:1 on nord and 2.79:1 on solarized, so nothing load-bearing
+        // sits on it.
+        (
+            verdict.chip(),
+            Style::default().fg(if verdict.is_clear() {
+                t.text_secondary
+            } else {
+                verdict.color(t)
+            }),
+        )
     };
-    put_right(f, end, ROW_HEALTH, verdict, style);
+    put_right(f, end, ROW_HEALTH, verdict_text, style);
 }
 
 fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
@@ -949,8 +961,8 @@ fn render_table(f: &mut Frame, app: &App, l: &Layout, paused: bool) {
     let end = l.content_x_end();
     let head = Style::default().fg(t.text_secondary);
 
-    put(f, l.x_process, ROW_TABLE_HEAD, "PROCESS", head, end);
-    put(f, l.x_host, ROW_TABLE_HEAD, "HOST", head, end);
+    put(f, l.x_process, ROW_TABLE_HEAD, "process", head, end);
+    put(f, l.x_host, ROW_TABLE_HEAD, "host", head, end);
     put_right(f, l.x_down + W_RATE - 1, ROW_TABLE_HEAD, "DOWN", head);
     put_right(f, l.x_up + W_RATE - 1, ROW_TABLE_HEAD, "UP", head);
     put_right(f, l.x_rtt + W_RTT - 1, ROW_TABLE_HEAD, "RTT", head);

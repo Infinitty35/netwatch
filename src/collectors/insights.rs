@@ -318,6 +318,15 @@ impl InsightsCollector {
     }
 
     /// Cheap snapshot of the latest insights — single atomic refcount bump.
+    /// Most recent narrative paragraph, for the Diagnose tab's optional
+    /// commentary block. `None` until the model has produced one — the tab
+    /// renders its findings either way, because the narrative is commentary
+    /// on facts the deterministic engine already established, never a source
+    /// of them.
+    pub fn latest_narrative(&self) -> Option<String> {
+        self.get_insights().last().map(|i| i.text.clone())
+    }
+
     pub fn get_insights(&self) -> Arc<Vec<Insight>> {
         Arc::clone(&safe_read(&self.insights, "insights::get_insights"))
     }
@@ -443,16 +452,25 @@ fn clean_insight_text(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// The base URL a configured endpoint resolves to.
+///
+/// `"local"` is a config convenience, not an address — telling a user "no
+/// model answering at local" names the setting rather than the thing that
+/// failed, so the UI resolves it the same way the request does.
+pub fn resolve_endpoint(endpoint: &str) -> &str {
+    if endpoint == "local" || endpoint.is_empty() {
+        "http://localhost:11434"
+    } else {
+        endpoint
+    }
+}
+
 fn call_ollama(
     model: &str,
     endpoint: &str,
     prompt: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let base = if endpoint == "local" || endpoint.is_empty() {
-        "http://localhost:11434"
-    } else {
-        endpoint
-    };
+    let base = resolve_endpoint(endpoint);
     let url = format!("{}/api/chat", base);
 
     let body = serde_json::json!({

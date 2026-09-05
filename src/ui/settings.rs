@@ -1,8 +1,9 @@
 use crate::app::App;
 use crate::config::NetwatchConfig;
+use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 pub const SETTINGS_COUNT: usize = 20;
@@ -204,9 +205,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         " Settings ".to_string()
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(&app.theme)
         .title(title)
-        .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);

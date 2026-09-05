@@ -258,7 +258,7 @@ production-capture-specific, and that audience is overwhelmingly Linux.
 
 | Key | Action |
 |-----|--------|
-| `1`–`9`, `0` | Switch tabs (tab `9` Insights appears when AI Insights is enabled; `0` Egress) |
+| `1`–`9`, `0` | Switch tabs (`9` Diagnose, `0` Egress) |
 | `P` | Promote observed egress baseline → `egress-policy.toml` |
 | `↑` `↓` | Navigate |
 | `p` | Pause / resume |
@@ -424,9 +424,10 @@ foreground and background use your terminal's own defaults. If you theme your wh
 with pywal, matugen, or a terminal profile, this is the one that follows along. It's also
 accepted under the names `system` and `ansi` in a config file.
 
-Chart rendering is a separate axis from the theme: `graph_style = "dots"` swaps every
-sparkline's solid blocks for the btop-style braille area plot, and `graph_fade = true` adds
-the fade and grid. Both live in [Configuration](#configuration).
+Chart rendering is a separate axis from the theme. The braille area plot and its magnitude
+gradient are both on by default; `graph_style = "bars"` swaps the plot for solid blocks if
+your font has no braille coverage, and `graph_fade = false` drops the gradient. Both live in
+[Configuration](#configuration).
 
 ---
 
@@ -464,24 +465,30 @@ to start.
 | `theme` | `"dark"` | `dark` `terminal` `ocean` `solarized` `dracula` `nord` `sky` `paper` | Color theme. `terminal` is also accepted as `system` or `ansi`. See [Themes](#themes). |
 | `view` | `"full"` | `full` `lite` `dense` | Which view starts. `--view` overrides it for one run; an unknown name falls back to `full`. |
 | `default_tab` | `"dashboard"` | `dashboard` `connections` `interfaces` `packets` `stats` `topology` `timeline` `processes` `insights` | Tab shown on launch in the full view. |
-| `graph_style` | `"bars"` | `bars` `dots` | Chart rendering for every sparkline in the app. `bars` is solid blocks; `dots` is the btop-style braille area plot, four times the vertical resolution in the same cells. |
-| `graph_fade` | `false` | `true` `false` | The other half of the btop look: columns fade right-bright to left-dim (newest at full intensity, oldest at ~30%), over a faint dot grid that makes magnitude easier to read. |
+| `graph_style` | `"dots"` | `dots` `bars` | Chart rendering for every sparkline in the app. `dots` is the braille area plot: two samples per cell column and four times the vertical resolution, so a sparkline carries twice the history in the same width. `bars` is solid blocks, for terminals whose font has no braille coverage — there the area plot renders as empty boxes. |
+| `graph_fade` | `true` | `true` `false` | The magnitude gradient: every cell is coloured by how high it sits — dim at the baseline, the series colour in the middle, lightened at the peak — over a faint dot grid. It is what makes a filled area read as depth rather than as a block. Themes that defer to the terminal palette switch it off regardless, having no 16-colour gradient to degrade to. |
 | `groups_start_collapsed` | `true` | `true` `false` | Whether the grouped tables (Connections, Egress) open folded. Folded answers "what is on this machine" in one glance; `false` is closer to the old flat tables. |
 
-**The btop look**, both keys together:
+**The plain look**, if braille or colour interpolation is a problem in your terminal:
 
 ```toml
-graph_style = "dots"
-graph_fade  = true
+graph_style = "bars"
+graph_fade  = false
 ```
 
-Two notes on where `graph_style` reaches. It governs *every* chart routed through the graph
-module — the aggregate RX/TX panels, per-interface sparklines, in-row connection lines, RTT
-history, timeline severity layers, and Lite's charts — from v0.28.0 onward; before that, Lite
-hardcoded blocks and ignored it. The Dense view's mirrored throughput graph is the one thing
-it doesn't touch: that plot is braille unconditionally, at two samples per cell column, and
-reads neither key. If braille is what you're after and you have the terminal for it,
-`netwatch --view dense` gets you there with no configuration at all.
+`graph_style` governs *every* chart routed through the graph module — the Dashboard's hero
+tiles and throughput plot, per-interface sparklines, in-row connection lines, RTT history,
+timeline tracks, and Lite's charts. There is one braille renderer behind it, shared with the
+Dense view's mirrored plot, so no two graphs in the tool can drift apart in texture or in
+colour. The Dense view is the one place that stays braille regardless of the setting: it has
+no fallback layout that would fit in blocks.
+
+One asymmetry worth knowing under `bars`. The mirrored half of a shared-axis graph — the
+upload series hanging below the Dashboard's zero line — draws at three fill levels rather
+than eight. The bottom-anchored eighths (`▁`–`▇`) are all in Unicode's Block Elements range;
+their top-anchored counterparts past `▔` and `▀` are in Symbols for Legacy Computing, whose
+font coverage is the thing `bars` exists to avoid depending on. The upward half keeps its
+full resolution.
 
 ### Refresh and capture
 
@@ -526,7 +533,7 @@ port_scan_window_secs = 30          # detection window
 
 | Key | Default | Values | What it does |
 |-----|---------|--------|--------------|
-| `insights_enabled` | `false` | `true` `false` | Enables the Insights tab. Opt-in — see [AI Insights](#ai-insights). |
+| `insights_enabled` | `false` | `true` `false` | Adds an AI narrative block to the Diagnose tab. Opt-in — see [AI Insights](#ai-insights). |
 | `insights_model` | `"llama3.2"` | model name | Model for the Ollama or cloud endpoint. |
 | `insights_endpoint` | `"local"` | `local` or base URL | `local` means `http://localhost:11434`; anything else is used as a base URL. |
 
@@ -535,8 +542,13 @@ port_scan_window_secs = 30          # detection window
 ## AI Insights
 
 *(opt-in, off by default.)* Feed a snapshot — protocol mix, top talkers, DNS queries,
-connection states, health, expert warnings — to an LLM every 15 seconds and get analysis
-rendered in the TUI: anomalies, beaconing patterns, suspicious DNS, health regressions.
+connection states, health, expert warnings — to an LLM every 15 seconds and get a
+plain-language paragraph on top of what the Diagnose tab has already established.
+
+It renders inside Diagnose, under the findings, labelled as commentary. That placement is
+deliberate: detection, cause ranking and remediation are deterministic and run without a
+model, and the narrative is never allowed to be the source of a fact. Everything it could
+mention is on the screen above it, computed from evidence.
 
 Enable via Settings (`,`) → AI Insights. Supports local [Ollama](https://ollama.com)
 (default), a remote Ollama host, or Ollama **cloud models** — no API keys in NetWatch. See

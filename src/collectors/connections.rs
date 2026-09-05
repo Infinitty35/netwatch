@@ -65,6 +65,28 @@ pub struct Connection {
     pub out_of_order: u32,
 }
 
+/// Label shown when a connection has no owning process. Deliberately not
+/// `pid:0`: PID 0 is the kernel swapper, so printing it for a *missing* pid
+/// invented a process that owns nothing. Every screen that once showed
+/// `pid:0 — 644 MB` was reporting unattributed bytes, which sent a review
+/// hunting the Landlock sandbox for a bug that was in this format string.
+pub const UNATTRIBUTED: &str = "unattributed";
+
+/// Display name for a connection's owning process.
+///
+/// Three distinct states, three distinct labels:
+/// * `Some(name)` — attributed, use the name.
+/// * `None` name, `Some(pid)` — the pid is known but `/proc/<pid>/comm` was
+///   unreadable (process exited, or another user's). `pid:<n>` is honest here.
+/// * both `None` — attribution failed. [`UNATTRIBUTED`], never a fake pid.
+pub fn process_label(process_name: Option<&str>, pid: Option<u32>) -> String {
+    match (process_name, pid) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(pid)) => format!("pid:{pid}"),
+        (None, None) => UNATTRIBUTED.to_string(),
+    }
+}
+
 /// Which side of a canonical `StreamKey` the connection's local endpoint sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSide {

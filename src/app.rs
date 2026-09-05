@@ -349,7 +349,11 @@ pub enum Tab {
     Topology,
     Timeline,
     Processes,
-    Insights,
+    /// Issue → cause → remediation → report. Replaced the standalone Insights
+    /// tab: the AI narrative is commentary on findings, so it belongs beside
+    /// them rather than in a tab of its own where it was the only thing on
+    /// screen with an opinion and nothing to base it on.
+    Diagnose,
     Egress,
 }
 
@@ -363,8 +367,23 @@ use crate::sort::{SortColumn, TabSortState};
 /// working directory happened to be. The rest of the codebase already resolves
 /// paths through `dirs` (see `config.rs` and `egress::default_policy_path`);
 /// this brings the three export sites in line.
+/// Where exports land.
+///
+/// The current directory, not the home directory. The Landlock sandbox grants
+/// write access to the CWD it was started in and *not* to `$HOME` (see
+/// `sandbox::linux::collect_read_write`, whose comment already said "PCAP
+/// exports and Flight Recorder bundles land in CWD by default"). While this
+/// returned the home directory, every export under the default sandbox failed
+/// with `Permission denied` — which, with no on-screen confirmation, looked
+/// exactly like an export that had silently done nothing.
+///
+/// Falls back to `$HOME` for the `--no-sandbox` case where the CWD is
+/// somewhere unwritable, and finally to `.`.
 fn export_dir() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+    std::env::current_dir()
+        .ok()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 pub fn sort_columns_for_tab(tab: Tab) -> &'static [SortColumn] {
@@ -439,6 +458,123 @@ pub struct UiScrollState {
     pub egress_scroll: usize,
 }
 
+/// Everything the Diagnose tab owns.
+///
+/// The engine, its baselines and the remediation journal live together
+/// because they are only meaningful together: an issue's σ figures come from
+/// the baselines, and its "applied" status comes from the journal. Splitting
+/// them across `App` would let a render read one without the others.
+pub struct DiagnoseState {
+    pub engine: crate::diagnose::Engine,
+    pub baselines: crate::diagnose::baseline::BaselineStore,
+    pub sampler: crate::diagnose::live::LiveSampler,
+    pub journal: crate::diagnose::remediation::Journal,
+    /// Cursor into `engine.primary()`.
+    pub selected: usize,
+    pub show_report: bool,
+    /// Privileges this process actually holds, resolved once at startup.
+    /// Apply steps beyond it are hidden rather than offered and then refused.
+    pub capability: crate::diagnose::issue::Capability,
+    /// Transient line under the panels: export path, applied confirmation, or
+    /// what startup reconciliation had to undo.
+    pub status: Option<String>,
+    /// An apply step awaiting confirmation, as `(issue id, step key)`.
+    /// Nothing touches the host until the user answers this.
+    pub pending_apply: Option<(String, char)>,
+    /// Set by `--demo`: the engine is fed a recorded scenario instead of the
+    /// live network, and remediations are simulated rather than applied. The
+    /// Diagnose tab says so on every frame. See [`crate::diagnose::demo`].
+    pub demo: Option<crate::diagnose::demo::DemoDriver>,
+    status_tick: u32,
+    /// Ticks since the baselines were last written.
+    persist_tick: u32,
+}
+
+impl DiagnoseState {
+    fn new() -> Self {
+        let fingerprint =
+            crate::diagnose::baseline::NetworkFingerprint::new(String::new(), None, vec![], None);
+        Self {
+            engine: crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock)),
+            baselines: crate::diagnose::baseline::BaselineStore::load(
+                &crate::diagnose::baseline::BaselineStore::default_path(),
+                fingerprint,
+            ),
+            sampler: crate::diagnose::live::LiveSampler::new(),
+            journal: crate::diagnose::remediation::Journal::new(
+                crate::diagnose::remediation::Journal::default_path(),
+            ),
+            selected: 0,
+            show_report: false,
+            capability: detect_capability(),
+            status: None,
+            pending_apply: None,
+            demo: None,
+            status_tick: 0,
+            persist_tick: 0,
+        }
+    }
+
+    /// Swap the live engine for a replay of the recorded scenario.
+    ///
+    /// The engine, its clock and its baselines are all replaced: a demo must
+    /// not inherit the host's real baselines (they describe a different
+    /// network) and must not write to the host's `baselines.json` (it would
+    /// poison them with scenario data). Persistence is disabled for the
+    /// lifetime of the process by `App::tick_diagnose`.
+    pub fn enter_demo_mode(&mut self) {
+        let (driver, engine, baselines) = crate::diagnose::demo::DemoDriver::new();
+        self.demo = Some(driver);
+        self.engine = engine;
+        self.baselines = baselines;
+        self.selected = 0;
+        // The scenario is an operator who can act on what they find, so the
+        // demo offers the key-bound fix regardless of how it was launched.
+        // This is a claim about the scenario, not about this process — the
+        // banner says DEMO on every frame, and the apply path is simulated,
+        // so no privilege is asserted that isn't held.
+        self.capability = crate::diagnose::issue::Capability::Root;
+    }
+
+    pub fn is_demo(&self) -> bool {
+        self.demo.is_some()
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = Some(msg.into());
+        self.status_tick = 0;
+    }
+}
+
+/// What netwatch may do to the host. Apply steps declare what they need and
+/// are hidden when it isn't held — a fix a user can press and then be told
+/// "permission denied" is worse than no fix offered.
+fn detect_capability() -> crate::diagnose::issue::Capability {
+    #[cfg(unix)]
+    {
+        if effective_uid() == 0 {
+            return crate::diagnose::issue::Capability::Root;
+        }
+    }
+    crate::diagnose::issue::Capability::None
+}
+
+/// Effective uid, read from procfs so netwatch doesn't take a libc dependency
+/// for a single call. Falls back to "not root", which can only ever hide a
+/// fix — never offer one that will fail.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .and_then(|uid| uid.parse().ok())
+        })
+        .unwrap_or(1)
+}
+
 pub struct App {
     pub traffic: TrafficCollector,
     pub interface_info: Vec<InterfaceInfo>,
@@ -503,6 +639,8 @@ pub struct App {
     /// `app::run` after `App::new` returns and the privileged fds are
     /// open. Surfaced in the Settings overlay.
     pub sandbox_report: crate::sandbox::Report,
+    /// Issue detection, baselines and remediation. See [`DiagnoseState`].
+    pub diagnose: DiagnoseState,
 }
 
 /// State of the PKTAP attribution path for status display. macOS-only;
@@ -685,7 +823,113 @@ impl App {
             #[cfg(target_os = "macos")]
             pktap_handle,
             sandbox_report: crate::sandbox::Report::default(),
+            diagnose: DiagnoseState::new(),
         }
+    }
+
+    /// One diagnose pass: learn, sample, evaluate.
+    ///
+    /// Order matters. Baselines are updated from this tick's readings
+    /// *before* the detectors run, but the store withholds a baseline until
+    /// it has enough samples, so a metric can never be judged against a mean
+    /// that consists mostly of itself.
+    fn tick_diagnose(&mut self) {
+        // Demo mode: the recorded scenario drives the engine, nothing is
+        // sampled from the host, and nothing is persisted.
+        if let Some(mut driver) = self.diagnose.demo.take() {
+            let baselines = self.diagnose.baselines.clone();
+            driver.tick(&mut self.diagnose.engine, &baselines);
+            self.diagnose.demo = Some(driver);
+
+            let open = self.diagnose.engine.open_count();
+            if self.diagnose.selected >= open {
+                self.diagnose.selected = open.saturating_sub(1);
+            }
+            self.expire_diagnose_status();
+            return;
+        }
+
+        // Track which network we're on. Moving networks parks the old
+        // baselines rather than comparing a hotspot against an office.
+        let fingerprint = crate::diagnose::live::LiveSampler::fingerprint(self);
+        if !fingerprint.iface.is_empty() {
+            self.diagnose.baselines.set_network(fingerprint);
+        }
+
+        let readings = crate::diagnose::live::LiveSampler::readings(self);
+        crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
+
+        // The sampler is moved out for the duration of the borrow: it needs
+        // `&mut self` for its own cross-tick state and `&self` to read the
+        // collectors, which the borrow checker cannot see are disjoint.
+        let mut sampler = std::mem::take(&mut self.diagnose.sampler);
+        let thresholds = self.diagnose.engine.settings().thresholds;
+        let observations = sampler.sample(self, &thresholds);
+        self.diagnose.sampler = sampler;
+
+        let baselines = self.diagnose.baselines.clone();
+        self.diagnose.engine.observe(&observations, &baselines);
+
+        // Keep the cursor on a real row as issues open and close.
+        let open = self.diagnose.engine.open_count();
+        if self.diagnose.selected >= open {
+            self.diagnose.selected = open.saturating_sub(1);
+        }
+
+        self.expire_diagnose_status();
+
+        // Persist baselines every ~5 minutes. A 20-minute session that never
+        // writes has learned nothing the next run can use.
+        self.diagnose.persist_tick += 1;
+        if self.diagnose.persist_tick >= 300 {
+            self.diagnose.persist_tick = 0;
+            let path = crate::diagnose::baseline::BaselineStore::default_path();
+            if let Err(e) = self.diagnose.baselines.save(&path) {
+                tracing::warn!("could not persist baselines to {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Clear the transient Diagnose status line after a few seconds.
+    fn expire_diagnose_status(&mut self) {
+        if self.diagnose.status.is_some() {
+            self.diagnose.status_tick += 1;
+            if self.diagnose.status_tick >= 8 {
+                self.diagnose.status = None;
+                self.diagnose.status_tick = 0;
+            }
+        }
+    }
+
+    /// Undo anything a previous netwatch left behind, before the UI draws.
+    ///
+    /// A run that was killed can't revert its own changes, so the next run
+    /// does it. Without this, "netwatch reverts on quit" is a promise that
+    /// breaks exactly when it matters most.
+    pub fn reconcile_remediations(&mut self) {
+        let mut host = crate::diagnose::remediation::RealHost;
+        self.diagnose.journal = crate::diagnose::remediation::Journal::load(
+            crate::diagnose::remediation::Journal::default_path(),
+            &host,
+        );
+        let outcome = self.diagnose.journal.reconcile(&mut host);
+        if let Some(summary) = outcome.summary() {
+            tracing::info!("remediation reconciliation: {summary}");
+            self.diagnose.set_status(summary);
+        }
+    }
+
+    /// Revert this session's remediations and flush the baselines. Best
+    /// effort — anything that fails here is picked up by the next run's
+    /// reconciliation pass.
+    pub fn shutdown_diagnose(&mut self) {
+        let mut host = crate::diagnose::remediation::RealHost;
+        let outcome = self.diagnose.journal.revert_session(&mut host);
+        for msg in outcome.abandoned {
+            tracing::warn!("could not revert on quit: {msg}");
+        }
+        let path = crate::diagnose::baseline::BaselineStore::default_path();
+        let _ = self.diagnose.baselines.save(&path);
     }
 
     /// State of the PKTAP attribution path for the Connections header.
@@ -766,6 +1010,7 @@ impl App {
             fade: self.user_config.graph_fade,
             bg: self.theme.bg,
             terminal_palette: self.theme.defers_to_terminal(),
+            baseline: true,
         }
     }
 
@@ -1227,9 +1472,10 @@ impl App {
             self.freeze_incident_recorder(&reason);
         }
 
-        // Refresh health every ~5 ticks (5s) — and piggyback the CPU% sampler.
+        // Refresh health every `HEALTH_PROBE_TICKS` ticks — and piggyback the
+        // CPU% sampler.
         self.health_tick += 1;
-        if self.health_tick >= 5 {
+        if self.health_tick >= HEALTH_PROBE_TICKS {
             self.health_tick = 0;
             let gateway = self.config_collector.config.gateway.clone();
             let dns = self.config_collector.config.primary_dns();
@@ -1241,6 +1487,8 @@ impl App {
                 self.tcp_info.update();
             }
         }
+
+        self.tick_diagnose();
 
         // Feed AI insights collector with a fresh network snapshot
         if let Some(ref collector) = self.insights_collector {
@@ -1418,8 +1666,18 @@ pub async fn run<B: Backend>(
     remote: Option<&crate::remote::RemotePublisher>,
     sandbox_mode: crate::sandbox::Mode,
     view: Option<ViewMode>,
+    demo: bool,
 ) -> Result<()> {
     let mut app = App::new();
+    if demo {
+        app.diagnose.enter_demo_mode();
+        // Live capture needs CAP_NET_RAW, so without a recorded conversation
+        // the packets tab is blank in the demo — on the machines most likely
+        // to be running it.
+        app.packet_collector.seed_demo_capture();
+        app.ui.scroll.packet_selected = Some(6);
+        app.ui.current_tab = Tab::Diagnose;
+    }
     // CLI wins over the saved config: `--view dense` is a decision about this
     // run, not a change to the user's default.
     if let Some(v) = view {
@@ -1429,6 +1687,12 @@ pub async fn run<B: Backend>(
         // broken. Nothing is written to disk unless the user presses `S`.
         app.user_config.view = v.name().to_string();
     }
+
+    // Undo anything a previous run left on the host before the sandbox goes
+    // up — reverting a resolv.conf edit needs write access the sandbox is
+    // about to take away, and it needs to happen before the first frame so a
+    // user never sees a screen shaped by a change they didn't ask for.
+    app.reconcile_remediations();
 
     // Apply the security sandbox after App::new finishes — pcap handles,
     // PKTAP attributor, and the eBPF kprobe are all up at this point, so
@@ -1517,7 +1781,7 @@ pub async fn run<B: Backend>(
                     Tab::Topology => ui::topology::render(f, &app, area),
                     Tab::Timeline => ui::timeline::render(f, &app, area),
                     Tab::Processes => ui::processes::render(f, &app, area),
-                    Tab::Insights => ui::insights::render(f, &app, area),
+                    Tab::Diagnose => ui::diagnose::render(f, &app, area),
                     Tab::Egress => ui::egress::render(f, &app, area),
                 },
             }
@@ -1547,6 +1811,11 @@ pub async fn run<B: Backend>(
                 if handle_key(&mut app, key) {
                     app.packet_collector.stop_capture();
                     app.egress_profiler.persist_now();
+                    // Put back anything this session changed on the host, and
+                    // flush the baselines it learned. A run that is killed
+                    // instead of quit is covered by the next run's
+                    // reconciliation pass.
+                    app.shutdown_diagnose();
                     return Ok(());
                 }
             }
@@ -1718,6 +1987,7 @@ pub async fn run_headless(
     // Graceful shutdown: stop capture, then flush whatever is still buffered.
     app.packet_collector.stop_capture();
     app.egress_profiler.persist_now();
+    app.shutdown_diagnose();
     if let Some(publisher) = remote {
         publisher.shutdown(std::time::Duration::from_secs(8));
     }
@@ -1978,10 +2248,7 @@ fn update_top_proc_rx_history(
         if c.state != "ESTABLISHED" {
             continue;
         }
-        let name = c
-            .process_name
-            .clone()
-            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        let name = crate::collectors::connections::process_label(c.process_name.as_deref(), c.pid);
         let entry = current.entry((name, c.pid)).or_insert(0.0);
         *entry += c.rx_rate.unwrap_or(0.0);
     }
@@ -2069,8 +2336,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {
             // Header row: click on tabs (row 0 or 1 within header area)
             if row < 3 {
-                if let Some(tab) = ui::widgets::tab_at_column(col, app.user_config.insights_enabled)
-                {
+                if let Some(tab) = ui::widgets::tab_at_column(col) {
                     app.ui.current_tab = tab;
                     return;
                 }
@@ -2309,9 +2575,9 @@ fn scroll_tab(app: &mut App, delta: isize) {
             let max = app.process_bandwidth.ranked().len().saturating_sub(1);
             app.ui.scroll.process_scroll = clamp_scroll(app.ui.scroll.process_scroll, delta, max);
         }
-        Tab::Insights => {
-            app.ui.scroll.insights_scroll =
-                clamp_scroll(app.ui.scroll.insights_scroll, delta, usize::MAX);
+        Tab::Diagnose => {
+            let max = app.diagnose.engine.open_count().saturating_sub(1);
+            app.diagnose.selected = clamp_scroll(app.diagnose.selected, delta, max);
         }
         Tab::Interfaces => {
             let max = app.traffic.interface_count().saturating_sub(1);
@@ -2490,11 +2756,6 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                             } else {
                                 None
                             };
-                            if !app.user_config.insights_enabled
-                                && app.ui.current_tab == Tab::Insights
-                            {
-                                app.ui.current_tab = Tab::Dashboard;
-                            }
                         }
                         app.ui.settings_status = Some("✓ Applied".into());
                         app.ui.settings_status_tick = 0;
@@ -2811,9 +3072,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             // file (Horizon 3: observe → *promote* → warn-on-drift).
             app.promote_egress_policy();
         }
-        KeyCode::Char('t')
-            if app.ui.current_tab != Tab::Timeline && app.ui.current_tab != Tab::Stats =>
-        {
+        KeyCode::Char('t') if t_cycles_theme(app.ui.current_tab) => {
             let names = crate::theme::THEME_NAMES;
             let current = names.iter().position(|&n| n == app.theme.name).unwrap_or(0);
             let next = (current + 1) % names.len();
@@ -2823,7 +3082,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char(',') => {
             app.ui.show_settings = !app.ui.show_settings;
             app.ui.settings_editing = false;
-            if app.ui.show_settings && app.ui.current_tab == Tab::Insights {
+            if app.ui.show_settings && app.ui.current_tab == Tab::Diagnose {
                 app.ui.settings_cursor = ui::settings::cursor::AI_INSIGHTS;
             }
         }
@@ -2861,6 +3120,51 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         // `V` walks full → lite → dense → full. `L` still jumps straight to
         // Lite, so nobody's muscle memory breaks.
         KeyCode::Char('V') | KeyCode::Char('v') => cycle_view(app),
+        // Confirmation for a remediation that will change host state. It has
+        // to come before every other binding: while a prompt is up, `y` must
+        // mean "yes", not "copy summary".
+        KeyCode::Char('y') | KeyCode::Enter
+            if app.ui.current_tab == Tab::Diagnose && app.diagnose.pending_apply.is_some() =>
+        {
+            apply_pending_remediation(app);
+        }
+        KeyCode::Char('n') | KeyCode::Esc
+            if app.ui.current_tab == Tab::Diagnose && app.diagnose.pending_apply.is_some() =>
+        {
+            app.diagnose.pending_apply = None;
+            app.diagnose.set_status("not applied");
+        }
+        KeyCode::Enter if app.ui.current_tab == Tab::Diagnose => {
+            stage_remediation(app);
+        }
+        KeyCode::Char('a') if app.ui.current_tab == Tab::Diagnose => {
+            if let Some(id) = selected_issue_id(app) {
+                if app.diagnose.engine.ack(&id) {
+                    app.diagnose
+                        .set_status(format!("{id} acknowledged — still open, just quiet"));
+                }
+            }
+        }
+        KeyCode::Char('m') if app.ui.current_tab == Tab::Diagnose => {
+            if let Some(id) = selected_issue_id(app) {
+                if app.diagnose.engine.mute(&id, 60) {
+                    app.diagnose.set_status(format!("{id} muted for 1h"));
+                }
+            }
+        }
+        KeyCode::Char('o') if app.ui.current_tab == Tab::Diagnose => {
+            app.diagnose.show_report = !app.diagnose.show_report;
+        }
+        KeyCode::Char('y') if app.ui.current_tab == Tab::Diagnose => {
+            let summary = diagnose_summary(app);
+            match crate::clipboard::copy(&summary) {
+                Ok(via) => app.diagnose.set_status(format!("summary copied ({via})")),
+                Err(e) => app.diagnose.set_status(format!("copy failed: {e}")),
+            }
+        }
+        KeyCode::Char('e') if app.ui.current_tab == Tab::Diagnose => {
+            export_diagnose_report(app);
+        }
         KeyCode::Char('1') => app.ui.current_tab = Tab::Dashboard,
         KeyCode::Char('2') => app.ui.current_tab = Tab::Connections,
         KeyCode::Char('3') => app.ui.current_tab = Tab::Interfaces,
@@ -2869,9 +3173,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('6') => app.ui.current_tab = Tab::Topology,
         KeyCode::Char('7') => app.ui.current_tab = Tab::Timeline,
         KeyCode::Char('8') => app.ui.current_tab = Tab::Processes,
-        KeyCode::Char('9') if app.user_config.insights_enabled => {
-            app.ui.current_tab = Tab::Insights;
-        }
+        KeyCode::Char('9') => app.ui.current_tab = Tab::Diagnose,
         KeyCode::Char('0') => app.ui.current_tab = Tab::Egress,
         // Stream view controls (intercept before other Packets keys)
         KeyCode::Esc if app.ui.current_tab == Tab::Packets && app.ui.stream_view_open => {
@@ -2883,7 +3185,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('h') if app.ui.current_tab == Tab::Packets && app.ui.stream_view_open => {
             app.ui.stream_hex_mode = !app.ui.stream_hex_mode;
         }
-        KeyCode::Char('a') if app.ui.current_tab == Tab::Insights => {
+        KeyCode::Char('i') if app.ui.current_tab == Tab::Diagnose => {
             if let Some(ref collector) = app.insights_collector {
                 let packets = app.packet_collector.get_packets();
                 let conns = app.connection_collector.connections();
@@ -2973,11 +3275,22 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.packet_collector.start_capture(&iface, bpf.as_deref());
             }
         }
+        // `x` narrows the list to the expert findings. It used to *clear the
+        // capture*, which is a destructive action on an unshifted letter next
+        // to `s` and `c` — and the design hands `x` to a harmless filter, so
+        // anyone learning the keymap from the screen would have wiped their
+        // buffer. Clearing now needs the shift key, like every other
+        // irreversible action in the tool.
         KeyCode::Char('x') if app.ui.current_tab == Tab::Packets => {
+            app.ui.packet_expert_only = !app.ui.packet_expert_only;
+            app.ui.scroll.packet_scroll = 0;
+        }
+        KeyCode::Char('X') if app.ui.current_tab == Tab::Packets => {
             app.packet_collector.clear();
             app.ui.scroll.packet_scroll = 0;
             app.ui.scroll.packet_selected = None;
             app.caches.bookmarks.clear();
+            app.ui.export_status = Some("Capture cleared".into());
         }
         KeyCode::Char('m') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
             if let Some(sel_id) = app.ui.scroll.packet_selected {
@@ -2992,7 +3305,34 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             if let Some((idx, pkt)) = packets
                 .iter()
                 .enumerate()
+                .find(|(_, p)| p.id > current_id && crate::ui::packets::is_expert(p))
+            {
+                app.ui.scroll.packet_selected = Some(pkt.id);
+                app.ui.scroll.packet_scroll = idx;
+                app.ui.packet_follow = false;
+            }
+        }
+        KeyCode::Char(']') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
+            let packets = app.packet_collector.get_packets();
+            let current_id = app.ui.scroll.packet_selected.unwrap_or(0);
+            if let Some((idx, pkt)) = packets
+                .iter()
+                .enumerate()
                 .find(|(_, p)| p.id > current_id && app.caches.bookmarks.contains(&p.id))
+            {
+                app.ui.scroll.packet_selected = Some(pkt.id);
+                app.ui.scroll.packet_scroll = idx;
+                app.ui.packet_follow = false;
+            }
+        }
+        KeyCode::Char('[') if app.ui.current_tab == Tab::Packets && !app.ui.stream_view_open => {
+            let packets = app.packet_collector.get_packets();
+            let current_id = app.ui.scroll.packet_selected.unwrap_or(u64::MAX);
+            if let Some((idx, pkt)) = packets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, p)| p.id < current_id && app.caches.bookmarks.contains(&p.id))
             {
                 app.ui.scroll.packet_selected = Some(pkt.id);
                 app.ui.scroll.packet_scroll = idx;
@@ -3006,7 +3346,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, p)| p.id < current_id && app.caches.bookmarks.contains(&p.id))
+                .find(|(_, p)| p.id < current_id && crate::ui::packets::is_expert(p))
             {
                 app.ui.scroll.packet_selected = Some(pkt.id);
                 app.ui.scroll.packet_scroll = idx;
@@ -3034,6 +3374,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 && !app.ui.traceroute_view_open =>
         {
             app.ui.connection_group = app.ui.connection_group.cycle();
+        }
+        KeyCode::Char('t') if app.ui.current_tab == Tab::Dashboard => {
+            app.ui.dashboard_log_scale = !app.ui.dashboard_log_scale;
         }
         KeyCode::Char('t') if app.ui.current_tab == Tab::Stats => {
             app.ui.stats_range = app.ui.stats_range.cycle();
@@ -3414,6 +3757,83 @@ fn top_remote_ips(app: &App) -> Vec<(String, usize)> {
         .map(|(ip, _, count, _)| (ip, count))
         .collect()
 }
+/// Refresh ticks between health probes.
+///
+/// The gateway / dns / internet histories advance once per probe while the
+/// traffic histories advance once per tick, so one health sample spans
+/// `HEALTH_PROBE_TICKS` traffic samples. Anything plotting them on a shared
+/// time axis has to know that; it was a bare `5` in the tick loop and a second
+/// bare `5` in the Timeline tab, which is two places to get it wrong.
+pub const HEALTH_PROBE_TICKS: u32 = 5;
+
+/// Wall-clock span every rolling history retains.
+///
+/// The dashboard stacks throughput and the latency probes on one time axis, so
+/// they have to hold the *same amount of past* — otherwise the shorter series
+/// stops extending part-way across the panel while its neighbours keep going,
+/// and the stack stops meaning anything. That is what happened: traffic kept
+/// 600 samples at one per tick (10 minutes) while the health probes kept 60 at
+/// one per five ticks (5 minutes), so on a 10-minute panel the latency tracks
+/// were frozen at the halfway mark for the life of the session.
+///
+/// Retention is therefore expressed once, in seconds, and each collector
+/// converts it using its own cadence. `histories_cover_the_same_window`
+/// asserts they land on the same number.
+pub const HISTORY_WINDOW_SECS: u64 = 600;
+
+/// Samples a per-tick history needs to cover [`HISTORY_WINDOW_SECS`].
+pub const fn tick_history_len(refresh_ms: u64) -> usize {
+    let tick_secs = if refresh_ms < 1000 {
+        1
+    } else {
+        refresh_ms / 1000
+    };
+    (HISTORY_WINDOW_SECS / tick_secs) as usize
+}
+
+/// Samples a per-probe history needs to cover [`HISTORY_WINDOW_SECS`].
+pub const fn probe_history_len(refresh_ms: u64) -> usize {
+    let tick_secs = if refresh_ms < 1000 {
+        1
+    } else {
+        refresh_ms / 1000
+    };
+    let probe_secs = tick_secs * HEALTH_PROBE_TICKS as u64;
+    (HISTORY_WINDOW_SECS / probe_secs) as usize
+}
+
+/// Tabs that bind `t` to a control of their own, so theme cycling must not
+/// claim it there.
+///
+/// The list exists because the guard used to be an inline `!=` chain: adding
+/// the Dashboard's scale toggle without extending it meant `t` silently
+/// cycled the theme instead, which looks like the toggle not working rather
+/// than like a key collision. Theme cycling is still reachable from `,` on
+/// every tab.
+pub(crate) const TABS_WITH_OWN_T: &[Tab] = &[Tab::Dashboard, Tab::Stats, Tab::Timeline];
+
+/// Whether `t` means "next theme" on this tab.
+pub(crate) fn t_cycles_theme(tab: Tab) -> bool {
+    !TABS_WITH_OWN_T.contains(&tab)
+}
+
+#[cfg(test)]
+mod key_conflict_tests {
+    use super::*;
+
+    /// A tab that advertises `t` for its own control must not also be cycling
+    /// the theme underneath it.
+    #[test]
+    fn tabs_with_their_own_t_do_not_also_cycle_the_theme() {
+        for &tab in TABS_WITH_OWN_T {
+            assert!(!t_cycles_theme(tab), "{tab:?} binds t itself");
+        }
+        for tab in [Tab::Connections, Tab::Packets, Tab::Topology, Tab::Egress] {
+            assert!(t_cycles_theme(tab), "{tab:?} has no t of its own");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn sort_connections(conns: &mut [Connection], column: usize) {
     crate::ui::connections::sort(conns, column, true);
@@ -3731,7 +4151,7 @@ mod tests {
             Tab::Stats,
             Tab::Topology,
             Tab::Timeline,
-            Tab::Insights,
+            Tab::Diagnose,
         ];
         for tab in &non_sortable {
             assert!(
@@ -4150,6 +4570,36 @@ mod tests {
 
     // ── RTT history cap tests ───────────────────────────────────────────
 
+    /// The dashboard stacks these two series on one axis, so they must retain
+    /// the same amount of past. They drifted once — traffic ten minutes,
+    /// health five — and the symptom was a track that stopped extending
+    /// half-way across the panel and stayed there.
+    #[test]
+    fn histories_cover_the_same_window() {
+        for refresh_ms in [1000, 2000, 5000] {
+            let tick_secs = (refresh_ms / 1000).max(1);
+            let tick_cover = tick_history_len(refresh_ms) as u64 * tick_secs;
+            let probe_cover =
+                probe_history_len(refresh_ms) as u64 * tick_secs * HEALTH_PROBE_TICKS as u64;
+            assert_eq!(
+                tick_cover, probe_cover,
+                "at {refresh_ms}ms the traffic history covers {tick_cover}s \
+                 and the health history {probe_cover}s"
+            );
+            assert_eq!(tick_cover, HISTORY_WINDOW_SECS);
+        }
+    }
+
+    #[test]
+    fn a_probe_history_is_shorter_but_reaches_just_as_far_back() {
+        // Fewer samples, same span — that is the whole point.
+        assert!(probe_history_len(1000) < tick_history_len(1000));
+        assert_eq!(
+            probe_history_len(1000) as u32 * HEALTH_PROBE_TICKS,
+            tick_history_len(1000) as u32
+        );
+    }
+
     #[test]
     fn rtt_history_caps_per_ip_samples() {
         let mut history: HashMap<String, VecDeque<f64>> = HashMap::new();
@@ -4271,5 +4721,238 @@ mod tests {
         ];
         // No UP interface with IPv4 (besides lo) → any UP non-loopback.
         assert_eq!(App::pick_capture_interface(&info, None), "eno1");
+    }
+}
+
+// ── Diagnose actions ────────────────────────────────────────────────
+
+fn selected_issue_id(app: &App) -> Option<String> {
+    let primary = app.diagnose.engine.primary();
+    primary
+        .get(app.diagnose.selected.min(primary.len().saturating_sub(1)))
+        .map(|i| i.id.clone())
+}
+
+/// One-line summary of what is wrong, for `y` and for the export toast.
+/// Reads from the same `Issue` the screen renders, so a pasted summary always
+/// matches the screenshot next to it.
+fn diagnose_summary(app: &App) -> String {
+    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
+    verdict.line()
+}
+
+/// Stage the first applicable remediation for confirmation.
+///
+/// Nothing is written here. Apply steps change host state — the resolver, a
+/// qdisc, a socket — and a keystroke away from an irreversible edit is not a
+/// design, so the actual work happens only after the prompt is answered.
+fn stage_remediation(app: &mut App) {
+    let Some(id) = selected_issue_id(app) else {
+        return;
+    };
+    let cap = app.diagnose.capability;
+    let Some(issue) = app.diagnose.engine.get(&id) else {
+        return;
+    };
+    let step = issue
+        .remediation
+        .iter()
+        .find(|s| s.kind == crate::diagnose::issue::StepKind::Apply && s.available(cap));
+
+    match step {
+        Some(step) => {
+            let key = step.key.unwrap_or('1');
+            let text = step.text.clone();
+            app.diagnose.pending_apply = Some((id, key));
+            app.diagnose
+                .set_status(format!("apply: {text}?  y = yes, n = no"));
+        }
+        None => {
+            let has_any = issue
+                .remediation
+                .iter()
+                .any(|s| s.kind == crate::diagnose::issue::StepKind::Apply);
+            app.diagnose.set_status(if has_any {
+                format!(
+                    "nothing to apply — the fix for this issue needs {}",
+                    crate::diagnose::issue::Capability::Root.label()
+                )
+            } else {
+                "nothing netwatch can apply for this issue — see the steps listed".to_string()
+            });
+        }
+    }
+}
+
+/// Carry out a confirmed remediation, journalling before it writes.
+fn apply_pending_remediation(app: &mut App) {
+    let Some((id, key)) = app.diagnose.pending_apply.take() else {
+        return;
+    };
+    let Some(issue) = app.diagnose.engine.get(&id) else {
+        return;
+    };
+    let Some(step) = issue.remediation.iter().find(|s| s.key == Some(key)) else {
+        return;
+    };
+    let Some(action) = step.action.clone() else {
+        return;
+    };
+
+    // Demo mode simulates the remediation: the scenario changes what the
+    // resolver reports, and the engine's own verify condition closes the
+    // issue. Nothing on this host is written to.
+    if let Some(mut driver) = app.diagnose.demo.take() {
+        let applied = driver.apply(&action);
+        app.diagnose.demo = Some(driver);
+        let msg = match &applied {
+            crate::diagnose::issue::Applied::Yes { before, after, .. } => {
+                format!("simulated · {before} → {after} · watching for verify to hold")
+            }
+            crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
+            crate::diagnose::issue::Applied::Reverted { reason, .. } => {
+                format!("reverted · {reason}")
+            }
+        };
+        app.diagnose.engine.record_applied(&id, key, applied);
+        app.diagnose.set_status(msg);
+        return;
+    }
+
+    let mut host = crate::diagnose::remediation::RealHost;
+    let outcome = match &action {
+        crate::diagnose::issue::Action::SetResolver { addr } => {
+            let target = std::path::Path::new("/etc/resolv.conf");
+            let current = std::fs::read_to_string(target).unwrap_or_default();
+            let new = crate::diagnose::remediation::resolv_conf_with(&current, addr);
+            app.diagnose.journal.apply_file_edit(
+                &mut host,
+                &id,
+                action.clone(),
+                target,
+                &new,
+                crate::diagnose::remediation::first_nameserver,
+            )
+        }
+        // Every other action is either an instruction or not yet wired to a
+        // host change. Recording "not applied" beats pretending.
+        _ => Ok(crate::diagnose::issue::Applied::No {
+            reason: "netwatch cannot perform this step itself".into(),
+        }),
+    };
+
+    match outcome {
+        Ok(applied) => {
+            let msg = match &applied {
+                crate::diagnose::issue::Applied::Yes { before, after, .. } => {
+                    format!("applied · {before} → {after} · reverts on quit unless made permanent")
+                }
+                crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
+                crate::diagnose::issue::Applied::Reverted { reason, .. } => {
+                    format!("reverted · {reason}")
+                }
+            };
+            app.diagnose.engine.record_applied(&id, key, applied);
+            app.diagnose.set_status(msg);
+        }
+        Err(e) => {
+            app.diagnose
+                .set_status(format!("could not apply: {e} — host unchanged"));
+        }
+    }
+}
+
+/// Write `report.md` and `report.json`, and say where they went.
+///
+/// The old `E` export wrote eight files and 6.4 MB with no on-screen
+/// confirmation and no path, which meant users could not tell it had worked.
+/// This one names the directory in the status line.
+fn export_diagnose_report(app: &mut App) {
+    if app.diagnose.is_demo() {
+        // A report full of scenario data, sitting in a real directory with a
+        // real timestamp, is precisely the artefact that later gets mistaken
+        // for a measurement. The demo shows the preview instead.
+        app.diagnose.show_report = true;
+        app.diagnose
+            .set_status("demo — report preview shown; export is disabled for recorded data");
+        return;
+    }
+    let report = build_diagnose_report(app);
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let dir = export_dir().join(format!("netwatch_diagnose_{stamp}"));
+
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("report.md"), report.to_markdown())?;
+        std::fs::write(
+            dir.join("report.json"),
+            report
+                .to_json()
+                .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
+        )?;
+        Ok(())
+    };
+
+    match write() {
+        Ok(()) => app
+            .diagnose
+            .set_status(format!("report.md + report.json → {}", dir.display())),
+        Err(e) => app.diagnose.set_status(format!("export failed: {e}")),
+    }
+}
+
+/// Assemble a report from live state. Issues come straight from the engine,
+/// so the export is the screen.
+pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
+    let cfg = &app.config_collector.config;
+    let base = &app.diagnose.baselines;
+    let issues = app.diagnose.engine.issues().to_vec();
+
+    let mut timeline: Vec<crate::diagnose::report::TimelineEvent> = issues
+        .iter()
+        .map(|i| crate::diagnose::report::TimelineEvent {
+            at: i.since.clone(),
+            kind: "issue".into(),
+            text: format!("{} · {}", i.title, i.subject.label()),
+        })
+        .collect();
+    timeline.sort_by(|a, b| a.at.cmp(&b.at));
+
+    let iface_info = app
+        .interface_info
+        .iter()
+        .find(|i| i.name == app.capture_interface);
+
+    crate::diagnose::report::Report {
+        generated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        window_start: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        window_end: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        environment: crate::diagnose::report::Environment {
+            host: cfg.hostname.clone(),
+            iface: app.capture_interface.clone(),
+            driver: None,
+            kernel: None,
+            qdisc: None,
+            resolvers: cfg.dns_servers.clone(),
+            gateway: cfg.gateway.clone(),
+            netwatch_version: env!("CARGO_PKG_VERSION").to_string(),
+            ruleset_version: "v1".to_string(),
+            baseline_state: format!(
+                "{} on {}{}",
+                base.overall_readiness().label(),
+                base.fingerprint().label(),
+                if base.switched_network() {
+                    " (network changed this session)"
+                } else {
+                    ""
+                }
+            ),
+        },
+        issues,
+        timeline,
+        artifacts: iface_info
+            .and_then(|i| i.mac.clone())
+            .map(|_| vec!["report.json".to_string()])
+            .unwrap_or_default(),
     }
 }

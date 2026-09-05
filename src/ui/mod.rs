@@ -1,9 +1,9 @@
 pub mod connections;
 pub mod dashboard;
 pub mod dense;
+pub mod diagnose;
 pub mod egress;
 pub mod help;
-pub mod insights;
 pub mod interfaces;
 pub mod lite;
 pub mod memory_stats;
@@ -12,6 +12,7 @@ pub mod processes;
 pub mod settings;
 pub mod sort_picker;
 pub mod stats;
+pub mod stream_context;
 pub mod timeline;
 pub mod topology;
 pub mod tree;

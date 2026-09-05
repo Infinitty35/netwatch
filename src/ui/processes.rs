@@ -4,10 +4,7 @@ use crate::app::App;
 use crate::collectors::process_bandwidth::ProcessBandwidth;
 use crate::sort::{apply_direction, cmp_case_insensitive, cmp_f64, SortColumn, TabSortState};
 use crate::ui::widgets;
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{prelude::*, widgets::Paragraph};
 
 pub const COLUMNS: &[SortColumn] = &[
     SortColumn { name: "Process" },
@@ -158,9 +155,9 @@ fn render_sort_chips(f: &mut Frame, app: &App, area: Rect) {
 fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: Rect) {
     let t = &app.theme;
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " PROCESSES ",
+            " processes ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
@@ -169,9 +166,7 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
                 Style::default().fg(t.text_muted),
             ))
             .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -179,7 +174,7 @@ fn render_process_table(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], a
         return;
     }
 
-    let header = "  PROCESS              PID    CONNS    RX/s        TX/s      RX TOTAL    TX TOTAL    RTT      CPU";
+    let header = "  process              pid    conns    rx/s        tx/s      rx total    tx total    rtt      cpu";
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             header,
@@ -337,7 +332,7 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
             p.process_name,
             p.pid.map(|x| x.to_string()).unwrap_or_else(|| "—".into())
         ),
-        None => " DETAIL ".to_string(),
+        None => " detail ".to_string(),
     };
     let title_right = match selected {
         Some(p) => format!(
@@ -348,17 +343,18 @@ fn render_drill_in(f: &mut Frame, app: &App, ranked: &[ProcessBandwidth], area: 
         None => " ↑↓ to switch ".to_string(),
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
             title_left,
             Style::default().fg(t.status_warn).bold(),
         )))
         .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+            Line::from(Span::styled(
+                title_right,
+                Style::default().fg(t.brand).bold(),
+            ))
+            .alignment(Alignment::Right),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -396,7 +392,7 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     let t = &app.theme;
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "TOP REMOTES",
+            "top remotes",
             Style::default().fg(t.text_muted),
         ))),
         Rect::new(area.x, area.y, area.width, 1),
@@ -409,10 +405,8 @@ fn render_top_remotes(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwi
     // report identical traffic. host -> (rate B/s, connection count).
     let mut per_host: HashMap<String, (f64, u32)> = HashMap::new();
     for c in conns.iter() {
-        let conn_name = c
-            .process_name
-            .clone()
-            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        let conn_name =
+            crate::collectors::connections::process_label(c.process_name.as_deref(), c.pid);
         if conn_name != proc.process_name {
             continue;
         }
@@ -497,10 +491,8 @@ fn render_socket_states(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBand
     let conns = app.connection_collector.connections();
     let mut counts: HashMap<&'static str, u32> = HashMap::new();
     for c in conns.iter() {
-        let conn_name = c
-            .process_name
-            .clone()
-            .unwrap_or_else(|| format!("pid:{}", c.pid.unwrap_or(0)));
+        let conn_name =
+            crate::collectors::connections::process_label(c.process_name.as_deref(), c.pid);
         if conn_name != proc.process_name {
             continue;
         }
@@ -576,11 +568,10 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
     }
     let chart_area = Rect::new(area.x, area.y + 1, area.width, chart_h);
     if !data.is_empty() {
-        let padded = pad_history(&data, area.width as usize);
         crate::graph::render(
             f,
             chart_area,
-            &padded,
+            &data,
             app.graph_style,
             t.rx_rate,
             t.status_warn,
@@ -629,14 +620,10 @@ fn render_rx_chart(f: &mut Frame, app: &App, area: Rect, proc: &ProcessBandwidth
 // ── helpers ─────────────────────────────────────────────────
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
     let hints = vec![
-        Span::styled("s", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Sort  "),
-        Span::styled("e", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Export  "),
-        Span::styled("Enter", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":→Connections"),
+        widgets::hint("s", "sort"),
+        widgets::hint("e", "export csv"),
+        widgets::hint("↵", "connections"),
     ];
     widgets::render_footer(f, app, area, hints);
 }
@@ -661,16 +648,4 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-fn pad_history(data: &[u64], target_width: usize) -> Vec<u64> {
-    if target_width == 0 {
-        return Vec::new();
-    }
-    if data.len() >= target_width {
-        return data[data.len() - target_width..].to_vec();
-    }
-    let mut padded = vec![0u64; target_width - data.len()];
-    padded.extend_from_slice(data);
-    padded
 }

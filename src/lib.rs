@@ -34,6 +34,7 @@ pub mod app;
 pub mod clipboard;
 pub mod collectors;
 pub mod config;
+pub mod diagnose;
 pub mod dpi;
 pub mod ebpf;
 pub mod event;

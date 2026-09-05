@@ -1389,6 +1389,7 @@ fn short_bits(bps: u64) -> String {
 fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
     let h = app.health_prober.status();
     let degraded = is_degraded(app);
+    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
     let conns = collect_conns(app);
 
     // The design's fourth hop is "a configured peer". We don't have one, so the
@@ -1411,7 +1412,9 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
         &paint::PanelOpts {
             key: Some("3"),
             title: Some("health"),
-            sub: Some(if degraded { "degraded" } else { "all nominal" }),
+            // Same rule as everywhere else: only the engine may say nominal,
+            // and only once it has the baselines to back it.
+            sub: Some(if degraded { "degraded" } else { verdict.chip() }),
             right: Some(if degraded { "● DEGRADED" } else { "● OK" }),
             right_style: Some(Style::default().fg(if degraded {
                 t.status_error

@@ -1,9 +1,10 @@
 use crate::sort::{SortColumn, TabSortState};
 use crate::theme::Theme;
+use crate::ui::widgets;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 // -- state --
@@ -163,9 +164,8 @@ pub fn render(
     f.render_widget(Clear, popup);
     crate::ui::widgets::paint_overlay_bg(f, theme, popup);
 
-    let block = Block::default()
+    let block = widgets::panel_block(theme)
         .title(" Sort by ")
-        .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.brand));
     let inner = block.inner(popup);
     f.render_widget(block, popup);

@@ -7,7 +7,7 @@ use crate::theme::Theme;
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{BorderType, Paragraph},
 };
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -110,14 +110,12 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(">200ms / loss ", Style::default().fg(t.text_muted)),
     ])
     .alignment(Alignment::Right);
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " TOPOLOGY ",
+            " topology ",
             Style::default().fg(t.brand).bold(),
         )))
-        .title(legend)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        .title(legend);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -167,13 +165,14 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     let self_h = 4u16;
     let self_w = lan_w;
     let self_y = inner.y;
-    let self_block = Block::default()
+    let self_block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " SELF ",
+            " self ",
             Style::default().fg(t.brand).bold(),
         )))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        // Emphasis is the accent border, not a second border weight — one
+        // box in double lines next to nine in rounded ones reads as a
+        // different kind of object, which "this machine" is not.
         .border_style(Style::default().fg(t.brand));
     let self_rect = Rect::new(lan_x, self_y, self_w, self_h);
     let self_inner_inner = self_block.inner(self_rect);
@@ -203,14 +202,12 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     let gw_color = gw_health.1;
     let router_h = 4u16;
     let router_y = mid_y.saturating_sub(router_h / 2);
-    let router_block = Block::default()
+    let router_block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " ROUTER ",
-            Style::default().fg(t.text_muted),
+            " router ",
+            Style::default().fg(t.brand).bold(),
         )))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t.border));
+        .border_type(BorderType::Rounded);
     let router_rect = Rect::new(router_x, router_y, router_w, router_h);
     let router_inner = router_block.inner(router_rect);
     f.render_widget(router_block, router_rect);
@@ -248,14 +245,12 @@ fn render_topology_graph(f: &mut Frame, app: &App, area: Rect) {
     };
     let isp_h = 4u16;
     let isp_y = mid_y.saturating_sub(isp_h / 2);
-    let isp_block = Block::default()
+    let isp_block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " ISP GATEWAY ",
-            Style::default().fg(t.text_muted),
+            " isp gateway ",
+            Style::default().fg(t.brand).bold(),
         )))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t.border));
+        .border_type(BorderType::Rounded);
     let isp_rect = Rect::new(isp_x, isp_y, isp_w, isp_h);
     let isp_inner = isp_block.inner(isp_rect);
     f.render_widget(isp_block, isp_rect);
@@ -426,8 +421,8 @@ fn render_side_column(
 ) {
     let t = &app.theme;
     let header_text = match side {
-        Side::Left => " LAN PEERS ",
-        Side::Right => " INTERNET ",
+        Side::Left => " lan peers ",
+        Side::Right => " internet ",
     };
     let align = match side {
         Side::Left => Alignment::Left,
@@ -553,7 +548,7 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
     let result =
         crate::app::safe_lock(&app.traceroute_runner.result, "topology::render_hop_detail");
 
-    let title_left = format!(" HOP DETAIL  self → {} ", result.target);
+    let title_left = format!(" hop detail  self → {} ", result.target);
     let title_right = match result.status {
         TracerouteStatus::Idle => " press T to traceroute ".to_string(),
         TracerouteStatus::Running => " ⏳ running… ".to_string(),
@@ -566,7 +561,7 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
         _ => t.text_muted,
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
             title_left,
             Style::default().fg(t.status_warn).bold(),
@@ -577,9 +572,7 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(title_right_color),
             ))
             .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -588,7 +581,7 @@ fn render_hop_detail(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let header =
-        "  HOP   HOST                              IP                    RTT      LOSS    JITTER";
+        "  hop   host                              ip                    rtt      loss    jitter";
     let header_area = Rect {
         x: inner.x + 1,
         y: inner.y,
@@ -747,14 +740,10 @@ fn render_hop_row(
 // ── helpers ─────────────────────────────────────────────────
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
     let hints = vec![
-        Span::styled("↑↓", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Select remote  "),
-        Span::styled("T", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Traceroute  "),
-        Span::styled("Enter", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":→Connections"),
+        widgets::hint("↑↓", "remote"),
+        widgets::hint("T", "trace"),
+        widgets::hint("↵", "connections"),
     ];
     widgets::render_footer(f, app, area, hints);
 }

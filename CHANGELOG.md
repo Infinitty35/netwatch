@@ -4,6 +4,97 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-09-05
+
+The release that stops NetWatch at "here is what your network is doing" and
+takes it to "here is what is wrong, why, and what to do about it".
+
+### Added
+- **Diagnose (tab `9`) — issue → probable cause → remediation → verified
+  close.** A deterministic engine, no model required. Per-metric EWMA baselines
+  learned over 30 minutes, a 25-rule catalogue with an explicit suppression
+  graph, causes ranked by the checks that discriminated between them, key-bound
+  reversible fixes, and `report.md` / `report.json` generated from the same
+  `Vec<Issue>` the screen renders — so the export and the screenshot cannot
+  disagree. A test walks the markdown and fails if any line quotes a number no
+  evidence field can justify.
+
+  Four of the 25 rules are listed as `Planned` and can never open an issue:
+  NetWatch does not yet have their inputs (a DNSSEC reference query, per-reply
+  DNS flags, wireless statistics, a STUN probe). The Diagnose header states the
+  split. Two further detectors run against inputs that do not exist yet and say
+  so rather than guessing — there is no loaded-RTT test, so the local
+  bufferbloat rule is dormant and the remote rule's strongest check reports
+  *not run*; link rate is uncollected, so the saturation rule stays quiet
+  rather than assuming 1 Gb and crying wolf on wifi.
+
+- **A verdict line on every tab**, reading from that same issue list: what is
+  wrong, since when, and what to press.
+- **`--demo`** replays a recorded incident through the real engine, rules and
+  UI, so the feature can be seen without waiting 30 minutes for baselines or
+  breaking your own DNS. Every frame is labelled, remediations are simulated,
+  and the issue still closes through the normal verify path.
+
+### Changed
+- **btop-style chrome across the whole tool.** Every box now comes from one
+  `widgets::Panel` — rounded corners, title inline in the accent, metadata
+  right-aligned in the same border row. There were 48 hand-built blocks across
+  15 files before this, agreeing by convention; two of them had already drifted
+  to different border styles on the same screen. Tab bar, table headers and
+  panel titles moved to the tool's lowercase voice.
+- **AI Insights is no longer a tab.** It renders inside Diagnose as clearly
+  labelled commentary on findings the deterministic engine has already
+  established — which is where the design always said it belonged.
+
+### Fixed
+- **Dashboard streams did not advance together.** Traffic history kept 600
+  samples at one per tick (10 minutes); the health probes kept 60 at one per
+  five ticks (5 minutes). The dashboard plots both on one 10-minute axis, so
+  past the five-minute mark the latency tracks stopped extending and sat frozen
+  at the halfway point for the rest of the session. Retention is now expressed
+  once in seconds and each collector converts it with its own cadence; a test
+  asserts the two cover the same window at 1s, 2s and 5s refresh rates.
+- **Latency graphs rendered as flat lines.** RTT was rounded to whole
+  milliseconds before plotting, so a 0.5 ms resolver collapsed to 0/1 and any
+  non-zero sample drew at full height; and a raw `max()` ceiling let a single
+  200 ms spike scale everything else to the floor. Both directions produced a
+  flat line, which reads as "this stream stopped updating". RTT now plots in
+  microseconds against a 95th-percentile ceiling with headroom above the
+  median.
+- **`E` export silently did nothing under the sandbox.** Exports were written
+  to `$HOME`, which Landlock makes read-only; every export failed with
+  `Permission denied` and, with no on-screen confirmation, looked exactly like
+  an export that had worked. They now land in the working directory the sandbox
+  actually grants, and the path appears on screen.
+- **A healthy router could be reported as a `critical` gateway outage.** An
+  unprivileged NetWatch cannot always send ICMP and plenty of routers drop echo
+  with no open port, so a failed probe meant very little on its own — and
+  `HealthProber` starts every series at 100% loss, making "not probed yet"
+  indistinguishable from "down". The rule now requires corroboration: if
+  anything beyond the gateway answers, packets are demonstrably transiting it.
+- **`pid:0` owned megabytes of traffic.** It was never a PID — it was what the
+  label printed when attribution returned `None`, so "644 MB owned by pid:0"
+  meant 644 MB unattributed. Unattributed traffic now says so.
+- **One dropped frame a minute was a finding**, and a per-second delta was
+  reported as a per-minute rate. The interface rule now sums a real 60-second
+  window and a wireless NIC must clear 60 drops, or one genuine error, before
+  anyone hears about it.
+- **AI Insights failed invisibly.** With the feature enabled and no model
+  reachable, the collector's status reached no surface at all — no narrative,
+  no error, no hint anything had been attempted. Diagnose now renders the block
+  whenever the feature is on, naming the address it tried and what to do.
+- **The connections state column truncated `ESTABLISHED` to `ESTABLI…`**, which
+  is not a state anyone can look up. Socket states now have short names that
+  fit whole.
+- **The timeline's "now" cursor overwrote its newest sample** with a `│` one
+  column in from the panel border, reading as doubled chrome. It tints the
+  cells already there instead, which is what the legend always claimed.
+- Footer advertised `1-8:Tab` and `--help` said `1-7`, while the bar drew ten
+  tabs. The tab-bar click hit-test also addressed a layout the bar no longer
+  used, so clicks landed on the wrong tab.
+- `screenshots/` (2.8 MiB) is excluded from the published crate, as
+  `docs/media/` already was.
+
 ## [0.29.2] - 2026-08-16
 
 ### Fixed

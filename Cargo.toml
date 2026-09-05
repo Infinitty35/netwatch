@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-tui"
-version = "0.29.2"
+version = "0.30.0"
 edition = "2021"
 authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
 description = "Real-time network diagnostics in your terminal. One command, zero config, instant visibility."
@@ -16,6 +16,9 @@ exclude = [
     # excluded from the published crate — crates.io has a 10 MiB limit and
     # these are most of the repo's bytes.
     "docs/media/",
+    # Per-tab screen captures, same reasoning: 2.8 MiB of documentation assets
+    # that a `cargo install` has no use for.
+    "screenshots/",
     "*.mov",
     "*.cast",
 ]

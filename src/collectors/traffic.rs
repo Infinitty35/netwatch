@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Instant;
 
-// Capped at 600 samples (10 min @ 1 Hz) so wide terminals can fill their
-// throughput sparkline without trailing empty cells. Per-interface memory cost
-// is ~5 KiB (600 × 8 bytes × 2 series), which is trivial.
-const SPARKLINE_HISTORY: usize = 600;
+// One sample per refresh tick, retained for `HISTORY_WINDOW_SECS` so this
+// series covers the same span as the health probes it is stacked against on
+// the dashboard timeline. Per-interface cost at the default 1 Hz is ~9.4 KiB
+// (600 × 8 bytes × 2 series), which is trivial.
+const SPARKLINE_HISTORY: usize = crate::app::tick_history_len(1000);
 
 #[derive(Debug, Clone)]
 pub struct InterfaceTraffic {

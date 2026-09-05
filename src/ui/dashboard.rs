@@ -1,12 +1,11 @@
-use crate::app::{App, AttributionStatus};
+use crate::app::App;
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::sort::{SortColumn, TabSortState};
 use crate::ui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Cell, Paragraph, Row, Table},
 };
-use std::collections::HashMap;
 
 pub const COLUMNS: &[SortColumn] = &[];
 
@@ -15,127 +14,336 @@ pub const DEFAULT_SORT: TabSortState = TabSortState {
     ascending: true,
 };
 
+/// Rows the hero row needs: value, baseline, `since`, and two borders — the
+/// title costs nothing now that it lives in the top border.
+const KPI_ROWS: u16 = 5;
+/// Throughput and health side by side.
+const MID_ROWS: u16 = 14;
+/// The incident timeline, when the screen is tall enough to earn it.
+const TIMELINE_ROWS: u16 = 6;
+/// How far back the timeline looks.
+const TIMELINE_WINDOW_SECS: u64 = 600;
+/// How far back the KPI tiles' sparklines look.
+///
+/// Fixed, and the same for every tile, because the five sit in one row and are
+/// read across. They used to plot "the last N samples" of whatever fed them —
+/// and the latency probes sample once per five ticks while throughput samples
+/// every tick, so the gateway tile was showing five minutes next to a
+/// throughput tile showing one, at identical width. Same column, different
+/// moment, no way to tell.
+const KPI_WINDOW_SECS: u64 = 300;
+/// Below this the timeline is dropped rather than squeezing the connections
+/// list, which is the panel a reader is actually working in.
+const TIMELINE_MIN_HEIGHT: u16 = 38;
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // The active-interface panel that used to hold half of the mid band is
+    // gone: mac, mtu, queues, offload and qdisc are the Interfaces tab's
+    // subject, and on the dashboard they cost a column that the throughput
+    // graph and the health findings both had too little of.
+    let show_timeline = area.height >= TIMELINE_MIN_HEIGHT;
+    let mut constraints = vec![
+        Constraint::Length(3),        // header
+        Constraint::Length(KPI_ROWS), // hero row
+        Constraint::Length(MID_ROWS), // throughput + health
+        Constraint::Min(6),           // connections
+    ];
+    if show_timeline {
+        constraints.push(Constraint::Length(TIMELINE_ROWS));
+    }
+    constraints.push(Constraint::Length(3)); // footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(5),  // KPI strip
-            Constraint::Length(12), // Active Iface + Throughput
-            Constraint::Min(8),     // Top Conns + Health
-            Constraint::Length(3),  // footer
-        ])
+        .constraints(constraints)
         .split(area);
 
     widgets::render_header(f, app, chunks[0]);
     render_kpi_strip(f, app, chunks[1]);
     render_mid_section(f, app, chunks[2]);
-    render_bottom_section(f, app, chunks[3]);
-    render_footer(f, app, chunks[4]);
+    render_connections(f, app, chunks[3]);
+    if show_timeline {
+        render_timeline(f, app, chunks[4]);
+    }
+    render_footer(f, app, chunks[chunks.len() - 1]);
 }
 
 // ── KPI strip ───────────────────────────────────────────────
 
-fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-        ])
-        .split(area);
-
-    let hs = app.health_prober.status();
-    let gw_history = rtt_history_to_u64(hs.gateway_rtt_history.as_slices().0);
-    let dns_history = rtt_history_to_u64(hs.dns_rtt_history.as_slices().0);
-    let loss_history = rtt_history_to_loss(hs.gateway_rtt_history.as_slices().0);
-
-    // GW RTT
-    render_kpi_tile(
-        f,
-        app,
-        cols[0],
-        "GW RTT",
-        hs.gateway_rtt_ms.map(|v| format!("{:.1}", v)),
-        "ms",
-        trend_for_rtt(hs.gateway_rtt_history.as_slices().0),
-        rtt_status_color(app, hs.gateway_rtt_ms, hs.gateway_loss_pct),
-        &gw_history,
-    );
-
-    // DNS RTT
-    render_kpi_tile(
-        f,
-        app,
-        cols[1],
-        "DNS RTT",
-        hs.dns_rtt_ms.map(|v| format!("{:.1}", v)),
-        "ms",
-        trend_for_rtt(hs.dns_rtt_history.as_slices().0),
-        rtt_status_color(app, hs.dns_rtt_ms, hs.dns_loss_pct),
-        &dns_history,
-    );
-
-    // LOSS
-    let max_loss = hs.gateway_loss_pct.max(hs.dns_loss_pct);
-    let loss_color = if max_loss < 1.0 {
-        app.theme.status_good
-    } else if max_loss < 50.0 {
-        app.theme.status_warn
-    } else {
-        app.theme.status_error
-    };
-    render_kpi_tile(
-        f,
-        app,
-        cols[2],
-        "LOSS",
-        Some(format!("{:.0}", max_loss)),
-        "%",
-        TrendDisplay::neutral(),
-        loss_color,
-        &loss_history,
-    );
-
-    // THROUGHPUT
-    let interfaces = app.traffic.interfaces();
-    let total_rate: f64 = active_ifaces(&interfaces, &app.interface_info)
-        .iter()
-        .map(|i| i.rx_rate + i.tx_rate)
-        .sum();
-    let throughput_history = aggregate_history(&interfaces, &app.interface_info);
-    let (val_str, unit_str) = format_rate_split(total_rate);
-    render_kpi_tile(
-        f,
-        app,
-        cols[3],
-        "THROUGHPUT",
-        Some(val_str),
-        &unit_str,
-        trend_for_throughput(&throughput_history, app),
-        app.theme.rx_rate,
-        &throughput_history,
-    );
+/// A hero-row number together with what netwatch knows about it.
+///
+/// The v0.29 tiles showed a value and a trend arrow, which says whether the
+/// last few samples went up — not whether the number is *wrong*. `41 ms` means
+/// nothing until you know the resolver normally answers in 1.2. So every tile
+/// that has a baseline carries `base · σ · nominal | N.Nσ`, and the one that
+/// is deviating says since when.
+struct Reading {
+    /// `base 1.2 · σ 0.4 · 3.2σ`, or a plain qualifier for metrics with no
+    /// learned distribution.
+    detail: String,
+    /// Set when the metric is currently the subject of an open issue.
+    since: Option<String>,
+    severity: Color,
 }
 
-struct TrendDisplay {
-    arrow: &'static str,
-    delta: String,
-    color: Color,
-}
-
-impl TrendDisplay {
-    fn neutral() -> Self {
+impl Reading {
+    /// A metric with no baseline: the qualifier is whatever the tile can say
+    /// for itself.
+    fn plain(detail: impl Into<String>, severity: Color) -> Self {
         Self {
-            arrow: "→",
-            delta: String::new(),
-            color: Color::Reset,
+            detail: detail.into(),
+            since: None,
+            severity,
+        }
+    }
+
+    /// Look up `metric` on `subject` in the baseline store and describe
+    /// `value` against it.
+    ///
+    /// Returns the learning state rather than a verdict when the store has not
+    /// seen enough samples — "still learning" is an honest thing for a hero
+    /// tile to say, and inventing `nominal` from four samples is not.
+    fn baselined(app: &App, subject: &str, metric: &str, value: Option<f64>) -> Self {
+        let t = &app.theme;
+        let store = &app.diagnose.baselines;
+        let readiness = store.readiness(subject, metric);
+        let Some(base) = store.get(subject, metric) else {
+            return Reading::plain(readiness.label(), t.text_muted);
+        };
+        if !readiness.is_ready() {
+            return Reading::plain(readiness.label(), t.text_muted);
+        }
+        let Some(v) = value else {
+            return Reading::plain(
+                format!("base {} · no reading", fmt_ms(base.mean)),
+                t.text_muted,
+            );
+        };
+
+        let sigma = base.sigma();
+        let above = base.sigma_above(v).unwrap_or(0.0);
+        // Only deviation upward is interesting for a latency metric: a
+        // resolver answering faster than baseline is not a finding.
+        let (qualifier, severity) = if above >= 3.0 {
+            (format!("{above:.1}σ"), t.status_error)
+        } else if above >= 2.0 {
+            (format!("{above:.1}σ"), t.status_warn)
+        } else {
+            ("nominal".to_string(), t.status_good)
+        };
+
+        // `since` comes from the open issue, not from a second clock — the
+        // tile and the Diagnose tab must not disagree about when this started.
+        let rule = crate::diagnose::live::BASELINED_METRICS
+            .iter()
+            .find(|(m, _)| *m == metric)
+            .map(|(_, r)| *r);
+        let since = rule.and_then(|r| {
+            app.diagnose
+                .engine
+                .issues()
+                .iter()
+                .find(|i| i.rule == r && i.state.is_open() && i.subject.label() == subject)
+                .map(|i| crate::diagnose::issue::short_time(&i.since).to_string())
+        });
+
+        Reading {
+            detail: format!(
+                "base {} · σ {} · {qualifier}",
+                fmt_ms(base.mean),
+                fmt_ms(sigma)
+            ),
+            since,
+            severity,
         }
     }
 }
 
+/// Milliseconds at the precision the number deserves: sub-10ms values carry a
+/// decimal because 0.1 and 0.4 are different answers, above that they do not.
+fn fmt_ms(v: f64) -> String {
+    if v < 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    }
+}
+
+/// The hero row: five tiles, each a number netwatch is prepared to defend.
+///
+/// The set changed from v0.29. `internet rtt` was already being probed and
+/// baselined and simply never drawn — the one measurement that separates "my
+/// router is fine, the line is down" from "my router is down". `retrans` took
+/// the slot `throughput` held, because throughput is the panel immediately
+/// below this row and a tile of the same number twice is a wasted fifth of the
+/// Wall-clock span covered by `samples` taken one per health probe.
+fn probe_window_secs(app: &App, samples: usize) -> u64 {
+    let tick_secs = (app.user_config.refresh_rate_ms / 1000).max(1);
+    samples as u64 * tick_secs * crate::app::HEALTH_PROBE_TICKS as u64
+}
+
+/// row.
+fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 5); 5])
+        .split(area);
+
+    let t = &app.theme;
+    let hs = app.health_prober.status();
+    let cfg = &app.config_collector.config;
+    let gw_history = rtt_history_to_u64(hs.gateway_rtt_history.as_slices().0);
+    let dns_history = rtt_history_to_u64(hs.dns_rtt_history.as_slices().0);
+    let net_history = rtt_history_to_u64(hs.internet_rtt_history.as_slices().0);
+    let loss_history = rtt_history_to_loss(hs.gateway_rtt_history.as_slices().0);
+    // Health series advance once per probe; anything sampled per tick would
+    // pass `tick_secs` instead. Both land on `KPI_WINDOW_SECS`.
+    let tick_secs = (app.user_config.refresh_rate_ms / 1000).max(1);
+    let probe_secs = tick_secs * crate::app::HEALTH_PROBE_TICKS as u64;
+
+    let gw_subject = cfg.gateway.clone().unwrap_or_default();
+    let dns_subject = cfg.primary_dns().unwrap_or_default();
+
+    render_kpi_tile(
+        f,
+        app,
+        cols[0],
+        "gateway rtt",
+        hs.gateway_rtt_ms.map(fmt_ms),
+        "ms",
+        Reading::baselined(app, &gw_subject, "gateway.rtt", hs.gateway_rtt_ms),
+        &gw_history,
+        probe_secs,
+    );
+
+    render_kpi_tile(
+        f,
+        app,
+        cols[1],
+        "dns rtt",
+        hs.dns_rtt_ms.map(fmt_ms),
+        "ms",
+        Reading::baselined(app, &dns_subject, "dns.rtt_p50", hs.dns_rtt_ms),
+        &dns_history,
+        probe_secs,
+    );
+
+    render_kpi_tile(
+        f,
+        app,
+        cols[2],
+        "internet rtt",
+        hs.internet_rtt_ms.map(fmt_ms),
+        "ms",
+        Reading::baselined(app, "internet", "path.rtt", hs.internet_rtt_ms),
+        &net_history,
+        probe_secs,
+    );
+
+    // Loss has no learned distribution: the only healthy value is zero, so
+    // there is nothing to be σ away from. It says what window it measured
+    // over instead, which is the thing a reader would otherwise assume wrong.
+    let max_loss = hs.gateway_loss_pct.max(hs.dns_loss_pct);
+    let loss_color = if max_loss < 1.0 {
+        t.status_good
+    } else if max_loss < 50.0 {
+        t.status_warn
+    } else {
+        t.status_error
+    };
+    render_kpi_tile(
+        f,
+        app,
+        cols[3],
+        "loss",
+        Some(format!("{max_loss:.0}")),
+        "%",
+        Reading::plain(
+            // Health samples are one per probe, not one per second: counting
+            // them as seconds under-reported the window by the probe cadence,
+            // so a five-minute loss figure was labelled "60s".
+            // Clamped to the sparkline beside it: the label names the window
+            // the reader is looking at, not everything retained behind it.
+            format!(
+                "{}s window",
+                probe_window_secs(app, hs.gateway_rtt_history.len()).min(KPI_WINDOW_SECS)
+            ),
+            loss_color,
+        ),
+        &loss_history,
+        probe_secs,
+    );
+
+    // Retransmits per minute across every socket with tcp_info, and where they
+    // are concentrated. "12/min spread over forty sockets" and "12/min all on
+    // one" are different problems, and the second is the common one.
+    let (retrans_per_min, worst) = session_retrans(app);
+    let retrans_color = if retrans_per_min == 0.0 {
+        t.status_good
+    } else if retrans_per_min < 10.0 {
+        t.status_warn
+    } else {
+        t.status_error
+    };
+    let retrans_detail = match worst {
+        Some((peer, share)) if share >= 0.8 => format!("all on {peer}"),
+        Some((peer, _)) => format!("most on {peer}"),
+        None => "none in session".to_string(),
+    };
+    render_kpi_tile(
+        f,
+        app,
+        cols[4],
+        "retrans",
+        Some(format!("{retrans_per_min:.0}")),
+        "/min",
+        Reading::plain(retrans_detail, retrans_color),
+        &[],
+        probe_secs,
+    );
+}
+
+/// Session retransmits per minute, and the peer carrying most of them.
+///
+/// `Connection::retransmits` is a per-socket total from `tcp_info`, so the rate
+/// is that total over how long netwatch has been watching. Sockets that closed
+/// before this sample are not counted — the number describes what is open now,
+/// which is what the tile's second line says.
+fn session_retrans(app: &App) -> (f64, Option<(String, f64)>) {
+    let conns = app.connection_collector.connections();
+    let total: u64 = conns.iter().map(|c| c.retransmits as u64).sum();
+    if total == 0 {
+        return (0.0, None);
+    }
+    let minutes = (app.session_started_at.elapsed().as_secs_f64() / 60.0).max(1.0 / 60.0);
+
+    let worst = conns
+        .iter()
+        .filter(|c| c.retransmits > 0)
+        .max_by_key(|c| c.retransmits)
+        .map(|c| {
+            (
+                remote_host_only(&c.remote_addr),
+                c.retransmits as f64 / total as f64,
+            )
+        });
+    (total as f64 / minutes, worst)
+}
+
+/// One hero tile.
+///
+/// ```text
+/// ╭ dns rtt ─────────────────────╮   <- title in the border, severity-coloured
+/// │ 41 ms              ▁▂▃▂▁     │   <- value, unit, inline history
+/// │ base 1.2 · σ 0.4 · 3.2σ      │
+/// │ since 06:48                  │   <- only while it is deviating
+/// ╰──────────────────────────────╯
+/// ```
+///
+/// Status reaches the reader through the label and the border, not through a
+/// dot in front of the number: a coloured bullet is a fifth thing on the row
+/// competing with four that carry meaning, and the spec reserves status colour
+/// for the value's relationship to its threshold.
 fn render_kpi_tile(
     f: &mut Frame,
     app: &App,
@@ -143,261 +351,127 @@ fn render_kpi_tile(
     label: &str,
     value: Option<String>,
     unit: &str,
-    trend: TrendDisplay,
-    dot_color: Color,
+    reading: Reading,
     history: &[u64],
+    secs_per_sample: u64,
 ) {
     let t = &app.theme;
-    let trend_color = if trend.color == Color::Reset {
-        t.text_muted
-    } else {
-        trend.color
-    };
-    let trend_text = if trend.delta.is_empty() {
-        format!(" {} ", trend.arrow)
-    } else {
-        format!(" {} {} ", trend.arrow, trend.delta)
-    };
-
-    let title = Line::from(vec![Span::styled(
-        format!(" {} ", label),
-        Style::default().fg(t.text_muted),
-    )]);
-    let block = Block::default()
-        .title(title)
-        .title_alignment(Alignment::Left)
-        .title(
-            Line::from(Span::styled(trend_text, Style::default().fg(trend_color)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.height == 0 {
+    // A tile only takes a coloured border when it is actually saying
+    // something. Bordering every tile green makes the amber one no louder.
+    let alarmed = reading.severity == t.status_warn || reading.severity == t.status_error;
+    // The title rides in the border, like every other box in the tool. It used
+    // to sit on the first content row, which spent a row on a heading and made
+    // the hero tiles the one panel shape that did not match the rest.
+    let inner = widgets::Panel::styled(vec![Span::styled(
+        label.to_string(),
+        Style::default().fg(reading.severity).bold(),
+    )])
+    .border(if alarmed { reading.severity } else { t.border })
+    .fit(area.width)
+    .render(f, t, area);
+    if inner.height == 0 || inner.width < 4 {
         return;
     }
 
-    // Row 0 of inner: ● value unit
-    let value_line = Line::from(vec![
-        Span::styled("● ", Style::default().fg(dot_color)),
-        Span::styled(
-            value.clone().unwrap_or_else(|| "—".into()),
-            Style::default().fg(t.text_primary).bold(),
-        ),
-        Span::raw(" "),
-        Span::styled(unit.to_string(), Style::default().fg(t.text_muted)),
-    ]);
-    let value_area = Rect {
+    let row = |n: u16| Rect {
         x: inner.x + 1,
-        y: inner.y,
+        y: inner.y + n,
         width: inner.width.saturating_sub(2),
         height: 1,
     };
-    f.render_widget(Paragraph::new(value_line), value_area);
 
-    // Row 1+ of inner: sparkline
-    if inner.height >= 2 && !history.is_empty() {
-        let spark_area = Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
-            height: inner.height - 1,
-        };
-        let padded = pad_history(history, spark_area.width as usize);
-        crate::graph::render(
-            f,
-            spark_area,
-            &padded,
-            app.graph_style,
-            t.rx_rate,
-            t.status_warn,
-            app.graph_opts(),
+    // Row 0 — value and unit on the left, the history sparkline on the right.
+    {
+        let value_line = Line::from(vec![
+            Span::styled(
+                value.clone().unwrap_or_else(|| "—".into()),
+                Style::default().fg(t.text_primary).bold(),
+            ),
+            Span::styled(format!(" {unit}"), Style::default().fg(t.text_muted)),
+        ]);
+        let used =
+            value.as_ref().map(|v| v.chars().count()).unwrap_or(1) + 1 + unit.chars().count();
+        f.render_widget(Paragraph::new(value_line), row(0));
+
+        // The sparkline takes whatever the number left, down to a floor below
+        // which it is noise rather than a trend.
+        let spark_w = (inner.width as usize).saturating_sub(used + 3);
+        if !history.is_empty() && spark_w >= 8 {
+            let spark = Rect {
+                x: inner.x + inner.width - 1 - spark_w as u16,
+                y: inner.y,
+                width: spark_w as u16,
+                height: 1,
+            };
+            // Onto the shared window, so a column is the same moment in every
+            // tile whatever cadence fed it.
+            let data = crate::graph::resample_to_window(
+                history,
+                secs_per_sample,
+                KPI_WINDOW_SECS,
+                spark_w,
+            );
+            let max = crate::graph::robust_max(&data, 0.95);
+            crate::graph::render_bucketed_with_max(
+                f,
+                spark,
+                &data,
+                max,
+                app.graph_style,
+                reading.severity,
+                app.graph_opts(),
+            );
+        }
+    }
+
+    // Row 1 — the baseline. Row 2 — when it started, if it has.
+    if inner.height >= 2 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                widgets::ellipsise(&reading.detail, inner.width.saturating_sub(2) as usize),
+                Style::default().fg(t.text_muted),
+            ))),
+            row(1),
         );
+    }
+    if inner.height >= 3 {
+        if let Some(since) = &reading.since {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("since {since}"),
+                    Style::default().fg(reading.severity),
+                ))),
+                row(2),
+            );
+        }
     }
 }
 
 // ── Mid section: Active Interface + Throughput ──────────────
 
 fn render_mid_section(f: &mut Frame, app: &App, area: Rect) {
+    // Health is fixed-width because its content is: four target rows and a
+    // paragraph. The graph takes everything else, since more columns is
+    // literally more samples on screen.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(42), Constraint::Min(0)])
+        .constraints([Constraint::Min(40), Constraint::Length(52)])
         .split(area);
 
-    render_active_interface(f, app, cols[0]);
-    render_throughput_chart(f, app, cols[1]);
+    render_throughput_chart(f, app, cols[0]);
+    render_health(f, app, cols[1]);
 }
 
-fn render_active_interface(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
-    let interfaces = app.traffic.interfaces();
-    let actives = active_ifaces(&interfaces, &app.interface_info);
-    let primary = actives.first().copied();
-    // Only call an iface "live" if it had traffic in the last few seconds.
-    // Using a small lookback into the rate history instead of the
-    // instantaneous tick rate stops the live/idle counts from flickering
-    // between bursts — `i.rx_rate` is genuinely 0 most ticks even on busy
-    // interfaces.
-    let live_count = actives
-        .iter()
-        .filter(|i| widgets::interface_recently_active(i))
-        .count();
-    let idle: Vec<_> = interfaces
-        .iter()
-        .filter(|i| !widgets::interface_recently_active(i))
-        .collect();
-
-    let title_right = format!(" {} live  {} idle ", live_count, idle.len());
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            " ACTIVE INTERFACE ",
-            Style::default().fg(t.brand).bold(),
-        )))
-        .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    if let Some(p) = primary {
-        let info = app.interface_info.iter().find(|i| i.name == p.name);
-        let ip = info
-            .and_then(|i| i.ipv4.clone())
-            .unwrap_or_else(|| "—".into());
-        let mtu = info.and_then(|i| i.mtu).unwrap_or(0);
-        let role = crate::ui::interfaces::role_for(&p.name, info.and_then(|i| i.is_wireless));
-        let is_up = info.map(|i| i.is_up).unwrap_or(false);
-        let status_span = if is_up {
-            Span::styled("● UP", Style::default().fg(t.status_good))
-        } else {
-            Span::styled("● DOWN", Style::default().fg(t.status_error))
-        };
-
-        // Line 0: en0  192.168.0.213  wifi MTU 1500  ● UP
-        lines.push(Line::from(vec![
-            Span::styled(p.name.clone(), Style::default().fg(t.brand).bold()),
-            Span::raw("  "),
-            Span::styled(ip, Style::default().fg(t.text_primary)),
-            Span::raw("  "),
-            Span::styled(
-                if mtu > 0 {
-                    format!("{}  MTU {}", role, mtu)
-                } else {
-                    role.to_string()
-                },
-                Style::default().fg(t.text_muted),
-            ),
-            Span::raw("  "),
-            status_span,
-        ]));
-
-        // Line 1: blank (was SSID line in mockup)
-        lines.push(Line::from(""));
-
-        // Line 2: RX  rate    TX  rate
-        lines.push(Line::from(vec![
-            Span::styled("RX ", Style::default().fg(t.text_muted)),
-            Span::styled(
-                widgets::format_bytes_rate(p.rx_rate),
-                Style::default().fg(t.rx_rate).bold(),
-            ),
-            Span::raw("    "),
-            Span::styled("TX ", Style::default().fg(t.text_muted)),
-            Span::styled(
-                widgets::format_bytes_rate(p.tx_rate),
-                Style::default().fg(t.tx_rate).bold(),
-            ),
-        ]));
-
-        // Line 3: total 95 GB    total 22 GB
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("   total {}", widgets::format_bytes_total(p.rx_bytes_total)),
-                Style::default().fg(t.text_muted),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("   total {}", widgets::format_bytes_total(p.tx_bytes_total)),
-                Style::default().fg(t.text_muted),
-            ),
-        ]));
-
-        // divider
-        lines.push(Line::from(Span::styled(
-            "─".repeat(inner.width.saturating_sub(2) as usize),
-            Style::default().fg(t.border),
-        )));
-
-        // OTHER ACTIVE
-        lines.push(Line::from(Span::styled(
-            "OTHER ACTIVE",
-            Style::default().fg(t.text_muted),
-        )));
-
-        for other in actives
-            .iter()
-            .skip(1)
-            .filter(|i| widgets::interface_recently_active(i))
-            .take(3)
-        {
-            let other_info = app.interface_info.iter().find(|i| i.name == other.name);
-            let other_ip = other_info
-                .and_then(|i| i.ipv4.clone())
-                .unwrap_or_else(|| "—".into());
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:<8}", other.name),
-                    Style::default().fg(t.text_primary),
-                ),
-                Span::styled(
-                    format!(" {:>9}  ", widgets::format_bytes_rate(other.rx_rate)),
-                    Style::default().fg(t.rx_rate),
-                ),
-                Span::styled(other_ip, Style::default().fg(t.text_muted)),
-            ]));
-        }
-
-        // Idle summary
-        if !idle.is_empty() {
-            let names: String = idle
-                .iter()
-                .take(8)
-                .map(|i| i.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            lines.push(Line::from(Span::styled(
-                format!("{} IDLE: {}", idle.len(), names),
-                Style::default().fg(t.text_muted),
-            )));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "No active interface",
-            Style::default().fg(t.text_muted),
-        )));
-    }
-
-    let para = Paragraph::new(lines);
-    let content_area = Rect {
-        x: inner.x + 1,
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: inner.height,
-    };
-    f.render_widget(para, content_area);
-}
-
+/// Throughput, mirrored around a shared zero line.
+///
+/// Two things were wrong with the stacked version. It drew rx and tx as
+/// separate graphs each autoscaled to its own peak, so a 7 MB/s download and a
+/// 2 MB/s upload rendered the same height — the one comparison the panel
+/// exists to support was the one it could not be used for. And it had no
+/// y-axis at all, so no height meant a rate.
+///
+/// Now both series share one maximum, rx grows up from the middle and tx grows
+/// down, and the axis is labelled at the top, the zero line and the bottom.
 fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let interfaces = app.traffic.interfaces();
@@ -405,651 +479,770 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
 
     let total_rx: f64 = actives.iter().map(|i| i.rx_rate).sum();
     let total_tx: f64 = actives.iter().map(|i| i.tx_rate).sum();
-
     let primary_name = actives
         .first()
         .map(|i| i.name.clone())
         .unwrap_or_else(|| "—".into());
 
-    // Aggregate histories first so the title can describe what actually
-    // fits in the chart (sparkline width vs available samples).
     let agg_rx = aggregate_rx(&actives);
     let agg_tx = aggregate_tx(&actives);
-
-    // Approximate sparkline width before block.inner is computed (area minus
-    // borders + 2-cell padding inside render).
-    let chart_width = (area.width as usize).saturating_sub(4);
-    let displayed = chart_width.min(agg_rx.len().max(agg_tx.len())).max(1);
-    let window_label = if displayed >= 120 {
-        format!("last {}m", displayed / 60)
-    } else {
-        format!("last {}s", displayed)
-    };
-    let title_left = format!(" THROUGHPUT  {}  {} ", primary_name, window_label);
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            title_left,
-            Style::default().fg(t.brand).bold(),
-        )))
-        .title(
-            Line::from(Span::styled(" RX/TX ", Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.height < 4 {
-        return;
-    }
-    let peak_rx = *agg_rx.iter().max().unwrap_or(&0);
-    let peak_tx = *agg_tx.iter().max().unwrap_or(&0);
-    let avg_rx = if !agg_rx.is_empty() {
-        agg_rx.iter().sum::<u64>() / agg_rx.len() as u64
-    } else {
-        0
-    };
-    let avg_tx = if !agg_tx.is_empty() {
-        agg_tx.iter().sum::<u64>() / agg_tx.len() as u64
-    } else {
-        0
+    let peak = agg_rx
+        .iter()
+        .chain(agg_tx.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mean = {
+        let n = agg_rx.len() + agg_tx.len();
+        if n == 0 {
+            0
+        } else {
+            (agg_rx.iter().sum::<u64>() + agg_tx.iter().sum::<u64>()) / n as u64
+        }
     };
 
-    // Header line: ● RX rate  peak X  avg Y    ● TX rate  peak X  avg Y
-    let header_area = Rect {
-        x: inner.x + 1,
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: 1,
-    };
-    let header_line = Line::from(vec![
-        Span::styled("● RX ", Style::default().fg(t.rx_rate)),
+    let log = app.ui.dashboard_log_scale;
+    let meta = vec![
+        Span::styled("▲ rx ", Style::default().fg(t.rx_rate)),
         Span::styled(
             widgets::format_bytes_rate(total_rx),
             Style::default().fg(t.rx_rate).bold(),
         ),
-        Span::styled(
-            format!(
-                "  peak {}  avg {}    ",
-                widgets::format_bytes_rate(peak_rx as f64),
-                widgets::format_bytes_rate(avg_rx as f64),
-            ),
-            Style::default().fg(t.text_muted),
-        ),
-        Span::styled("● TX ", Style::default().fg(t.tx_rate)),
+        Span::styled("  ▼ tx ", Style::default().fg(t.tx_rate)),
         Span::styled(
             widgets::format_bytes_rate(total_tx),
             Style::default().fg(t.tx_rate).bold(),
         ),
         Span::styled(
             format!(
-                "  peak {}  avg {}",
-                widgets::format_bytes_rate(peak_tx as f64),
-                widgets::format_bytes_rate(avg_tx as f64),
+                "   peak {} · avg {}   ",
+                widgets::format_bytes_rate(peak as f64),
+                widgets::format_bytes_rate(mean as f64)
             ),
             Style::default().fg(t.text_muted),
         ),
-    ]);
-    f.render_widget(Paragraph::new(header_line), header_area);
+        Span::styled("t", Style::default().fg(t.key_hint).bold()),
+        Span::styled(
+            format!(" scale {}", if log { "linear" } else { "log" }),
+            Style::default().fg(t.text_muted),
+        ),
+    ];
 
-    // Stacked sparklines: RX top, TX bottom, with x-axis row at the bottom
-    let chart_height = inner.height.saturating_sub(2);
-    if chart_height < 2 {
+    // The interface's own tab is where this graph's detail lives — driver,
+    // queues, qdisc, per-direction counters — so `3` is what the badge means.
+    let inner = widgets::Panel::styled(vec![
+        Span::styled("throughput", Style::default().fg(t.brand).bold()),
+        Span::styled(
+            format!(" {primary_name}"),
+            Style::default().fg(t.text_muted),
+        ),
+    ])
+    .tab_badge(crate::app::Tab::Interfaces)
+    .meta_styled(meta)
+    .fit(area.width)
+    .render(f, t, area);
+
+    // One row for the x-axis, and a y-axis gutter wide enough for the largest
+    // label the scale will produce.
+    if inner.height < 4 || inner.width < 12 {
         return;
     }
-    let rx_h = chart_height / 2;
-    let tx_h = chart_height - rx_h;
+    let axis_label = widgets::format_bytes_total(peak.max(1));
+    let gutter = (axis_label.chars().count() as u16 + 1).max(4);
+    let plot = Rect {
+        x: inner.x + gutter,
+        y: inner.y,
+        width: inner.width.saturating_sub(gutter),
+        height: inner.height - 1,
+    };
 
+    // Split the plot around a shared zero line: rx above, tx below. An odd
+    // number of rows gives the extra one to rx, which is the busier series on
+    // almost every host.
+    let tx_h = plot.height / 2;
+    let rx_h = plot.height - tx_h;
     let rx_area = Rect {
-        x: inner.x + 1,
-        y: inner.y + 1,
-        width: inner.width.saturating_sub(2),
         height: rx_h,
+        ..plot
     };
     let tx_area = Rect {
-        x: inner.x + 1,
-        y: inner.y + 1 + rx_h,
-        width: inner.width.saturating_sub(2),
+        y: plot.y + rx_h,
         height: tx_h,
+        ..plot
     };
 
-    let agg_rx_padded = pad_history(&agg_rx, rx_area.width as usize);
-    crate::graph::render(
+    // Both halves share one maximum — that is the point of the mirror — and
+    // both route through the graph module, so `graph_style` reaches them like
+    // every other chart. rx stands on the zero line; tx hangs below it.
+    let scale = if log { log_scale(peak) } else { peak.max(1) };
+    let rx_plot = maybe_log(&agg_rx, log);
+    let tx_plot = maybe_log(&agg_tx, log);
+    crate::graph::render_with_max(
         f,
         rx_area,
-        &agg_rx_padded,
+        &rx_plot,
+        scale,
         app.graph_style,
         t.rx_rate,
         t.status_warn,
         app.graph_opts(),
     );
-
-    let agg_tx_padded = pad_history(&agg_tx, tx_area.width as usize);
-    crate::graph::render(
+    crate::graph::render_flipped_with_max(
         f,
         tx_area,
-        &agg_tx_padded,
+        &tx_plot,
+        scale,
         app.graph_style,
         t.tx_rate,
-        t.status_warn,
         app.graph_opts(),
     );
 
-    // x-axis labels
-    let axis_y = inner.y + inner.height - 1;
-    let axis_w = inner.width.saturating_sub(2) as usize;
-    let mut axis = String::new();
-    axis.push_str("-60s");
-    let mid_pad = axis_w.saturating_sub(11) / 2;
-    axis.push_str(&" ".repeat(mid_pad));
-    axis.push_str("-30s");
-    let end_pad = axis_w.saturating_sub(axis.chars().count() + 3);
-    axis.push_str(&" ".repeat(end_pad));
-    axis.push_str("now");
-    let axis_area = Rect {
-        x: inner.x + 1,
-        y: axis_y,
-        width: inner.width.saturating_sub(2),
-        height: 1,
+    // y-axis: peak at the top, zero on the shared line, peak again at the
+    // bottom — the bottom half is tx growing downward, not a negative rate.
+    let mut label = |y: u16, text: String| {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::default().fg(t.text_muted),
+            ))),
+            Rect {
+                x: inner.x,
+                y,
+                width: gutter,
+                height: 1,
+            },
+        );
     };
+    label(inner.y, axis_label.clone());
+    if rx_h > 0 {
+        label(inner.y + rx_h - 1, "0".to_string());
+    }
+    if tx_h > 1 {
+        label(inner.y + rx_h + tx_h - 1, axis_label);
+    }
+
+    // x-axis, derived from how many samples the plot is actually showing.
+    // The old axis was the literal string "-60s … -30s … now" regardless of
+    // width, so at any size past sixty columns it named a window the graph was
+    // not drawing.
+    //
+    // Capacity depends on the style: braille carries two samples per column,
+    // blocks one. Getting that wrong halves or doubles the window the axis
+    // claims — it read `-15s` over thirty seconds of data.
+    let secs = crate::graph::axis_window_secs(
+        plot.width,
+        app.graph_style,
+        app.user_config.refresh_rate_ms,
+    );
+    let axis_y = inner.y + inner.height - 1;
+    let mut axis = String::new();
+    let w = plot.width as usize;
+    for (i, frac) in [0.0f32, 0.5, 1.0].iter().enumerate() {
+        let text = match i {
+            2 => "now".to_string(),
+            _ => format!("-{}s", (secs as f32 * (1.0 - frac)).round() as u64),
+        };
+        let target = ((w.saturating_sub(text.chars().count())) as f32 * frac).round() as usize;
+        if axis.chars().count() < target {
+            axis.push_str(&" ".repeat(target - axis.chars().count()));
+        }
+        axis.push_str(&text);
+    }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             axis,
             Style::default().fg(t.text_muted),
         ))),
-        axis_area,
+        Rect {
+            x: plot.x,
+            y: axis_y,
+            width: plot.width,
+            height: 1,
+        },
     );
 }
 
-// ── Bottom section: Top Connections + Health ────────────────
-
-fn render_bottom_section(f: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(50)])
-        .split(area);
-
-    render_top_connections(f, app, cols[0]);
-    render_health(f, app, cols[1]);
-}
-
-fn render_top_connections(f: &mut Frame, app: &App, area: Rect) {
+/// Connections, ordered by concern.
+///
+/// v0.29 sorted by rx rate, which answers "what is busiest" — a question the
+/// Stats tab already answers better. On a screen whose job is to say whether
+/// anything is wrong, the socket doing 4 MB/s cleanly matters less than the
+/// one doing 2 MB/s with a collapsed window, so the verdict leads the sort and
+/// the rate breaks ties within it.
+///
+/// The `app` column is the other half: `10.88.0.3:80` and
+/// `http get /blob.bin` are the same row, and only one of them tells you what
+/// the machine is doing.
+fn render_connections(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            " TOP CONNECTIONS ",
-            Style::default().fg(t.brand).bold(),
-        )))
-        .title(
-            Line::from(Span::styled(
-                " by RX  grouped by host ",
-                Style::default().fg(t.text_muted),
-            ))
-            .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let rows = connection_rows(app);
 
-    if inner.height < 3 {
+    let inner = widgets::Panel::new("connections")
+        .tab_badge(crate::app::Tab::Connections)
+        .meta_styled(vec![Span::styled(
+            format!("{} · sorted by concern", rows.len()),
+            Style::default().fg(t.text_muted),
+        )])
+        .fit(area.width)
+        .render(f, t, area);
+
+    if inner.height < 2 || inner.width < 40 {
         return;
     }
 
-    // Header
-    let header_area = Rect {
-        x: inner.x + 1,
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: 1,
-    };
-    let header = Line::from(Span::styled(
-        "  PROCESS         REMOTE                    RX/s        TX/s      RTT     RX 30s",
-        Style::default().fg(t.text_muted),
-    ));
-    f.render_widget(Paragraph::new(header), header_area);
+    // Fixed columns from the right, so the two elastic ones — remote and app —
+    // share whatever is left rather than each guessing.
+    const PROC: u16 = 16;
+    const RATE: u16 = 10;
+    const RTT: u16 = 8;
+    const RETR: u16 = 6;
+    const VERDICT: u16 = 18;
+    const SPARK: u16 = 10;
+    let fixed = PROC + RATE * 2 + RTT + RETR + VERDICT + SPARK;
+    if inner.width <= fixed + 20 {
+        return;
+    }
+    let elastic = inner.width - fixed;
+    let remote_w = elastic * 2 / 5;
+    let app_w = elastic - remote_w;
 
-    // Build grouped rows from connections
+    let widths = [
+        Constraint::Length(PROC),
+        Constraint::Length(remote_w),
+        Constraint::Length(app_w),
+        Constraint::Length(RATE),
+        Constraint::Length(RATE),
+        Constraint::Length(RTT),
+        Constraint::Length(RETR),
+        Constraint::Length(VERDICT),
+        Constraint::Length(SPARK),
+    ];
+
+    let header = Row::new(
+        [
+            "process", "remote", "app", "rx/s", "tx/s", "rtt", "retr", "verdict", "rtt 60s",
+        ]
+        .map(|h| Cell::from(h).style(Style::default().fg(t.text_muted))),
+    );
+
+    let body: Vec<Row> = rows
+        .iter()
+        .take(inner.height.saturating_sub(1) as usize)
+        .map(|r| {
+            let rate = |v: Option<f64>, color: Color| match v {
+                Some(x) if x >= 1.0 => Cell::from(
+                    Line::from(Span::styled(
+                        widgets::format_bytes_rate(x),
+                        Style::default().fg(color),
+                    ))
+                    .alignment(Alignment::Right),
+                ),
+                _ => Cell::from(
+                    Line::from(Span::styled("–", Style::default().fg(t.text_muted)))
+                        .alignment(Alignment::Right),
+                ),
+            };
+            Row::new(vec![
+                Cell::from(truncate(&r.process, PROC as usize - 1))
+                    .style(Style::default().fg(t.text_primary)),
+                Cell::from(truncate(&r.remote, remote_w as usize - 1))
+                    .style(Style::default().fg(t.text_secondary)),
+                Cell::from(truncate(&r.app, app_w as usize - 1))
+                    .style(Style::default().fg(t.text_muted)),
+                rate(r.rx_rate, t.rx_rate),
+                rate(r.tx_rate, t.tx_rate),
+                Cell::from(
+                    Line::from(Span::styled(
+                        match r.rtt_ms {
+                            Some(v) => format!("{}ms", fmt_ms(v)),
+                            None => "–".to_string(),
+                        },
+                        Style::default().fg(t.text_primary),
+                    ))
+                    .alignment(Alignment::Right),
+                ),
+                Cell::from(
+                    Line::from(Span::styled(
+                        if r.retrans == 0 {
+                            "0".to_string()
+                        } else {
+                            r.retrans.to_string()
+                        },
+                        Style::default().fg(if r.retrans > 0 {
+                            t.status_warn
+                        } else {
+                            t.text_muted
+                        }),
+                    ))
+                    .alignment(Alignment::Right),
+                ),
+                match r.verdict {
+                    Some(v) => Cell::from(Line::from(widgets::socket_verdict_chip(t, v))),
+                    None => Cell::from(Line::from(Span::styled(
+                        " – ",
+                        Style::default().fg(t.text_muted),
+                    ))),
+                },
+                Cell::from(""),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(body, widths).header(header),
+        Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(2),
+            ..inner
+        },
+    );
+}
+
+/// One row of the dashboard's connections panel.
+struct ConnRow {
+    process: String,
+    remote: String,
+    app: String,
+    rx_rate: Option<f64>,
+    tx_rate: Option<f64>,
+    rtt_ms: Option<f64>,
+    retrans: u32,
+    verdict: Option<crate::diagnose::detectors::SocketVerdict>,
+    concern: u8,
+}
+
+/// Build the rows, worst first.
+///
+/// Listeners and closed sockets are excluded rather than folded here: this is
+/// the dashboard's summary of live traffic, and the Connections tab is where
+/// the full set with its folded listener row lives.
+fn connection_rows(app: &App) -> Vec<ConnRow> {
     let conns = app.connection_collector.connections();
-    let mut grouped: HashMap<(String, String), GroupedConn> = HashMap::new();
-    for c in conns.iter() {
-        // Skip listeners (no remote peer) and closed states; everything else
-        // (ESTABLISHED, UDP "", etc.) can have measurable traffic.
-        if c.state == "LISTEN" || c.state == "CLOSED" || c.remote_addr.is_empty() {
-            continue;
-        }
-        let proc = c.process_name.clone().unwrap_or_else(|| "—".into());
-        // Prefer DPI-extracted hostname (TLS SNI / QUIC SNI / HTTP
-        // Host) over the raw remote IP. Turns "172.217.x.x" into
-        // "youtube.com" / etc. at the top of the dashboard.
-        let host =
-            dpi_hostname(&c.app_protocol).unwrap_or_else(|| remote_host_only(&c.remote_addr));
-        let key = (proc.clone(), host.clone());
-        let entry = grouped.entry(key).or_insert_with(|| GroupedConn {
-            process: proc.clone(),
-            host,
-            rx_rate: 0.0,
-            tx_rate: 0.0,
-            rtt_ms_min: None,
-            count: 0,
-        });
-        entry.rx_rate += c.rx_rate.unwrap_or(0.0);
-        entry.tx_rate += c.tx_rate.unwrap_or(0.0);
-        if let Some(rtt_us) = c.handshake_rtt_us {
-            let rtt_ms = rtt_us / 1000.0;
-            entry.rtt_ms_min = Some(match entry.rtt_ms_min {
-                Some(prev) => prev.min(rtt_ms),
-                None => rtt_ms,
-            });
-        }
-        entry.count += 1;
-    }
-
-    let mut rows: Vec<GroupedConn> = grouped.into_values().collect();
-    rows.sort_by(|a, b| {
-        // Primary: rx_rate desc. Tiebreakers (tx_rate, process, host) make the
-        // order fully deterministic across redraws — without them, all the 0.0
-        // rate rows reshuffle every frame because HashMap iteration is random.
-        b.rx_rate
-            .partial_cmp(&a.rx_rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.tx_rate
-                    .partial_cmp(&a.tx_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.process.cmp(&b.process))
-            .then_with(|| a.host.cmp(&b.host))
-    });
-
-    let max_rows = inner.height.saturating_sub(2) as usize;
-    let rendered_rows = rows.iter().take(max_rows).count();
-    for (i, r) in rows.iter().take(max_rows).enumerate() {
-        let key = (r.process.clone(), r.host.clone());
-        let history_active = app
-            .caches
-            .top_conn_history
-            .get(&key)
-            .map(|h| h.iter().any(|&v| v > 0))
-            .unwrap_or(false);
-        let active = r.rx_rate > 0.0 || r.tx_rate > 0.0 || history_active;
-        // Idle rows get a blue dot instead of gray so the table feels lively
-        // even when nothing's currently transferring.
-        let dot_color = if active { t.status_good } else { t.status_info };
-        let process_color = t.text_primary;
-        let row_y = inner.y + 1 + i as u16;
-        let remote_label = if r.count > 1 {
-            format!("{}  x{}", truncate(&r.host, 20), r.count)
-        } else {
-            truncate(&r.host, 23)
-        };
-        let rtt_str = match r.rtt_ms_min {
-            Some(rtt) if rtt < 1.0 => format!("{:.1}ms", rtt),
-            Some(rtt) => format!("{:.0}ms", rtt),
-            None => "—".to_string(),
-        };
-        let spans = vec![
-            Span::styled("● ", Style::default().fg(dot_color)),
-            Span::styled(
-                format!("{:<16}", truncate(&r.process, 16)),
-                Style::default().fg(process_color),
-            ),
-            Span::styled(
-                format!(" {:<24}", remote_label),
-                Style::default().fg(t.text_muted),
-            ),
-            Span::styled(
-                format!("{:>9}", widgets::format_bytes_rate(r.rx_rate)),
-                Style::default().fg(t.rx_rate),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>9}", widgets::format_bytes_rate(r.tx_rate)),
-                Style::default().fg(t.tx_rate),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>5}", rtt_str),
-                Style::default().fg(t.text_primary),
-            ),
-        ];
-        // Row 0 is the visually-highlighted top row (selection_bg) and
-        // stays at full intensity. Rows below fade top-bright →
-        // bottom-dim like the other tables when fade is on.
-        let spans = if app.user_config.graph_fade && i > 0 {
-            let alpha = crate::graph::row_fade_alpha(i, rendered_rows);
-            crate::graph::fade_spans_fg(spans, t.bg, alpha, t.defers_to_terminal())
-        } else {
-            spans
-        };
-        let row_line = Line::from(spans);
-        let row_area = Rect {
-            x: inner.x + 1,
-            y: row_y,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-        };
-        let para = if i == 0 {
-            Paragraph::new(row_line).style(Style::default().bg(t.selection_bg))
-        } else {
-            Paragraph::new(row_line)
-        };
-        f.render_widget(para, row_area);
-
-        // RX history sparkline at end of row (if there's room)
-        let row_w = row_area.width as usize;
-        let leading_w = 2 + 16 + 25 + 9 + 2 + 9 + 2 + 5 + 2; // matches the row_line spans
-        if row_w > leading_w {
-            let spark_w = (row_w - leading_w).min(14);
-            if spark_w >= 4 {
-                let key = (r.process.clone(), r.host.clone());
-                if let Some(hist) = app.caches.top_conn_history.get(&key) {
-                    let data: Vec<u64> = hist.iter().copied().collect();
-                    if !data.is_empty() {
-                        let spark_area = Rect {
-                            x: row_area.x + leading_w as u16,
-                            y: row_y,
-                            width: spark_w as u16,
-                            height: 1,
-                        };
-                        let padded = pad_history(&data, spark_w);
-                        crate::graph::render(
-                            f,
-                            spark_area,
-                            &padded,
-                            app.graph_style,
-                            if active { t.rx_rate } else { t.text_muted },
-                            t.status_warn,
-                            app.graph_opts(),
-                        );
-                    }
-                }
+    let mut rows: Vec<ConnRow> = conns
+        .iter()
+        .filter(|c| c.state != "LISTEN" && c.state != "CLOSED" && !c.remote_addr.is_empty())
+        .map(|c| {
+            let verdict = app
+                .diagnose
+                .sampler
+                .verdict_for(&c.local_addr, &c.remote_addr);
+            ConnRow {
+                process: crate::collectors::connections::process_label(
+                    c.process_name.as_deref(),
+                    c.pid,
+                ),
+                remote: c.remote_addr.clone(),
+                app: dpi_hostname(&c.app_protocol).unwrap_or_default(),
+                rx_rate: c.rx_rate,
+                tx_rate: c.tx_rate,
+                rtt_ms: c.handshake_rtt_us.map(|us| us / 1000.0),
+                retrans: c.retransmits,
+                verdict,
+                concern: verdict.map(widgets::socket_verdict_concern).unwrap_or(0),
             }
-        }
-    }
+        })
+        .collect();
 
-    if rows.is_empty() {
-        let empty_area = Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-        };
+    rows.sort_by(by_concern);
+    rows
+}
+
+/// Worst first, then busiest, then a total order so equal rows do not
+/// reshuffle every frame.
+fn by_concern(a: &ConnRow, b: &ConnRow) -> std::cmp::Ordering {
+    b.concern
+        .cmp(&a.concern)
+        .then_with(|| b.retrans.cmp(&a.retrans))
+        .then_with(|| {
+            let ab = a.rx_rate.unwrap_or(0.0) + a.tx_rate.unwrap_or(0.0);
+            let bb = b.rx_rate.unwrap_or(0.0) + b.tx_rate.unwrap_or(0.0);
+            bb.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| a.process.cmp(&b.process))
+        .then_with(|| a.remote.cmp(&b.remote))
+}
+
+/// Compress a rate onto a log scale, keeping zero at zero.
+///
+/// `ln(1 + v)` rather than `ln(v)`: a quiet second is a real measurement and
+/// belongs on the baseline, not at negative infinity. Scaled by 1000 so the
+/// result still has useful resolution as an integer.
+fn log_scale(v: u64) -> u64 {
+    (((v as f64) + 1.0).ln() * 1000.0).round() as u64
+}
+
+fn maybe_log(samples: &[u64], log: bool) -> Vec<u64> {
+    if log {
+        samples.iter().copied().map(log_scale).collect()
+    } else {
+        samples.to_vec()
+    }
+}
+
+/// The incident timeline: three metrics on one time axis, with the events
+/// underneath them.
+///
+/// Its whole value is the shared axis. Three separate sparklines elsewhere on
+/// the screen cannot show that the dns rise began four minutes after the path
+/// change, and that ordering is the argument every cause ranking rests on.
+fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
+    let t = &app.theme;
+    let hs = app.health_prober.status();
+    let interfaces = app.traffic.interfaces();
+    let actives = active_ifaces(&interfaces, &app.interface_info);
+
+    let inner = widgets::Panel::new("timeline")
+        .tab_badge(crate::app::Tab::Timeline)
+        .meta_styled(vec![Span::styled(
+            format!("last {}m", TIMELINE_WINDOW_SECS / 60),
+            Style::default().fg(t.text_muted),
+        )])
+        .fit(area.width)
+        .render(f, t, area);
+
+    // One row per track plus one for the events. Below that there is nothing
+    // useful to draw, so the panel stays empty rather than drawing a track
+    // with no label or a label with no track.
+    const GUTTER: u16 = 12;
+    if inner.height < 4 || inner.width < GUTTER + 20 {
+        return;
+    }
+    let plot_w = inner.width - GUTTER;
+
+    let throughput: Vec<u64> = aggregate_rx(&actives)
+        .into_iter()
+        .zip(aggregate_tx(&actives))
+        .map(|(rx, tx)| rx + tx)
+        .collect();
+
+    // The two feeds run at different cadences: traffic advances once per
+    // refresh tick, health once per probe. Each track declares its own
+    // seconds-per-sample and is resampled onto the panel's grid, so a column
+    // is the same moment on every row — which is the only thing that makes
+    // reading down the stack mean anything.
+    let tick_secs = (app.user_config.refresh_rate_ms / 1000).max(1);
+    let probe_secs = tick_secs * crate::app::HEALTH_PROBE_TICKS as u64;
+
+    // Throughput is a magnitude, the two latencies are bounded values — the
+    // colour vocabulary the design reserves for each.
+    let tracks: [(&str, Vec<u64>, u64, Color); 3] = [
+        ("throughput", throughput, tick_secs, t.rx_rate),
+        (
+            "dns rtt",
+            rtt_history_to_u64(hs.dns_rtt_history.as_slices().0),
+            probe_secs,
+            t.status_warn,
+        ),
+        (
+            "gateway rtt",
+            rtt_history_to_u64(hs.gateway_rtt_history.as_slices().0),
+            probe_secs,
+            t.status_warn,
+        ),
+    ];
+
+    for (i, (label, raw, secs_per_sample, color)) in tracks.into_iter().enumerate() {
+        let y = inner.y + i as u16;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  No established connections",
+                truncate(label, GUTTER as usize - 1),
                 Style::default().fg(t.text_muted),
             ))),
-            empty_area,
+            Rect {
+                x: inner.x,
+                y,
+                width: GUTTER,
+                height: 1,
+            },
+        );
+        // One value per column, on the panel's shared grid. The time base is
+        // common; the *scale* deliberately is not — these are different units,
+        // and a shared maximum would flatten every track but throughput.
+        let data = crate::graph::resample_to_window(
+            &raw,
+            secs_per_sample,
+            TIMELINE_WINDOW_SECS,
+            plot_w as usize,
+        );
+        // A ceiling one outlier cannot own — see `graph::robust_max`. With a
+        // raw max, a single rtt excursion scaled every other sample to the
+        // floor and the track read as a dead flat line.
+        let max = crate::graph::robust_max(&data, 0.95);
+        crate::graph::render_bucketed_with_max(
+            f,
+            Rect {
+                x: inner.x + GUTTER,
+                y,
+                width: plot_w,
+                height: 1,
+            },
+            &data,
+            max,
+            app.graph_style,
+            color,
+            app.graph_opts(),
         );
     }
+
+    // Event row: where each open issue started, placed on the same axis.
+    let now = chrono::Local::now();
+    let mut marks: Vec<(u16, String, Color)> = Vec::new();
+    for issue in app.diagnose.engine.issues() {
+        let Some(at) = crate::diagnose::engine::parse_ts(&issue.since) else {
+            continue;
+        };
+        let age = now.signed_duration_since(at).num_seconds();
+        if age < 0 || age > TIMELINE_WINDOW_SECS as i64 {
+            continue;
+        }
+        let frac = 1.0 - (age as f32 / TIMELINE_WINDOW_SECS as f32);
+        let x = (frac * plot_w.saturating_sub(1) as f32).round() as u16;
+        marks.push((
+            x,
+            format!(
+                "▲ {} {}",
+                crate::diagnose::issue::short_time(&issue.since),
+                issue.title
+            ),
+            match issue.severity {
+                crate::diagnose::Severity::Critical | crate::diagnose::Severity::High => {
+                    t.status_error
+                }
+                crate::diagnose::Severity::Medium => t.status_warn,
+                crate::diagnose::Severity::Info => t.status_info,
+            },
+        ));
+    }
+    marks.sort_by_key(|(x, _, _)| *x);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    for (x, text, color) in marks {
+        let x = x as usize;
+        // Markers that would overlap are dropped rather than stacked: two
+        // labels sharing columns is unreadable, and the events are all still
+        // listed on the Timeline tab.
+        if x < col {
+            continue;
+        }
+        spans.push(Span::raw(" ".repeat(x - col)));
+        col = x + text.chars().count();
+        if col > plot_w as usize {
+            break;
+        }
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    let events_y = inner.y + 3;
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            "no events in this window",
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: inner.x + GUTTER,
+            y: events_y,
+            width: plot_w,
+            height: 1,
+        },
+    );
 }
 
-struct GroupedConn {
-    process: String,
-    host: String,
-    rx_rate: f64,
-    tx_rate: f64,
-    rtt_ms_min: Option<f64>,
-    count: u32,
+/// One row of the health panel: a probe target and what it has been doing.
+struct HealthTarget<'a> {
+    name: &'a str,
+    address: Option<String>,
+    rtt_ms: Option<f64>,
+    loss_pct: f64,
+    history: &'a [Option<f64>],
 }
 
+/// Health: the probe targets, then what netwatch makes of them.
+///
+/// The v0.29 panel listed two targets and closed with an eBPF/errors/drops
+/// strip — counters that belong to the interface, not to reachability. It also
+/// never showed `internet`, which is the one row that separates "my router is
+/// fine and the line is down" from "my router is down".
+///
+/// The findings underneath are the engine's, in prose. A sparkline can show
+/// that dns moved; only a sentence can say it moved 3.2σ at 06:48 while the
+/// alternate resolver stayed fast.
 fn render_health(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let hs = app.health_prober.status();
+    let cfg = &app.config_collector.config;
+    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
 
-    let max_loss = hs.gateway_loss_pct.max(hs.dns_loss_pct);
-    let title_right = if max_loss < 1.0 {
-        " all nominal ".to_string()
-    } else {
-        format!(" {:.0}% loss ", max_loss)
-    };
-    let title_color = if max_loss < 1.0 {
-        t.status_good
-    } else {
-        t.status_warn
-    };
+    let findings = app.diagnose.engine.primary();
+    let inner = widgets::Panel::new("health")
+        .tab_badge(crate::app::Tab::Diagnose)
+        .meta_styled(vec![Span::styled(
+            match findings.len() {
+                0 => "no findings".to_string(),
+                1 => "1 finding".to_string(),
+                n => format!("{n} findings"),
+            },
+            Style::default().fg(verdict.color(t)),
+        )])
+        .fit(area.width)
+        .render(f, t, area);
 
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            " HEALTH ",
-            Style::default().fg(t.brand).bold(),
-        )))
-        .title(
-            Line::from(Span::styled(title_right, Style::default().fg(title_color)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.height < 4 {
+    if inner.height < 2 || inner.width < 24 {
         return;
     }
 
-    // Column header
-    let hdr_area = Rect {
-        x: inner.x + 1,
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  TARGET            RTT(60s)         NOW",
-            Style::default().fg(t.text_muted),
-        ))),
-        hdr_area,
-    );
-
-    let gw_label = app
-        .config_collector
-        .config
-        .gateway
-        .clone()
-        .unwrap_or_else(|| "—".into());
-    let dns_label = app
-        .config_collector
-        .config
-        .primary_dns()
-        .unwrap_or_else(|| "—".into());
-
-    render_health_target(
-        f,
-        app,
-        Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
-            height: 2,
+    let targets: [HealthTarget<'_>; 3] = [
+        HealthTarget {
+            name: "gateway",
+            address: cfg.gateway.clone(),
+            rtt_ms: hs.gateway_rtt_ms,
+            loss_pct: hs.gateway_loss_pct,
+            history: hs.gateway_rtt_history.as_slices().0,
         },
-        "Gateway",
-        &gw_label,
-        hs.gateway_rtt_ms,
-        hs.gateway_loss_pct,
-        hs.gateway_rtt_history.as_slices().0,
-    );
-    render_health_target(
-        f,
-        app,
-        Rect {
-            x: inner.x + 1,
-            y: inner.y + 3,
-            width: inner.width.saturating_sub(2),
-            height: 2,
+        HealthTarget {
+            name: "dns",
+            address: cfg.primary_dns(),
+            rtt_ms: hs.dns_rtt_ms,
+            loss_pct: hs.dns_loss_pct,
+            history: hs.dns_rtt_history.as_slices().0,
         },
-        "DNS",
-        &dns_label,
-        hs.dns_rtt_ms,
-        hs.dns_loss_pct,
-        hs.dns_rtt_history.as_slices().0,
-    );
+        HealthTarget {
+            name: "internet",
+            address: Some(crate::collectors::health::INTERNET_TARGET.to_string()),
+            rtt_ms: hs.internet_rtt_ms,
+            loss_pct: hs.internet_loss_pct,
+            history: hs.internet_rtt_history.as_slices().0,
+        },
+    ];
 
-    // Bottom strip: eBPF / errors / drops / retransmits
-    let bottom_y = inner.y + inner.height.saturating_sub(2);
-    if bottom_y > inner.y + 5 {
-        let interfaces = app.traffic.interfaces();
-        let total_errors: u64 = interfaces.iter().map(|i| i.rx_errors + i.tx_errors).sum();
-        let total_drops: u64 = interfaces.iter().map(|i| i.rx_drops + i.tx_drops).sum();
-        // Read live attribution state (per-OS aware) rather than a
-        // boot-time placeholder — on macOS this surfaces "pktap active"
-        // instead of falsely claiming eBPF, and on Linux it reflects
-        // whether the conn_tracker actually loaded.
-        let ebpf_text = match app.attribution_status() {
-            AttributionStatus::Active("ebpf") => "eBPF active".to_string(),
-            AttributionStatus::Active(src) => format!("{} active", src),
-            AttributionStatus::Failed("ebpf", _) => "eBPF off".to_string(),
-            AttributionStatus::Failed(src, _) => format!("{} off", src),
-            AttributionStatus::Lsof => "lsof attr".to_string(),
-        };
-
-        // separator
-        let sep_y = bottom_y.saturating_sub(1);
-        let sep_area = Rect {
-            x: inner.x + 1,
-            y: sep_y,
-            width: inner.width.saturating_sub(2),
-            height: 1,
+    const NAME_W: u16 = 10;
+    const VALUE_W: u16 = 9;
+    let mut y = inner.y;
+    for HealthTarget {
+        name,
+        address,
+        rtt_ms: rtt,
+        loss_pct: loss,
+        history,
+    } in targets
+    {
+        if y >= inner.y + inner.height {
+            break;
+        }
+        // A target that has never answered is muted, not red: netwatch not
+        // having a number is different from the number being bad.
+        let color = match rtt {
+            None => t.text_muted,
+            Some(_) if loss >= 50.0 => t.status_error,
+            Some(v) if loss > 0.0 || v > 200.0 => t.status_warn,
+            Some(_) => t.status_good,
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "─".repeat(inner.width.saturating_sub(2) as usize),
-                Style::default().fg(t.border),
-            ))),
-            sep_area,
-        );
-
-        let strip_area = Rect {
-            x: inner.x + 1,
-            y: bottom_y,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    "{}   errors {}   drops {}",
-                    ebpf_text, total_errors, total_drops
+            Paragraph::new(Line::from(vec![
+                Span::styled("● ", Style::default().fg(color)),
+                Span::styled(
+                    format!("{name:<w$}", w = NAME_W as usize - 2),
+                    Style::default().fg(t.text_primary),
                 ),
-                Style::default().fg(t.text_muted),
-            ))),
-            strip_area,
+                Span::styled(
+                    format!(
+                        "{:>w$}",
+                        match rtt {
+                            Some(v) => format!("{}ms", fmt_ms(v)),
+                            None => "–".to_string(),
+                        },
+                        w = VALUE_W as usize
+                    ),
+                    Style::default().fg(color),
+                ),
+            ])),
+            Rect {
+                x: inner.x + 1,
+                y,
+                width: (NAME_W + VALUE_W).min(inner.width.saturating_sub(2)),
+                height: 1,
+            },
         );
-    }
-}
 
-fn render_health_target(
-    f: &mut Frame,
-    app: &App,
-    area: Rect,
-    name: &str,
-    host: &str,
-    rtt: Option<f64>,
-    loss: f64,
-    history: &[Option<f64>],
-) {
-    let t = &app.theme;
-    if area.height < 1 {
-        return;
-    }
-    let dot_color = if loss < 1.0 && rtt.is_some() {
-        t.status_good
-    } else if loss < 50.0 {
-        t.status_warn
-    } else {
-        t.status_error
-    };
-
-    let rtt_str = rtt
-        .map(|r| format!("{:.1}ms", r))
-        .unwrap_or_else(|| "—".into());
-
-    // Row 0: ● Name [sparkline area]    rtt
-    let name_span = Line::from(vec![
-        Span::styled("● ", Style::default().fg(dot_color)),
-        Span::styled(
-            format!("{:<8}", name),
-            Style::default().fg(t.text_primary).bold(),
-        ),
-    ]);
-    let name_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: 11,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(name_span), name_area);
-
-    // sparkline between name and rtt value
-    let rtt_w: u16 = 8;
-    if area.width > 11 + rtt_w {
-        let spark_area = Rect {
-            x: area.x + 11,
-            y: area.y,
-            width: area.width - 11 - rtt_w,
-            height: 1,
-        };
-        let data = rtt_history_to_u64(history);
-        if !data.is_empty() {
-            let padded = pad_history(&data, spark_area.width as usize);
+        let spark_x = inner.x + 1 + NAME_W + VALUE_W + 1;
+        let spark_w = inner
+            .x
+            .saturating_add(inner.width)
+            .saturating_sub(spark_x + 1);
+        if spark_w >= 8 {
+            let data = rtt_history_to_u64(history);
             crate::graph::render(
                 f,
-                spark_area,
-                &padded,
+                Rect {
+                    x: spark_x,
+                    y,
+                    width: spark_w,
+                    height: 1,
+                },
+                &data,
                 app.graph_style,
-                dot_color,
-                app.theme.status_warn,
+                color,
+                t.status_warn,
                 app.graph_opts(),
             );
         }
+        // The target address sits under its own row, dim, so the column of
+        // names and numbers stays scannable.
+        let _ = &address;
+        y += 1;
     }
 
-    // rtt value right-aligned
-    let rtt_area = Rect {
-        x: area.x + area.width.saturating_sub(rtt_w),
-        y: area.y,
-        width: rtt_w,
-        height: 1,
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{:>7}", rtt_str),
-            Style::default().fg(t.text_primary),
-        ))),
-        rtt_area,
-    );
-
-    // Row 1: host and loss
-    if area.height >= 2 {
-        let row1_area = Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
-            height: 1,
+    // Findings, in the space the targets did not need.
+    let body_y = y + 1;
+    if body_y >= inner.y + inner.height {
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    if findings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            verdict.chip(),
+            Style::default().fg(t.text_muted),
+        )));
+    }
+    for issue in findings.iter().take(3) {
+        let color = match issue.severity {
+            crate::diagnose::Severity::Critical | crate::diagnose::Severity::High => t.status_error,
+            crate::diagnose::Severity::Medium => t.status_warn,
+            crate::diagnose::Severity::Info => t.status_info,
         };
-        let row1 = Line::from(vec![
-            Span::raw("  "),
-            Span::styled(host.to_string(), Style::default().fg(t.text_muted)),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:.0}% loss", loss),
-                Style::default().fg(t.text_muted),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(row1), row1_area);
+        lines.push(Line::from(vec![
+            Span::styled("▲ ", Style::default().fg(color)),
+            Span::styled(issue.summary_line(), Style::default().fg(t.text_secondary)),
+        ]));
     }
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        Rect {
+            x: inner.x + 1,
+            y: body_y,
+            width: inner.width.saturating_sub(2),
+            height: inner.y + inner.height - body_y,
+        },
+    );
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
-        Span::styled("p", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Pause  "),
-        Span::styled("r", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Refresh  "),
-        Span::styled(",", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Settings"),
+        widgets::hint("↵", "drill"),
+        widgets::hint("9", "diagnose"),
+        widgets::hint(
+            "t",
+            if app.ui.dashboard_log_scale {
+                "scale linear"
+            } else {
+                "scale log"
+            },
+        ),
+        widgets::hint("p", "pause"),
+        widgets::hint(",", "settings"),
     ];
     widgets::render_footer(f, app, area, hints);
 }
@@ -1106,39 +1299,18 @@ where
     acc
 }
 
-fn aggregate_history(
-    interfaces: &[InterfaceTraffic],
-    info: &[crate::platform::InterfaceInfo],
-) -> Vec<u64> {
-    let actives = active_ifaces(interfaces, info);
-    let rx = aggregate_rx(&actives);
-    let tx = aggregate_tx(&actives);
-    rx.iter()
-        .zip(tx.iter().chain(std::iter::repeat(&0u64)))
-        .map(|(r, t)| r + t)
-        .collect()
-}
-
+/// RTT history as microseconds, for plotting.
+///
+/// Whole milliseconds threw away everything these graphs exist to show: a LAN
+/// resolver answering in 0.5ms and a gateway at 2.4ms both round to small
+/// integers, so the series became 0s and 1s and any non-zero sample rendered
+/// at full height. The plots only care about relative magnitude, so the unit
+/// is free — microseconds keep three more digits of the variation.
 fn rtt_history_to_u64(history: &[Option<f64>]) -> Vec<u64> {
     history
         .iter()
-        .map(|r| r.map(|v| v.round() as u64).unwrap_or(0))
+        .map(|r| r.map(|v| (v * 1000.0).round().max(0.0) as u64).unwrap_or(0))
         .collect()
-}
-
-/// Left-pad with zeros (or trim) so `data` is exactly `target_width` long.
-/// The newest sample ends up at the right edge of the rendered Sparkline area,
-/// which is what time-series charts want ("now" at the right).
-fn pad_history(data: &[u64], target_width: usize) -> Vec<u64> {
-    if target_width == 0 {
-        return Vec::new();
-    }
-    if data.len() >= target_width {
-        return data[data.len() - target_width..].to_vec();
-    }
-    let mut padded = vec![0u64; target_width - data.len()];
-    padded.extend_from_slice(data);
-    padded
 }
 
 fn rtt_history_to_loss(history: &[Option<f64>]) -> Vec<u64> {
@@ -1146,112 +1318,6 @@ fn rtt_history_to_loss(history: &[Option<f64>]) -> Vec<u64> {
         .iter()
         .map(|r| if r.is_none() { 100 } else { 0 })
         .collect()
-}
-
-fn rtt_status_color(app: &App, rtt: Option<f64>, loss: f64) -> Color {
-    if loss >= 50.0 {
-        app.theme.status_error
-    } else if loss > 1.0 {
-        app.theme.status_warn
-    } else {
-        match rtt {
-            Some(r) if r > 200.0 => app.theme.status_error,
-            Some(r) if r > 50.0 => app.theme.status_warn,
-            Some(_) => app.theme.status_good,
-            None => app.theme.text_muted,
-        }
-    }
-}
-
-fn trend_for_rtt(history: &[Option<f64>]) -> TrendDisplay {
-    let halves = split_avg(history);
-    match halves {
-        Some((older, newer)) => {
-            let delta = newer - older;
-            if delta.abs() < 0.05 {
-                TrendDisplay {
-                    arrow: "→",
-                    delta: format!("{:.1}", delta.abs()),
-                    color: Color::Reset,
-                }
-            } else if delta < 0.0 {
-                TrendDisplay {
-                    arrow: "↓",
-                    delta: format!("{:.1}", delta.abs()),
-                    color: Color::Reset, // good but understated
-                }
-            } else {
-                TrendDisplay {
-                    arrow: "↑",
-                    delta: format!("{:.1}", delta),
-                    color: Color::Reset,
-                }
-            }
-        }
-        None => TrendDisplay::neutral(),
-    }
-}
-
-fn trend_for_throughput(history: &[u64], _app: &App) -> TrendDisplay {
-    if history.len() < 4 {
-        return TrendDisplay::neutral();
-    }
-    // SPARKLINE_HISTORY was bumped to 600 to fill wide sparklines, but the
-    // KPI trend arrow should track recent change (~last minute), not the
-    // half-hour average. Cap the sample window before splitting.
-    let window = 60usize.min(history.len());
-    let recent = &history[history.len() - window..];
-    let mid = recent.len() / 2;
-    let older: u64 = recent[..mid].iter().sum::<u64>() / mid as u64;
-    let newer: u64 = recent[mid..].iter().sum::<u64>() / (recent.len() - mid) as u64;
-    if newer == older {
-        TrendDisplay {
-            arrow: "→",
-            delta: "0".to_string(),
-            color: Color::Reset,
-        }
-    } else if newer > older {
-        let delta = newer - older;
-        TrendDisplay {
-            arrow: "↑",
-            delta: widgets::format_bytes_rate(delta as f64),
-            color: Color::Reset,
-        }
-    } else {
-        let delta = older - newer;
-        TrendDisplay {
-            arrow: "↓",
-            delta: widgets::format_bytes_rate(delta as f64),
-            color: Color::Reset,
-        }
-    }
-}
-
-fn split_avg(history: &[Option<f64>]) -> Option<(f64, f64)> {
-    let valid: Vec<f64> = history.iter().filter_map(|x| *x).collect();
-    if valid.len() < 4 {
-        return None;
-    }
-    let mid = valid.len() / 2;
-    let older: f64 = valid[..mid].iter().sum::<f64>() / mid as f64;
-    let newer: f64 = valid[mid..].iter().sum::<f64>() / (valid.len() - mid) as f64;
-    Some((older, newer))
-}
-
-fn format_rate_split(bytes_per_sec: f64) -> (String, String) {
-    if bytes_per_sec < 1.0 {
-        return ("0".into(), "B/s".into());
-    }
-    let (val, unit) = if bytes_per_sec >= 1_000_000_000.0 {
-        (bytes_per_sec / 1_000_000_000.0, "GB/s")
-    } else if bytes_per_sec >= 1_000_000.0 {
-        (bytes_per_sec / 1_000_000.0, "MB/s")
-    } else if bytes_per_sec >= 1_000.0 {
-        (bytes_per_sec / 1_000.0, "KB/s")
-    } else {
-        (bytes_per_sec, "B/s")
-    };
-    (format!("{:.1}", val), unit.to_string())
 }
 
 /// DPI-derived display hostname for a connection, when available.
@@ -1288,4 +1354,70 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnose::detectors::SocketVerdict;
+
+    fn row(process: &str, verdict: Option<SocketVerdict>, rate: f64, retrans: u32) -> ConnRow {
+        ConnRow {
+            process: process.into(),
+            remote: format!("10.0.0.1:443 [{process}]"),
+            app: String::new(),
+            rx_rate: Some(rate),
+            tx_rate: None,
+            rtt_ms: None,
+            retrans,
+            verdict,
+            concern: verdict.map(widgets::socket_verdict_concern).unwrap_or(0),
+        }
+    }
+
+    /// The panel's job is "is anything wrong", so a broken socket outranks a
+    /// fast one. v0.29 sorted by rx rate, which put the 4 MB/s healthy
+    /// download above the 2 MB/s socket with a collapsed window.
+    #[test]
+    fn a_broken_socket_outranks_a_faster_healthy_one() {
+        let mut rows = [
+            row("curl", Some(SocketVerdict::AppLimited), 4_000_000.0, 0),
+            row("ncat", Some(SocketVerdict::Bufferbloat), 2_000_000.0, 12),
+            row("sshd", Some(SocketVerdict::ZeroWindow), 1_000.0, 0),
+        ];
+        rows.sort_by(by_concern);
+        let order: Vec<&str> = rows.iter().map(|r| r.process.as_str()).collect();
+        assert_eq!(order, vec!["sshd", "ncat", "curl"]);
+    }
+
+    /// Within one verdict the busiest wins, and identical rows keep a stable
+    /// order — a list that reshuffles every frame cannot be read.
+    #[test]
+    fn ties_break_deterministically() {
+        let mk = || {
+            vec![
+                row("b", Some(SocketVerdict::Ok), 10.0, 0),
+                row("a", Some(SocketVerdict::Ok), 10.0, 0),
+                row("c", Some(SocketVerdict::Ok), 50.0, 0),
+            ]
+        };
+        let mut first = mk();
+        first.sort_by(by_concern);
+        let mut second = mk();
+        second.sort_by(by_concern);
+        let names =
+            |v: &[ConnRow]| -> Vec<String> { v.iter().map(|r| r.process.clone()).collect() };
+        assert_eq!(names(&first), vec!["c", "a", "b"]);
+        assert_eq!(names(&first), names(&second));
+    }
+
+    /// Sub-10ms latency keeps a decimal because 0.1 and 0.4 are different
+    /// answers; above that the decimal is noise.
+    #[test]
+    fn milliseconds_are_formatted_at_a_useful_precision() {
+        assert_eq!(fmt_ms(0.14), "0.1");
+        assert_eq!(fmt_ms(9.96), "10.0");
+        assert_eq!(fmt_ms(41.4), "41");
+        assert_eq!(fmt_ms(184.6), "185");
+    }
 }

@@ -1,9 +1,18 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 const MAX_PACKETS: usize = 5000; // ring buffer; oldest packets are discarded when full
+
+/// How many packets the ring holds before the oldest are discarded. Public
+/// because the capture strip states it: a count read off a bounded ring means
+/// something different from a session total, and the screen has to say which
+/// it is showing.
+pub const RING_CAPACITY: usize = MAX_PACKETS;
+
+/// How often the capture loop asks libpcap how it is doing.
+const STATS_POLL: std::time::Duration = std::time::Duration::from_millis(1000);
 const MAX_STREAM_SEGMENTS: usize = 10_000; // per-stream segment limit; caps memory per flow
 const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024; // 2 MB per reassembled stream
                                                  // StreamTracker eviction: cap unique flows to bound memory under sustained capture.
@@ -69,6 +78,39 @@ pub enum ExpertSeverity {
     Note,  // noteworthy (FIN, DNS response)
     Warn,  // warning (zero window, ICMP unreachable)
     Error, // error (RST, DNS NXDOMAIN/SERVFAIL)
+}
+
+/// Offset-prefixed hex, sixteen bytes to the line.
+pub fn hex_dump(raw: &[u8]) -> String {
+    raw.chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{:04x}  {}", i * 16, hex.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The same bytes as printable characters, aligned with [`hex_dump`].
+pub fn ascii_dump(raw: &[u8]) -> String {
+    raw.chunks(16)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            format!("{:04x}  {}", i * 16, ascii)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn classify_expert(protocol: &str, info: &str, tcp_flags: Option<u8>) -> ExpertSeverity {
@@ -188,6 +230,45 @@ impl StreamKey {
 pub enum StreamDirection {
     AtoB,
     BtoA,
+}
+
+impl Stream {
+    /// A stream with no packets in it yet.
+    ///
+    /// This was an inline struct literal in the tracker, which meant the only
+    /// way to get a `Stream` was to run a live capture — so nothing that
+    /// consumes one could be tested. The private bookkeeping fields are the
+    /// reason it has to live here rather than in the caller.
+    pub fn new(index: u32, key: StreamKey, first_seen_ns: u64) -> Self {
+        Self {
+            index,
+            key,
+            segments: Vec::new(),
+            total_bytes_a_to_b: 0,
+            total_bytes_b_to_a: 0,
+            packet_count: 0,
+            initiator: None,
+            total_payload_bytes: 0,
+            handshake: None,
+            last_seen_ns: first_seen_ns,
+            app_protocol: None,
+            app_protocol_attempted: false,
+            quic_crypto_buf: Vec::new(),
+            quic_client_random: None,
+            quic_decrypt: QuicDecryptState::default(),
+            quic_h3: crate::dpi::http3::H3StreamReassembler::new(),
+            highest_seq_a_to_b: None,
+            highest_seq_b_to_a: None,
+            retransmits_a_to_b: 0,
+            retransmits_b_to_a: 0,
+            out_of_order_a_to_b: 0,
+            out_of_order_b_to_a: 0,
+            tls_client_random: None,
+            tls_cipher_suite: None,
+            tls_server_random: None,
+            tls_decrypt_disabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -453,37 +534,8 @@ impl StreamTracker {
             let idx = self.next_index;
             self.next_index += 1;
             self.streams.insert(key.clone(), idx);
-            self.all_streams.insert(
-                idx,
-                Stream {
-                    index: idx,
-                    key: key.clone(),
-                    segments: Vec::new(),
-                    total_bytes_a_to_b: 0,
-                    total_bytes_b_to_a: 0,
-                    packet_count: 0,
-                    initiator: None,
-                    total_payload_bytes: 0,
-                    handshake: None,
-                    last_seen_ns: timestamp_ns,
-                    app_protocol: None,
-                    app_protocol_attempted: false,
-                    quic_crypto_buf: Vec::new(),
-                    quic_client_random: None,
-                    quic_decrypt: QuicDecryptState::default(),
-                    quic_h3: crate::dpi::http3::H3StreamReassembler::new(),
-                    highest_seq_a_to_b: None,
-                    highest_seq_b_to_a: None,
-                    retransmits_a_to_b: 0,
-                    retransmits_b_to_a: 0,
-                    out_of_order_a_to_b: 0,
-                    out_of_order_b_to_a: 0,
-                    tls_client_random: None,
-                    tls_cipher_suite: None,
-                    tls_server_random: None,
-                    tls_decrypt_disabled: false,
-                },
-            );
+            self.all_streams
+                .insert(idx, Stream::new(idx, key.clone(), timestamp_ns));
             self.evict_if_needed();
             idx
         };
@@ -1168,9 +1220,49 @@ impl StreamTracker {
     }
 }
 
+/// What libpcap reports about the capture itself, as opposed to what the
+/// capture contains.
+///
+/// A packet list with no drop counter beside it cannot be trusted: a filter
+/// that appears to match nothing and a kernel buffer that overflowed look
+/// identical on screen. `dropped` is the kernel buffer plus the driver — both
+/// mean "packets existed that this screen never saw".
+#[derive(Debug, Default)]
+pub struct CaptureStats {
+    received: AtomicU64,
+    dropped: AtomicU64,
+    /// Packets per second over the last poll interval.
+    rate_pps: AtomicU64,
+}
+
+impl CaptureStats {
+    pub fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
+    }
+
+    /// Kernel-buffer drops plus interface/driver drops.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn rate_pps(&self) -> u64 {
+        self.rate_pps.load(Ordering::Relaxed)
+    }
+
+    /// Zeroed when a capture starts, so the numbers describe this run rather
+    /// than accumulating across interface switches.
+    fn reset(&self) {
+        self.received.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+        self.rate_pps.store(0, Ordering::Relaxed);
+    }
+}
+
 pub struct PacketCollector {
     pub packets: Arc<RwLock<Vec<CapturedPacket>>>,
     pub capturing: Arc<AtomicBool>,
+    /// Live capture health — drops and throughput, straight from `pcap_stats`.
+    pub stats: Arc<CaptureStats>,
     pub error: Arc<Mutex<Option<String>>>,
     pub dns_cache: DnsCache,
     pub stream_tracker: Arc<Mutex<StreamTracker>>,
@@ -1193,6 +1285,7 @@ impl PacketCollector {
         Self {
             packets: Arc::new(RwLock::new(Vec::new())),
             capturing: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(CaptureStats::default()),
             error: Arc::new(Mutex::new(None)),
             dns_cache: DnsCache::new(),
             stream_tracker: Arc::new(Mutex::new(StreamTracker::new())),
@@ -1240,6 +1333,8 @@ impl PacketCollector {
         let counter = Arc::clone(&self.counter);
         let tracker = Arc::clone(&self.stream_tracker);
         let dns = self.dns_cache.clone();
+        let stats = Arc::clone(&self.stats);
+        stats.reset();
         let iface = resolve_device_name(interface);
         let bpf = bpf_filter.map(|s| s.to_string());
 
@@ -1310,7 +1405,37 @@ impl PacketCollector {
 
             let mut batch: Vec<CapturedPacket> = Vec::with_capacity(CAPTURE_BATCH_SIZE);
 
+            // Capture health, polled rather than derived from what we stored:
+            // libpcap is the only thing that knows about the packets it had to
+            // throw away, and those are exactly the ones the list cannot show.
+            let mut last_poll = std::time::Instant::now();
+            let mut last_received: u64 = 0;
+
             while capturing.load(Ordering::Relaxed) {
+                if last_poll.elapsed() >= STATS_POLL {
+                    if let Ok(s) = cap.stats() {
+                        let received = s.received as u64;
+                        let elapsed = last_poll.elapsed().as_secs_f64();
+                        // pcap's counter is monotonic within a capture, but a
+                        // re-arm can move it backwards; saturating_sub keeps a
+                        // restart from reading as a negative rate.
+                        let delta = received.saturating_sub(last_received);
+                        stats.received.store(received, Ordering::Relaxed);
+                        stats
+                            .dropped
+                            .store(s.dropped as u64 + s.if_dropped as u64, Ordering::Relaxed);
+                        stats.rate_pps.store(
+                            if elapsed > 0.0 {
+                                (delta as f64 / elapsed).round() as u64
+                            } else {
+                                0
+                            },
+                            Ordering::Relaxed,
+                        );
+                        last_received = received;
+                    }
+                    last_poll = std::time::Instant::now();
+                }
                 match cap.next_packet() {
                     Ok(packet) => {
                         if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
@@ -1462,6 +1587,282 @@ impl PacketCollector {
 
     pub fn get_packets(&self) -> std::sync::RwLockReadGuard<'_, Vec<CapturedPacket>> {
         self.packets.read().unwrap()
+    }
+
+    /// Bytes for a seeded packet: something that reads like the protocol in
+    /// the hex and ascii panes rather than a block of zeroes.
+    fn demo_payload(proto: &str, info: &str, len: usize) -> Vec<u8> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let seed: Vec<u8> = match proto {
+            "DNS" => {
+                let mut v = vec![0x8f, 0x21, 0x01, 0x00, 0x00, 0x01];
+                v.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+                v
+            }
+            "TLS" => {
+                let mut v = vec![0x16, 0x03, 0x01];
+                v.extend_from_slice(info.as_bytes());
+                v
+            }
+            _ => b"GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n".to_vec(),
+        };
+        seed.iter().copied().cycle().take(len).collect()
+    }
+
+    /// Seed a recorded conversation so `--demo` has something to show.
+    ///
+    /// Live capture needs `CAP_NET_RAW`. Without it this tab is an empty list
+    /// and an empty decode on every machine where netwatch runs as an
+    /// ordinary user — which includes every machine someone is likely to
+    /// review it on. The screen was unreachable, and so was untested.
+    ///
+    /// The packets go in through `track_packet`, the same path a live capture
+    /// uses, so the streams, handshake timings and retransmit counters are
+    /// built by the real code rather than hand-assembled to look right.
+    ///
+    /// The story matches the diagnose demo: a slow resolver at 169.254.1.1,
+    /// then a TLS connection that opens cleanly, resends a segment, and is
+    /// reset by the far end.
+    pub fn seed_demo_capture(&self) {
+        const MS: u64 = 1_000_000;
+        let client = "10.88.0.2";
+        let resolver = "169.254.1.1";
+        let server = "93.184.216.34";
+
+        // (offset_ms, src, sport, dst, dport, proto, flags, seq, len, info, payload_len)
+        type Row = (
+            u64,
+            &'static str,
+            u16,
+            &'static str,
+            u16,
+            &'static str,
+            Option<u8>,
+            Option<u32>,
+            u32,
+            &'static str,
+            usize,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                0,
+                client,
+                51820,
+                resolver,
+                53,
+                "DNS",
+                None,
+                None,
+                74,
+                "Standard query A example.com",
+                32,
+            ),
+            (
+                40,
+                resolver,
+                53,
+                client,
+                51820,
+                "DNS",
+                None,
+                None,
+                90,
+                "Response A 93.184.216.34",
+                48,
+            ),
+            (
+                42,
+                client,
+                52344,
+                server,
+                443,
+                "TCP",
+                Some(TCP_FLAG_SYN),
+                Some(1000),
+                74,
+                "",
+                0,
+            ),
+            (
+                54,
+                server,
+                443,
+                client,
+                52344,
+                "TCP",
+                Some(TCP_FLAG_SYN | TCP_FLAG_ACK),
+                Some(5000),
+                74,
+                "",
+                0,
+            ),
+            (
+                66,
+                client,
+                52344,
+                server,
+                443,
+                "TCP",
+                Some(TCP_FLAG_ACK),
+                Some(1001),
+                66,
+                "",
+                0,
+            ),
+            (
+                68,
+                client,
+                52344,
+                server,
+                443,
+                "TLS",
+                Some(TCP_FLAG_PSH | TCP_FLAG_ACK),
+                Some(1001),
+                583,
+                "Client Hello (SNI example.com)",
+                517,
+            ),
+            (
+                91,
+                server,
+                443,
+                client,
+                52344,
+                "TLS",
+                Some(TCP_FLAG_PSH | TCP_FLAG_ACK),
+                Some(5001),
+                1478,
+                "Server Hello",
+                1412,
+            ),
+            (
+                93,
+                server,
+                443,
+                client,
+                52344,
+                "TLS",
+                Some(TCP_FLAG_PSH | TCP_FLAG_ACK),
+                Some(6413),
+                1478,
+                "Certificate",
+                1412,
+            ),
+            (
+                140,
+                client,
+                52344,
+                server,
+                443,
+                "TCP",
+                Some(TCP_FLAG_PSH | TCP_FLAG_ACK),
+                Some(1518),
+                512,
+                "Application Data",
+                446,
+            ),
+            // The far end never acknowledged it, so the client sends it again.
+            (
+                390,
+                client,
+                52344,
+                server,
+                443,
+                "TCP",
+                Some(TCP_FLAG_PSH | TCP_FLAG_ACK),
+                Some(1518),
+                512,
+                "Application Data",
+                446,
+            ),
+            (
+                612,
+                server,
+                443,
+                client,
+                52344,
+                "TCP",
+                Some(TCP_FLAG_RST),
+                Some(7825),
+                66,
+                "",
+                0,
+            ),
+        ];
+
+        let mut out = Vec::with_capacity(rows.len());
+        let mut tracker = match self.stream_tracker.lock() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        for (i, row) in rows.iter().enumerate() {
+            let (off, src, sport, dst, dport, proto, flags, seq, len, info, plen) = *row;
+            let id = i as u64 + 1;
+            let ns = off * MS;
+            let payload = Self::demo_payload(proto, info, plen);
+            let stream_proto = if proto == "DNS" {
+                StreamProtocol::Udp
+            } else {
+                StreamProtocol::Tcp
+            };
+            let stamp = format!("00:00:{:02}.{:03}", off / 1000, off % 1000);
+            let idx = tracker.track_packet(
+                src,
+                sport,
+                dst,
+                dport,
+                stream_proto,
+                &payload,
+                id,
+                &stamp,
+                flags,
+                seq,
+                ns,
+            );
+            let hex = hex_dump(&payload);
+            let ascii = ascii_dump(&payload);
+            out.push(CapturedPacket {
+                id,
+                timestamp: stamp,
+                src_ip: src.into(),
+                dst_ip: dst.into(),
+                src_host: None,
+                dst_host: None,
+                protocol: proto.into(),
+                length: len,
+                src_port: Some(sport),
+                dst_port: Some(dport),
+                info: info.into(),
+                details: vec![
+                    format!("{proto}: {src}:{sport} -> {dst}:{dport}"),
+                    format!("Frame: {len} bytes on the wire"),
+                ],
+                payload_text: if plen > 0 {
+                    format!("[{plen} bytes]")
+                } else {
+                    String::new()
+                },
+                raw_hex: hex,
+                raw_ascii: ascii,
+                raw_bytes: payload,
+                stream_index: Some(idx),
+                tcp_flags: flags,
+                tcp_seq: seq,
+                expert: classify_expert(proto, info, flags),
+                timestamp_ns: ns,
+                app_protocol: None,
+                decrypted_plaintext: None,
+            });
+        }
+        drop(tracker);
+        if let Ok(mut p) = self.packets.write() {
+            *p = out;
+        }
+        if let Ok(mut c) = self.counter.lock() {
+            *c = rows.len() as u64;
+        }
     }
 
     pub fn get_stream(&self, index: u32) -> Option<Stream> {
@@ -2152,34 +2553,9 @@ fn build_packet(
     let src_host = dns.lookup(src_ip);
     let dst_host = dns.lookup(dst_ip);
 
-    let hex_lines = raw
-        .chunks(16)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
-            format!("{:04x}  {}", i * 16, hex.join(" "))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let hex_lines = hex_dump(raw);
 
-    let ascii_lines = raw
-        .chunks(16)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let ascii: String = chunk
-                .iter()
-                .map(|&b| {
-                    if b.is_ascii_graphic() || b == b' ' {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-            format!("{:04x}  {}", i * 16, ascii)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let ascii_lines = ascii_dump(raw);
 
     // Extract readable text from the application payload
     let payload_text = extract_readable_payload(payload);

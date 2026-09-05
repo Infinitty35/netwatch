@@ -3,10 +3,7 @@ use std::collections::HashMap;
 use crate::app::{App, StatsRange};
 use crate::collectors::packets::CapturedPacket;
 use crate::ui::widgets;
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{prelude::*, widgets::Paragraph};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -185,7 +182,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         f,
         app,
         cols[0],
-        "PACKETS",
+        "packets",
         format_count(stats.total_packets),
         &avg_label,
         t.text_primary,
@@ -200,7 +197,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         f,
         app,
         cols[1],
-        "BYTES",
+        "bytes",
         format_bytes_short(stats.total_bytes),
         &bytes_label,
         t.rx_rate,
@@ -210,7 +207,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         f,
         app,
         cols[2],
-        "CONNS",
+        "conns",
         stats.connection_count.to_string(),
         "active",
         t.status_info,
@@ -230,7 +227,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         f,
         app,
         cols[3],
-        "DNS",
+        "dns",
         format_count(stats.dns_queries),
         &dns_label,
         dns_color,
@@ -255,7 +252,7 @@ fn render_kpi_tiles(f: &mut Frame, app: &App, stats: &AggregateStats, area: Rect
         f,
         app,
         cols[4],
-        "RETRANS",
+        "retrans",
         retrans_val,
         &retrans_label,
         t.text_primary,
@@ -272,13 +269,10 @@ fn render_kpi_tile(
     val_color: Color,
 ) {
     let t = &app.theme;
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            format!(" {} ", label),
-            Style::default().fg(t.text_muted),
-        )))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+    let block = widgets::panel_block(t).title(Line::from(Span::styled(
+        format!(" {} ", label),
+        Style::default().fg(t.brand).bold(),
+    )));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -355,13 +349,10 @@ fn render_breakdown_panel(
     items: Vec<BreakdownItem>,
 ) {
     let t = &app.theme;
-    let block = Block::default()
-        .title(Line::from(Span::styled(
-            format!(" {} ", title),
-            Style::default().fg(t.brand).bold(),
-        )))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+    let block = widgets::panel_block(t).title(Line::from(Span::styled(
+        format!(" {} ", title),
+        Style::default().fg(t.brand).bold(),
+    )));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -447,7 +438,7 @@ fn render_protocol_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket
     }
     let total: u64 = totals.values().sum();
     if total == 0 {
-        render_breakdown_panel(f, app, area, "PROTOCOL  by bytes", Vec::new());
+        render_breakdown_panel(f, app, area, "protocol  by bytes", Vec::new());
         return;
     }
     let mut items: Vec<BreakdownItem> = totals
@@ -465,7 +456,7 @@ fn render_protocol_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     items.truncate(6);
-    render_breakdown_panel(f, app, area, "PROTOCOL  by bytes", items);
+    render_breakdown_panel(f, app, area, "protocol  by bytes", items);
 }
 
 fn classify_protocol(p: &str) -> &'static str {
@@ -505,7 +496,7 @@ fn render_processes_breakdown(f: &mut Frame, app: &App, area: Rect) {
     by_rx.sort_by_key(|b| std::cmp::Reverse(b.rx_bytes));
 
     if by_rx.is_empty() {
-        render_breakdown_panel(f, app, area, "TOP PROCESSES  by RX", Vec::new());
+        render_breakdown_panel(f, app, area, "top processes  by rx", Vec::new());
         return;
     }
 
@@ -532,7 +523,7 @@ fn render_processes_breakdown(f: &mut Frame, app: &App, area: Rect) {
         });
     }
 
-    render_breakdown_panel(f, app, area, "TOP PROCESSES  by RX", items);
+    render_breakdown_panel(f, app, area, "top processes  by rx", items);
 }
 
 fn render_remotes_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rect) {
@@ -553,7 +544,7 @@ fn render_remotes_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket]
         *totals.entry(remote.clone()).or_insert(0) += p.length as u64;
     }
     if totals.is_empty() {
-        render_breakdown_panel(f, app, area, "TOP REMOTES  by RX", Vec::new());
+        render_breakdown_panel(f, app, area, "top remotes  by rx", Vec::new());
         return;
     }
 
@@ -590,7 +581,7 @@ fn render_remotes_breakdown(f: &mut Frame, app: &App, packets: &[CapturedPacket]
         });
     }
 
-    render_breakdown_panel(f, app, area, "TOP REMOTES  by RX", items);
+    render_breakdown_panel(f, app, area, "top remotes  by rx", items);
 }
 
 fn local_ip_set(app: &App) -> std::collections::HashSet<String> {
@@ -700,9 +691,9 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         0
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " THROUGHPUT  session ",
+            " throughput  session ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
@@ -714,9 +705,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(t.text_muted),
             ))
             .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -771,12 +760,10 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         height: tx_h,
     };
 
-    let rx_padded = pad_history(&agg_rx, chart_w as usize);
-    let tx_padded = pad_history(&agg_tx, chart_w as usize);
     crate::graph::render(
         f,
         rx_area,
-        &rx_padded,
+        &agg_rx,
         app.graph_style,
         t.rx_rate,
         t.status_warn,
@@ -785,7 +772,7 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     crate::graph::render(
         f,
         tx_area,
-        &tx_padded,
+        &agg_tx,
         app.graph_style,
         t.tx_rate,
         t.status_warn,
@@ -800,15 +787,12 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         width: chart_w,
         height: 1,
     };
-    let axis_w = chart_w as usize;
-    let mut axis = String::from("-60s");
-    let mid_pad = axis_w.saturating_sub(11) / 2;
-    axis.push_str(&" ".repeat(mid_pad));
-    axis.push_str("-30s");
-    let used = axis.chars().count();
-    let end_pad = axis_w.saturating_sub(used + 3);
-    axis.push_str(&" ".repeat(end_pad));
-    axis.push_str("now");
+    // Derived from what the plot is actually showing, not from the literal
+    // "-60s … -30s … now" this used to print at every width.
+    let axis = crate::graph::time_axis(
+        chart_w,
+        crate::graph::axis_window_secs(chart_w, app.graph_style, app.user_config.refresh_rate_ms),
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             axis,
@@ -834,18 +818,6 @@ where
     acc
 }
 
-fn pad_history(data: &[u64], target_width: usize) -> Vec<u64> {
-    if target_width == 0 {
-        return Vec::new();
-    }
-    if data.len() >= target_width {
-        return data[data.len() - target_width..].to_vec();
-    }
-    let mut padded = vec![0u64; target_width - data.len()];
-    padded.extend_from_slice(data);
-    padded
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -856,12 +828,6 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    let t = &app.theme;
-    let hints = vec![
-        Span::styled("t", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Range  "),
-        Span::styled("a", Style::default().fg(t.key_hint).bold()),
-        Span::raw(":Analyze"),
-    ];
+    let hints = vec![widgets::hint("t", "range"), widgets::hint("a", "analyze")];
     widgets::render_footer(f, app, area, hints);
 }

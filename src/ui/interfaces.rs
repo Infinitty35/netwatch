@@ -4,10 +4,7 @@ use crate::sort::{
     apply_direction, cmp_case_insensitive, cmp_f64, cmp_ip, SortColumn, TabSortState,
 };
 use crate::ui::widgets;
-use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{prelude::*, widgets::Paragraph};
 
 pub const COLUMNS: &[SortColumn] = &[
     SortColumn { name: "Iface" },
@@ -200,17 +197,18 @@ fn render_interfaces_table(f: &mut Frame, app: &App, interfaces: &[InterfaceTraf
 
     let counts = chip_counts(&app.traffic.interfaces(), app);
     let title_right = format!(" {} active  {} idle  0 down ", counts.active, counts.idle);
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
-            " INTERFACES ",
+            " interfaces ",
             Style::default().fg(t.brand).bold(),
         )))
         .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+            Line::from(Span::styled(
+                title_right,
+                Style::default().fg(t.brand).bold(),
+            ))
+            .alignment(Alignment::Right),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -252,7 +250,7 @@ fn render_interfaces_table(f: &mut Frame, app: &App, interfaces: &[InterfaceTraf
 
 fn build_header_line(app: &App) -> Line<'static> {
     let t = &app.theme;
-    let header_text = "  IFACE     IP                  ROLE        RX/s        TX/s      RX TOTAL    TX TOTAL    TRAFFIC  60s";
+    let header_text = "  iface     ip                  role        rx/s        tx/s      rx total    tx total    traffic  60s";
     Line::from(Span::styled(
         header_text.to_string(),
         Style::default().fg(t.text_muted),
@@ -345,11 +343,10 @@ fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: 
                 height: 1,
             };
             let history: Vec<u64> = iface.rx_history.iter().copied().collect();
-            let padded = pad_history(&history, spark_w as usize);
             crate::graph::render(
                 f,
                 spark_area,
-                &padded,
+                &history,
                 app.graph_style,
                 t.rx_rate,
                 t.status_warn,
@@ -368,8 +365,8 @@ fn render_detail_panel(f: &mut Frame, app: &App, interfaces: &[InterfaceTraffic]
         .or_else(|| interfaces.first());
 
     let title_left = match selected {
-        Some(iface) => format!(" {}  DETAIL ", iface.name),
-        None => " DETAIL ".to_string(),
+        Some(iface) => format!(" {}  detail ", iface.name),
+        None => " detail ".to_string(),
     };
     let mtu = selected
         .and_then(|i| {
@@ -389,17 +386,18 @@ fn render_detail_panel(f: &mut Frame, app: &App, interfaces: &[InterfaceTraffic]
         " ↑↓ to switch ".to_string()
     };
 
-    let block = Block::default()
+    let block = widgets::panel_block(t)
         .title(Line::from(Span::styled(
             title_left,
             Style::default().fg(t.status_warn).bold(),
         )))
         .title(
-            Line::from(Span::styled(title_right, Style::default().fg(t.text_muted)))
-                .alignment(Alignment::Right),
-        )
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border));
+            Line::from(Span::styled(
+                title_right,
+                Style::default().fg(t.brand).bold(),
+            ))
+            .alignment(Alignment::Right),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -597,22 +595,20 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
         height: tx_h,
     };
 
-    let rx_padded = pad_history(&rx_hist, chart_w as usize);
     crate::graph::render(
         f,
         rx_area,
-        &rx_padded,
+        &rx_hist,
         app.graph_style,
         t.rx_rate,
         t.status_warn,
         app.graph_opts(),
     );
 
-    let tx_padded = pad_history(&tx_hist, chart_w as usize);
     crate::graph::render(
         f,
         tx_area,
-        &tx_padded,
+        &tx_hist,
         app.graph_style,
         t.tx_rate,
         t.status_warn,
@@ -627,15 +623,12 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
         width: chart_w,
         height: 1,
     };
-    let axis_w = chart_w as usize;
-    let mut axis = String::from("-60s");
-    let mid_pad = axis_w.saturating_sub(11) / 2;
-    axis.push_str(&" ".repeat(mid_pad));
-    axis.push_str("-30s");
-    let used = axis.chars().count();
-    let end_pad = axis_w.saturating_sub(used + 3);
-    axis.push_str(&" ".repeat(end_pad));
-    axis.push_str("now");
+    // Derived from what the plot is actually showing, not from the literal
+    // "-60s … -30s … now" this used to print at every width.
+    let axis = crate::graph::time_axis(
+        chart_w,
+        crate::graph::axis_window_secs(chart_w, app.graph_style, app.user_config.refresh_rate_ms),
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             axis,
@@ -647,12 +640,9 @@ fn render_detail_chart(f: &mut Frame, app: &App, area: Rect, iface: &InterfaceTr
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
-        Span::styled("f", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Filter  "),
-        Span::styled("s", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Sort  "),
-        Span::styled("a", Style::default().fg(app.theme.key_hint).bold()),
-        Span::raw(":Analyze"),
+        widgets::hint("f", "filter"),
+        widgets::hint("s", "sort"),
+        widgets::hint("a", "analyze"),
     ];
     widgets::render_footer(f, app, area, hints);
 }
@@ -714,18 +704,6 @@ pub fn role_for_iface(
         .find(|i| i.name == name)
         .and_then(|i| i.is_wireless);
     role_for(name, is_wireless)
-}
-
-fn pad_history(data: &[u64], target_width: usize) -> Vec<u64> {
-    if target_width == 0 {
-        return Vec::new();
-    }
-    if data.len() >= target_width {
-        return data[data.len() - target_width..].to_vec();
-    }
-    let mut padded = vec![0u64; target_width - data.len()];
-    padded.extend_from_slice(data);
-    padded
 }
 
 #[cfg(test)]
