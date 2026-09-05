@@ -31,6 +31,12 @@
 #   - Width has to clear ~130 columns or the tab bar and footer clip, which
 #     reads as a broken render rather than an honest one.
 #
+# NOT CURRENTLY IN THE README. Dropped at v0.30: a ten-tab walkthrough breaks
+# on every chrome change, and the tab table in the README says the same thing
+# in text that cannot go stale. The tape is kept because the prereqs below were
+# expensive to learn — re-record from it if a tour is wanted again, but do it
+# after the chrome has settled, not before.
+#
 # Record with:  vhs docs/media/demo-tour.tape
 # Needs: ./target/release/netwatch, vhs, scripts/demo-lite-traffic.sh.
 

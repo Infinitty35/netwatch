@@ -18,19 +18,15 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-dense.gif" alt="NetWatch Dense: four boxes filling the terminal — a mirrored braille throughput graph with download growing up from the time axis and upload growing down from it, per-interface rates with 60-second sparklines, four-hop latency budgets, and a connection table whose selected row's detail is hoisted into the top of the same box carrying kernel cwnd / ssthresh / mss / rwnd" width="900">
+  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
 </p>
 
 <p align="center">
-  <em>Everything at once, with <strong>zero rows of chrome</strong> — no header bar, no menu bar, no status bar. Download grows up from the shared time axis, upload grows down from it, so traffic symmetry is a shape you recognise before you read a number. Colour encodes magnitude, not series.</em>
-</p>
-
-<p align="center">
-  <img src="docs/media/demo-tour.gif" alt="A tour of the live NetWatch TUI: dashboard, connections with process attribution, live packet capture and decode, network topology, and the egress profile of each program" width="820">
-</p>
-
-<p align="center">
-  <em>…and the default ten-tab instrument underneath it, one <code>V</code> away and sharing the same warm collectors — the dashboard, the program behind every socket, deep packet inspection, the network map, and what each program talks to.</em>
+  <em>The headline of v0.30. Issue → probable cause → remediation → verified close. The engine is never
+  told the problem is fixed; it watches the resolver and closes the issue when
+  <code>dns.rtt_p50 &lt; 5ms</code> has held for 60s. Recorded with
+  <code>netwatch --demo</code>, which replays a scenario through the real engine
+  and says so on every frame.</em>
 </p>
 
 ---
@@ -49,30 +45,10 @@ It scales to the question you're asking — in both directions: [`--view dense`]
 
 And the part no other terminal tool does at all: NetWatch learns what each program on the machine talks to, turns that observed baseline into a policy with one keypress, and tells you the moment a program starts talking somewhere new.
 
-<p align="center">
-  <img src="docs/media/demo-egress.gif" alt="NetWatch learning what curl talks to, promoting that baseline to an egress policy, and then flagging a new destination as drift" width="820">
-</p>
-
-<p align="center">
-  <em>Observe → promote → warn. The baseline becomes a policy with one keypress; the next new destination arrives as <strong>drift</strong>.</em>
-</p>
-
 That diagnosis is deterministic — no model involved. Baselines are learned per
 metric and scoped to the network that taught them, 25 catalogued rules decide
 what counts as wrong, and each explanation is ranked by the checks that
 separated it from the others.
-
-<p align="center">
-  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
-</p>
-
-<p align="center">
-  <em>Issue → probable cause → remediation → verified close. The engine is never
-  told the problem is fixed; it watches the resolver and closes the issue when
-  <code>dns.rtt_p50 &lt; 5ms</code> has held for 60s. Recorded with
-  <code>netwatch --demo</code>, which replays a scenario through the real engine
-  and says so on every frame.</em>
-</p>
 
 ## Why NetWatch
 
@@ -180,6 +156,14 @@ The decrypted application data renders inline. A keylog miss never breaks captur
 
 ### See it catch egress drift in 60 seconds
 
+<p align="center">
+  <img src="docs/media/demo-egress.gif" alt="NetWatch learning what curl talks to, promoting that baseline to an egress policy, and then flagging a new destination as drift" width="820">
+</p>
+
+<p align="center">
+  <em>Observe → promote → warn. The baseline becomes a policy with one keypress; the next new destination arrives as <strong>drift</strong>.</em>
+</p>
+
 The loop from the demo above, in three commands:
 
 ```bash
@@ -253,7 +237,11 @@ The other direction: when you have a big terminal and want *everything* at once,
 netwatch --view dense     # four boxes, needs 130×44
 ```
 
-That's the screen at the top of this README. The signature element is the **mirrored dual graph**: download grows up from a centre time axis, upload grows down from the same axis. Traffic symmetry becomes a shape you recognise without reading a number — a download burst is a cliff above the line, a backup job is a cliff below it. Both halves are braille at two samples per character cell, and every cell is coloured by its **height in the graph** rather than by which series it belongs to, so you see a spike's severity before you measure it against the axis.
+<p align="center">
+  <img src="docs/media/demo-dense.gif" alt="NetWatch Dense: four boxes filling the terminal — a mirrored braille throughput graph with download growing up from the time axis and upload growing down from it, per-interface rates with 60-second sparklines, four-hop latency budgets, and a connection table whose selected row's detail is hoisted into the top of the same box carrying kernel cwnd / ssthresh / mss / rwnd" width="900">
+</p>
+
+The signature element is the **mirrored dual graph**: download grows up from a centre time axis, upload grows down from the same axis. Traffic symmetry becomes a shape you recognise without reading a number — a download burst is a cliff above the line, a backup job is a cliff below it. Both halves are braille at two samples per character cell, and every cell is coloured by its **height in the graph** rather than by which series it belongs to, so you see a spike's severity before you measure it against the axis.
 
 Throughput ramps cool→bright because high bandwidth is *busy*, not *bad* — a saturated link during a backup is working. Only bounded values where high genuinely is bad — link saturation, latency budget per hop — get the green→amber→red treatment, and their meters colour by position along the bar, so the red zone is visible before you reach it.
 
