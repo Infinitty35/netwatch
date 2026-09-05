@@ -8,125 +8,95 @@ All notable changes to NetWatch will be documented in this file.
 
 NetWatch gains a diagnostic engine: a Diagnose tab that names what is wrong,
 ranks the explanations by the checks that separated them, offers a fix, and
-closes the issue itself when its own success condition holds. The chrome is
-rebuilt to one panel definition across every tab, and AI Insights becomes a
-commentary block inside Diagnose rather than a tab of its own.
+closes the issue when its own success condition holds. The chrome is rebuilt to
+one panel definition across every tab, and AI Insights becomes a commentary
+block inside Diagnose rather than a tab of its own.
 
 ### Added
 - **Diagnose (tab `9`) — issue → probable cause → remediation → verified
   close.** Deterministic; no model involved. Per-metric EWMA baselines with
   standard deviation, learned over a minimum of 30 minutes and scoped to a
   fingerprint of the network that taught them, so carrying a laptop from a
-  1.2 ms office resolver to a hotel hotspot does not fire every rule at once.
-  A 25-rule catalogue with an explicit suppression graph, so a dead gateway
-  reports as one finding with its consequences listed underneath rather than
-  as six. Causes are ranked by weighted check-pass fraction and displayed as a
-  word — `strong`, `likely`, `possible` — because the number underneath is not
-  a calibrated probability and rendering it as `92%` invites reading it as one.
-  Checks that could not run report as *not run* and count neither for nor
-  against.
+  1.2 ms office resolver to a hotel hotspot doesn't fire every rule at once. A
+  25-rule catalogue with an explicit suppression graph, so a dead gateway is
+  one finding with its consequences underneath rather than six. Causes are
+  ranked by weighted check-pass fraction and shown as a word — `strong`,
+  `likely`, `possible` — because the number underneath is not a calibrated
+  probability and `92%` invites reading it as one; checks that couldn't run
+  report as *not run* and count neither way.
 
-  Remediations are key-bound and reversible. Anything that edits host state
-  journals its intent *before* it writes, so a `SIGKILL` cannot leave
-  `/etc/resolv.conf` pointing where NetWatch put it — the next start reverts
-  what a dead process left behind, and declines to if something else has edited
-  the file since. `report.md` and `report.json` are generated from the same
-  `Vec<Issue>` the screen renders, and a test walks the markdown and fails if
-  any line quotes a number no evidence field can justify.
+  Remediations are key-bound and reversible, and journal their intent *before*
+  they write, so a `SIGKILL` can't leave `/etc/resolv.conf` pointing where
+  NetWatch put it — the next start reverts what a dead process left behind, and
+  declines if something else has edited the file since. `report.md` and
+  `report.json` come from the same `Vec<Issue>` the screen renders; a test
+  fails if any line quotes a number no evidence field can justify.
 
   Four of the 25 rules are declared `Planned` and can never open an issue,
-  because NetWatch does not yet have their inputs: a DNSSEC-validating
-  reference query, per-reply DNS flags, wireless statistics, a STUN probe. The
-  Diagnose header states the split. Two further detectors run against inputs
-  that do not exist yet and say so rather than guessing — there is no
-  loaded-RTT test, so `tcp.bufferbloat_local` is dormant and the remote rule's
-  strongest discriminating check reports *not run*; link rate is uncollected,
-  so `iface.saturated` stays quiet rather than assuming 1 Gb and crying wolf on
-  wifi. A tool that lists 25 rules and quietly evaluates 19 is misreporting its
-  own coverage.
-
-  Two rules are deliberately conservative about what a failed probe means.
-  `gateway.unreachable` requires corroboration — an unprivileged NetWatch
-  cannot always send ICMP and plenty of routers drop echo with no open port, so
-  a failed gateway probe on its own means little; if anything beyond the
-  gateway answers, packets are demonstrably transiting it and no issue opens.
-  `iface.errors` fires on a rate over a real 60-second window, and a wireless
-  NIC must clear 60 drops or one genuine error first, because a NIC that drops
-  the occasional multicast frame is not a fault and reporting it as one teaches
-  people to ignore the tab.
-
-- **A verdict line under the tab bar on every tab**, reading from that same
-  issue list: what is wrong, since when, and what to press. It collapses to one
-  dim line when nothing is open — and when the baselines are not yet learned it
-  says so rather than claiming health it has not earned. "All nominal" from a
-  tool ninety seconds into a session is not a diagnosis, and the dashboard,
-  Lite and Dense health readouts now defer to the engine for that word.
-
+  because their inputs don't exist yet (a DNSSEC reference query, per-reply DNS
+  flags, wireless statistics, a STUN probe), and two more detectors report
+  their strongest check as *not run* for the same reason. The header states the
+  split: a tool that lists 25 rules and evaluates 19 is misreporting its own
+  coverage.
+- **A verdict line under the tab bar on every tab**, from that same issue list:
+  what is wrong, since when, what to press. When the baselines aren't learned
+  yet it says so rather than claiming health it hasn't earned — the dashboard,
+  Lite and Dense readouts now defer to the engine for the word "nominal".
 - **`--demo`** replays a recorded incident through the real engine, rules and
-  UI. Diagnose has nothing to say on a healthy machine and needs 30 minutes of
-  baseline before it will say it, which makes the feature impossible to
-  demonstrate honestly; this is the answer. Every frame is labelled as a
-  replay, remediations are simulated and touch nothing, and the issue still
-  closes through the normal verify path rather than by fiat.
+  UI. Diagnose has nothing to say on a healthy machine and wants 30 minutes of
+  baseline first, which makes it impossible to demonstrate honestly otherwise.
+  Every frame is labelled, remediations touch nothing, and the issue still
+  closes through the normal verify path.
 
 ### Changed
 - **btop-style chrome across the whole tool.** Every box now comes from one
   `widgets::Panel` — rounded corners, title inline in the brand accent,
   metadata right-aligned in the same border row. There were 48 hand-built
-  blocks across 15 files before this, agreeing by convention rather than by
-  construction, and two had already drifted to different border styles on the
-  same screen. Tab bar, table headers and panel titles move to the tool's
-  lowercase voice; the tab bar drops its brackets, which returns twenty columns
-  and stops the status chips clipping at 150 columns.
-- **AI Insights is no longer a tab.** It renders inside Diagnose as clearly
-  labelled commentary on findings the deterministic engine has already
-  established, which is where the design always placed it. `insights_enabled`
-  and the rest of the config keys are unchanged; tab `9` is now Diagnose, and
-  a config naming `insights` as its start tab resolves there.
+  blocks across 15 files agreeing by convention rather than construction, two
+  already drifted to a different border style on the same screen. Tab bar,
+  table headers and panel titles move to the tool's lowercase voice; dropping
+  the tab brackets returns twenty columns and stops the status chips clipping
+  at 150 columns.
+- **AI Insights is no longer a tab.** It renders inside Diagnose as labelled
+  commentary on findings the engine has already established. `insights_enabled`
+  and the other config keys are unchanged; tab `9` is Diagnose, and a config
+  naming `insights` as its start tab resolves there.
 - `screenshots/` is excluded from the published crate, as `docs/media/` already
-  was — 2.8 MiB of documentation assets a `cargo install` has no use for.
+  was.
 
 ### Fixed
-- **`pid:0` owned megabytes of traffic on Connections, Processes and Egress.**
-  It was never a PID — PID 0 is the kernel swapper. It was what the label
-  printed when attribution returned `None`, so "644 MB owned by pid:0" meant
-  644 MB unattributed, and the invented process sent at least one investigation
-  hunting the sandbox for a bug that was in a format string. Unattributed
-  traffic now says `unattributed`; a known PID whose `comm` could not be read
-  still reads `pid:<n>`, because those are different states.
-- **`E` export silently did nothing under the default sandbox.** Exports were
-  written to `$HOME`, which the Landlock policy makes read-only, so every
-  export failed with `Permission denied` — and with no on-screen confirmation
-  that was indistinguishable from an export that had worked. They now land in
-  the working directory the sandbox actually grants write access to, which is
-  where `sandbox::collect_read_write` always said they went, and the path
-  appears on screen.
-- **The dashboard's five KPI sparklines covered different spans of time at
-  identical width.** The gateway, DNS and loss tiles plot a series sampled once
-  per health probe; the throughput tile plots one sampled once per refresh
-  tick. Both drew "the last N samples", so at five ticks per probe the latency
-  tiles showed five minutes beside a throughput tile showing one, in a row
-  meant to be read across. Every tile is now resampled onto one shared window
-  before it is drawn.
-- **Latency sparklines rendered as flat lines, in both directions.** RTT was
-  rounded to whole milliseconds before plotting, so a 0.5 ms LAN resolver
-  collapsed to 0 or 1 and any non-zero sample drew at full height; and the
-  plotting ceiling was a raw `max()`, so a single 200 ms excursion against a
-  2 ms baseline scaled every normal sample to the floor. Either way the track
-  became a straight line, which reads as a stream that has stopped updating.
-  RTT now plots in microseconds against a 95th-percentile ceiling with headroom
-  above the median, so neither an outlier nor a dead-steady series flattens it.
+- **`pid:0` owned megabytes of traffic** on Connections, Processes and Egress.
+  PID 0 is the kernel swapper; this was what the label printed when attribution
+  returned `None`, so "644 MB owned by pid:0" meant 644 MB unattributed — and
+  the invented process sent an investigation hunting the sandbox for a bug that
+  was in a format string. Unattributed traffic now says so; a known PID whose
+  `comm` couldn't be read still reads `pid:<n>`.
+- **`E` export silently did nothing under the default sandbox.** Exports went
+  to `$HOME`, which the Landlock policy makes read-only, so every one failed
+  with `Permission denied` — indistinguishable, with no confirmation on screen,
+  from one that worked. They now land in the working directory the sandbox
+  grants, and the path is shown.
+- **The five KPI sparklines covered different spans at identical width.**
+  Gateway, DNS and loss are sampled once per health probe; throughput once per
+  refresh tick. All drew "the last N samples", so at five ticks per probe the
+  latency tiles showed five minutes beside a throughput tile showing one, in a
+  row meant to be read across. Every tile is resampled onto one window first.
+- **Latency sparklines rendered flat, in both directions.** RTT was rounded to
+  whole milliseconds, so a 0.5 ms resolver collapsed to 0 or 1 and any non-zero
+  sample drew full height; and the ceiling was a raw `max()`, so one 200 ms
+  excursion against a 2 ms baseline scaled everything else to the floor. RTT
+  now plots in microseconds against a 95th-percentile ceiling with headroom
+  above the median.
 - **The Connections state column truncated `ESTABLISHED` to `ESTABLI…`**, which
-  is not a state anyone can look up. Socket states now have short names that
-  fit the column whole — `estab`, `time-wait`, `close-wait` — and a mixed group
-  drops the denominator rather than clipping the word.
-- **The Timeline's "now" cursor overwrote the newest sample it was pointing
-  at.** It painted a `│` in the last column — the one holding the most recent
-  reading — one column in from the panel's own border, so it read as a doubled
-  border rather than a cursor. It now tints the cells already there, which is
-  what the panel's "cyan = now" legend always claimed.
+  is not a state anyone can look up. States now have short names that fit whole
+  — `estab`, `time-wait`, `close-wait` — and a mixed group drops the
+  denominator rather than clipping the word.
+- **The Timeline's "now" cursor overwrote the newest sample it pointed at**,
+  painting a `│` one column in from the panel border so it read as doubled
+  chrome. It tints the cells already there, which is what the "cyan = now"
+  legend always claimed.
 - The footer advertised `1-8:Tab` and `--help` said `1-7 Switch tabs` while the
-  bar drew ten tabs. Both now name the range that exists.
+  bar drew ten tabs.
 
 ## [0.29.2] - 2026-08-16
 
