@@ -2,7 +2,7 @@
   <h1 align="center">NetWatch</h1>
   <p align="center">
     <strong>See what your network is actually doing — live, in your terminal.</strong><br>
-    <em>A network monitor that reads encrypted traffic, names the process behind every connection, and catches malware calling home. One binary. Zero config.</em>
+    <em>A network monitor that reads encrypted traffic, names the process behind every connection, catches malware calling home — and tells you what's wrong, why, and how to fix it. One binary. Zero config.</em>
   </p>
   <p align="center">
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
@@ -37,13 +37,15 @@
 
 Most network tools answer one question — *"what's using my bandwidth?"* — and stop. NetWatch keeps going. It decodes the protocols on the wire, tells you **which program** opened each connection, and watches for the patterns that mean trouble — a port scan, malware beaconing to a command server, data sneaking out over DNS. When something looks wrong, one keypress freezes a portable evidence bundle you can attach to a bug report.
 
-Think of it as **one zero-config binary that does the job of a bandwidth meter, the triage view of Wireshark, and a lightweight intrusion detector** — without leaving the terminal.
+And when something *is* wrong it doesn't stop at the graph. It names the issue, ranks the explanations by the checks that ruled the others out, offers the fix, and closes the issue itself once its own success condition holds.
+
+Think of it as **one zero-config binary that does the job of a bandwidth meter, the triage view of Wireshark, a lightweight intrusion detector, and the engineer who reads the output** — without leaving the terminal.
 
 It scales to the question you're asking — in both directions: [`--view dense`](#dense-view) fills a big terminal with four zero-chrome boxes, and `netwatch --lite` is [one 80×24 screen](#lite-view) for *"what's using my network right now?"*; the full ten-tab view is there when the answer is "something I need to investigate" — one keypress apart, sharing the same live capture.
 
 **Made for** blue-teamers, incident responders, SREs, and homelabbers who need to see what's happening *right now* — not parse a capture file an hour later.
 
-<samp>840+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
+<samp>920+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
 
 And the part no other terminal tool does at all: NetWatch learns what each program on the machine talks to, turns that observed baseline into a policy with one keypress, and tells you the moment a program starts talking somewhere new.
 
@@ -55,10 +57,10 @@ And the part no other terminal tool does at all: NetWatch learns what each progr
   <em>Observe → promote → warn. The baseline becomes a policy with one keypress; the next new destination arrives as <strong>drift</strong>.</em>
 </p>
 
-And when something *is* wrong, NetWatch does not stop at the graph. It names the
-issue, ranks the explanations by the checks that discriminated between them,
-offers the fix, and closes the issue itself when its own success condition
-holds.
+That diagnosis is deterministic — no model involved. Baselines are learned per
+metric and scoped to the network that taught them, 25 catalogued rules decide
+what counts as wrong, and each explanation is ranked by the checks that
+separated it from the others.
 
 <p align="center">
   <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
@@ -74,6 +76,7 @@ holds.
 
 ## Why NetWatch
 
+- 🩺 **Get told what's wrong, not just what's happening** — NetWatch learns what normal looks like on *this* network, then names the issue, ranks the probable causes by the checks that ruled the others out, and offers a fix it can apply and reverse. It closes the issue itself when the rule's own success condition holds — the engine is never told the problem is fixed, it watches until it is. Deterministic: no model, no cloud, and it says which of its rules it cannot yet evaluate rather than implying full coverage.
 - 🔓 **Read encrypted traffic you control** — point a browser or app's `SSLKEYLOGFILE` at NetWatch and watch the plaintext of its TLS 1.3 sessions decode live, the same way Wireshark does it. No proxy, no certificates, nothing in the middle.
 - 🛰️ **Learn what every program talks to, then get told when it changes** — NetWatch watches which destinations each process reaches (hostname from the ClientHello, autonomous system, port), and one keypress promotes that observed baseline into an egress policy. From then on it warns when a program starts talking somewhere new. That is the sentence a firewall ruleset cannot express: *`curl` used to reach only `api.github.com`, and today it reached something else.* Observe-only — it never blocks.
 - 🧬 **Fingerprint the software behind a connection** — JA4 turns each TLS/QUIC handshake into a stable fingerprint, so you can recognize a specific client — or a specific piece of malware — *even though the traffic is encrypted*, the way you'd recognize a browser by its user-agent. Pivot on a fingerprint to find every other flow from the same software.
@@ -269,7 +272,7 @@ Below the graph: per-interface rates with 60-second sparklines, four-hop latency
 | **[Security &amp; the Landlock sandbox](docs/REFERENCE.md#security--forensics)** | The threat model, capability dropping, and the filesystem allow-list. |
 | **[Egress policy linting](docs/egress-linter-plan.md)** | The observe → promote → warn model, the rule language, `strict` mode, and the NDJSON export schema. |
 | **[Flight Recorder](docs/REFERENCE.md#flight-recorder)** | Arming, freezing, and the contents of an incident bundle. |
-| **[AI Insights](docs/INSIGHTS.md)** | Optional local/cloud LLM analysis (off by default). |
+| **[AI Insights](docs/INSIGHTS.md)** | Optional local/cloud LLM commentary, rendered inside the Diagnose tab (off by default). |
 
 ## How it works
 
