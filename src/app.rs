@@ -445,6 +445,14 @@ pub(crate) fn record_rtt_sample(
 #[derive(Default)]
 pub struct UiScrollState {
     pub connection_scroll: usize,
+    /// Cursor in the dashboard's connections panel, or `None` when the reader
+    /// has not moved it.
+    ///
+    /// `Option` rather than a plain index because the dashboard is a screen
+    /// people mostly *look* at: a permanently highlighted row would be a
+    /// cursor pointing at nothing anyone asked about. It appears on the first
+    /// arrow key and goes away again off the top.
+    pub dashboard_conn_scroll: Option<usize>,
     pub packet_scroll: usize,
     pub packet_selected: Option<u64>,
     pub stream_scroll: usize,
@@ -1187,6 +1195,24 @@ impl App {
                          if group.key == key)
             }) {
                 self.ui.scroll.connection_scroll = idx;
+            }
+        }
+    }
+
+    /// Collapse or expand the dashboard connection group under the cursor.
+    ///
+    /// Works from a child row as well as the header, like the Connections
+    /// tab. A solo row folds nothing: `selected_group_key` returns `None`
+    /// there, so the key is a no-op rather than a hidden state change.
+    fn toggle_dashboard_fold(&mut self) {
+        let Some(process) = crate::ui::dashboard::selected_group_key(self) else {
+            return;
+        };
+        if self.ui.dashboard_collapsed.toggle(&process) {
+            // Collapsing removes the rows below the cursor, so park it on the
+            // header to keep the selection on something visible.
+            if let Some(idx) = crate::ui::dashboard::group_header_index(self, &process) {
+                self.ui.scroll.dashboard_conn_scroll = Some(idx);
             }
         }
     }
@@ -2595,7 +2621,20 @@ fn scroll_tab(app: &mut App, delta: isize) {
             let max = crate::ui::egress::visible_rows(app).len().saturating_sub(1);
             app.ui.scroll.egress_scroll = clamp_scroll(app.ui.scroll.egress_scroll, delta, max);
         }
-        Tab::Dashboard => {}
+        Tab::Dashboard => {
+            // Clamp against the rows the panel draws — headers plus the
+            // children of expanded groups — so the cursor can't run past a
+            // folded group into rows nobody is seeing.
+            let max = crate::ui::dashboard::visible_row_count(app).saturating_sub(1);
+            app.ui.scroll.dashboard_conn_scroll =
+                match (app.ui.scroll.dashboard_conn_scroll, delta < 0) {
+                    // Off the top puts the panel back in read-only mode
+                    // rather than pinning the cursor to row 0.
+                    (Some(0) | None, true) => None,
+                    (None, false) => Some(0),
+                    (Some(i), _) => Some(clamp_scroll(i, delta, max)),
+                };
+        }
     }
 }
 
@@ -3520,6 +3559,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char(' ') if app.ui.current_tab == Tab::Connections => {
             app.toggle_connection_fold();
         }
+        KeyCode::Char(' ') if app.ui.current_tab == Tab::Dashboard => {
+            app.toggle_dashboard_fold();
+        }
         // Fold/unfold everything. One key rather than two because the state
         // is binary at the screen level: either you want the overview or you
         // want the detail. Resets the cursor, since the row it pointed at has
@@ -3537,6 +3579,10 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('z') if app.ui.current_tab == Tab::Connections => {
             app.ui.connection_collapsed.toggle_all();
             app.ui.scroll.connection_scroll = 0;
+        }
+        KeyCode::Char('z') if app.ui.current_tab == Tab::Dashboard => {
+            app.ui.dashboard_collapsed.toggle_all();
+            app.ui.scroll.dashboard_conn_scroll = None;
         }
         // Must stay ahead of the unguarded sort arms below — match arms are
         // ordered, and a guarded Egress arm placed after an unguarded one
@@ -3590,6 +3636,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                     app.ui.current_tab = Tab::Connections;
                 }
             }
+        }
+        KeyCode::Enter if app.ui.current_tab == Tab::Dashboard => {
+            app.toggle_dashboard_fold();
         }
         KeyCode::Enter if app.ui.current_tab == Tab::Connections => {
             // A group header has no single flow to drill into, so Enter does

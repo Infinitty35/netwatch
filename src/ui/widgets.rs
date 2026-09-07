@@ -862,9 +862,9 @@ pub fn render_control_strip(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// A socket verdict as a filled pill: dark text on a saturated ground.
+/// A socket verdict as a coloured word on the panel ground.
 ///
-/// The ground is the *severity* of the verdict, not a per-category colour —
+/// The colour is the *severity* of the verdict, not a per-category colour —
 /// which is why `app-limited` is green and `bufferbloat` amber. An
 /// app-limited socket is working exactly as intended; a bufferbloated one is
 /// the reason someone opened this screen.
@@ -873,16 +873,13 @@ pub fn socket_verdict_chip(
     v: crate::diagnose::detectors::SocketVerdict,
 ) -> Span<'static> {
     use crate::diagnose::detectors::SocketVerdict as V;
-    let bg = match v {
+    let fg = match v {
         V::Ok | V::AppLimited => t.status_good,
         V::ReceiverLimited => t.status_info,
         V::Bufferbloat | V::Congestion => t.status_warn,
         V::RetransBurst | V::ZeroWindow => t.status_error,
     };
-    Span::styled(
-        format!(" {} ", v.label()),
-        Style::default().fg(t.text_inverse).bg(bg),
-    )
+    Span::styled(v.label().to_string(), Style::default().fg(fg))
 }
 
 /// How loudly a verdict asks to be looked at. Higher sorts first.
@@ -1177,24 +1174,21 @@ mod tests {
         let t = crate::theme::by_name("dark");
 
         assert_eq!(
-            socket_verdict_chip(&t, V::AppLimited).style.bg,
+            socket_verdict_chip(&t, V::AppLimited).style.fg,
             Some(t.status_good)
         );
-        assert_eq!(socket_verdict_chip(&t, V::Ok).style.bg, Some(t.status_good));
+        assert_eq!(socket_verdict_chip(&t, V::Ok).style.fg, Some(t.status_good));
         assert_eq!(
-            socket_verdict_chip(&t, V::Bufferbloat).style.bg,
+            socket_verdict_chip(&t, V::Bufferbloat).style.fg,
             Some(t.status_warn)
         );
         assert_eq!(
-            socket_verdict_chip(&t, V::ZeroWindow).style.bg,
+            socket_verdict_chip(&t, V::ZeroWindow).style.fg,
             Some(t.status_error)
         );
-        // Dark text on the ground, so the pill is legible rather than a
-        // coloured word on the panel background.
-        assert_eq!(
-            socket_verdict_chip(&t, V::Ok).style.fg,
-            Some(t.text_inverse)
-        );
+        // The word carries the colour; no filled pill, so the column reads as
+        // text against the panel ground.
+        assert_eq!(socket_verdict_chip(&t, V::Ok).style.bg, None);
     }
 
     /// Concern ordering is what the dashboard sorts by. A zero-window socket

@@ -42,11 +42,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // subject, and on the dashboard they cost a column that the throughput
     // graph and the health findings both had too little of.
     let show_timeline = area.height >= TIMELINE_MIN_HEIGHT;
+    // Interfaces sits beside connections when the row can carry both. Below
+    // that the connections table cannot hold its columns next to a 44-column
+    // panel — its own guard blanks the table rather than squeezing it — so
+    // interfaces falls back to sharing the throughput row, which is a graph
+    // and shrinks without losing meaning.
+    let iface_beside_conns = area.width >= IFACE_BESIDE_CONNS_MIN_W;
     let mut constraints = vec![
         Constraint::Length(3),        // header
         Constraint::Length(KPI_ROWS), // hero row
-        Constraint::Length(MID_ROWS), // throughput + health
-        Constraint::Min(6),           // connections
+        Constraint::Length(MID_ROWS), // throughput, and interfaces when narrow
+        Constraint::Min(6),           // connections, and interfaces when wide
     ];
     if show_timeline {
         constraints.push(Constraint::Length(TIMELINE_ROWS));
@@ -60,8 +66,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     widgets::render_header(f, app, chunks[0]);
     render_kpi_strip(f, app, chunks[1]);
-    render_mid_section(f, app, chunks[2]);
-    render_connections(f, app, chunks[3]);
+    render_mid_section(f, app, chunks[2], iface_beside_conns);
+    render_bottom_section(f, app, chunks[3], iface_beside_conns);
     if show_timeline {
         render_timeline(f, app, chunks[4]);
     }
@@ -449,17 +455,65 @@ fn render_kpi_tile(
 
 // ── Mid section: Active Interface + Throughput ──────────────
 
-fn render_mid_section(f: &mut Frame, app: &App, area: Rect) {
-    // Health is fixed-width because its content is: four target rows and a
-    // paragraph. The graph takes everything else, since more columns is
-    // literally more samples on screen.
+/// Narrowest useful interfaces panel: a 12-column name, a full 15-character
+/// IPv4, two rate columns, the status dot and the borders.
+const IFACE_MIN_W: u16 = 52;
+
+/// Widest. Past this the address column is padding — an IPv4 has been fully
+/// visible since [`IFACE_MIN_W`], and the rates are fixed-width.
+const IFACE_MAX_W: u16 = 68;
+
+/// Narrowest connections panel that still draws its table: 67 columns of
+/// fixed fields, 20 elastic for the remote and app names, and its borders.
+const CONN_MIN_W: u16 = 89;
+
+/// Narrowest screen that fits both on one row.
+const IFACE_BESIDE_CONNS_MIN_W: u16 = CONN_MIN_W + IFACE_MIN_W;
+
+/// How much of a row the interfaces panel takes.
+///
+/// A third, bounded. Fixed at its minimum it left a wide terminal spending
+/// every extra column on the connections table, which already has two elastic
+/// columns and does not need a third share; capped, it stops the address
+/// column growing into a void once the address is fully visible.
+fn iface_width(total: u16) -> u16 {
+    (total / 3).clamp(IFACE_MIN_W, IFACE_MAX_W)
+}
+
+fn render_mid_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conns: bool) {
+    if iface_beside_conns {
+        // The graph takes the whole row: more columns is literally more
+        // samples on screen.
+        render_throughput_chart(f, app, area);
+        return;
+    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(52)])
+        .constraints([
+            Constraint::Min(40),
+            Constraint::Length(iface_width(area.width)),
+        ])
         .split(area);
 
     render_throughput_chart(f, app, cols[0]);
-    render_health(f, app, cols[1]);
+    render_interfaces(f, app, cols[1]);
+}
+
+fn render_bottom_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conns: bool) {
+    if !iface_beside_conns {
+        render_connections(f, app, area);
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(40),
+            Constraint::Length(iface_width(area.width)),
+        ])
+        .split(area);
+
+    render_connections(f, app, cols[0]);
+    render_interfaces(f, app, cols[1]);
 }
 
 /// Throughput, mirrored around a shared zero line.
@@ -556,46 +610,24 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         height: inner.height - 1,
     };
 
-    // Split the plot around a shared zero line: rx above, tx below. An odd
-    // number of rows gives the extra one to rx, which is the busier series on
-    // almost every host.
-    let tx_h = plot.height / 2;
-    let rx_h = plot.height - tx_h;
-    let rx_area = Rect {
-        height: rx_h,
-        ..plot
-    };
-    let tx_area = Rect {
-        y: plot.y + rx_h,
-        height: tx_h,
-        ..plot
-    };
-
     // Both halves share one maximum — that is the point of the mirror — and
-    // both route through the graph module, so `graph_style` reaches them like
-    // every other chart. rx stands on the zero line; tx hangs below it.
+    // one zero line, which the graph module owns so the two halves cannot
+    // each draw their own.
     let scale = if log { log_scale(peak) } else { peak.max(1) };
     let rx_plot = maybe_log(&agg_rx, log);
     let tx_plot = maybe_log(&agg_tx, log);
-    crate::graph::render_with_max(
-        f,
-        rx_area,
+    let rx_h = crate::graph::render_mirrored_with_max(
+        f.buffer_mut(),
+        plot,
         &rx_plot,
-        scale,
-        app.graph_style,
-        t.rx_rate,
-        t.status_warn,
-        app.graph_opts(),
-    );
-    crate::graph::render_flipped_with_max(
-        f,
-        tx_area,
         &tx_plot,
         scale,
         app.graph_style,
+        t.rx_rate,
         t.tx_rate,
         app.graph_opts(),
     );
+    let tx_h = plot.height - rx_h;
 
     // y-axis: peak at the top, zero on the shared line, peak again at the
     // bottom — the bottom half is tx growing downward, not a negative rate.
@@ -622,9 +654,6 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // x-axis, derived from how many samples the plot is actually showing.
-    // The old axis was the literal string "-60s … -30s … now" regardless of
-    // width, so at any size past sixty columns it named a window the graph was
-    // not drawing.
     //
     // Capacity depends on the style: braille carries two samples per column,
     // blocks one. Getting that wrong halves or doubles the window the axis
@@ -635,22 +664,9 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         app.user_config.refresh_rate_ms,
     );
     let axis_y = inner.y + inner.height - 1;
-    let mut axis = String::new();
-    let w = plot.width as usize;
-    for (i, frac) in [0.0f32, 0.5, 1.0].iter().enumerate() {
-        let text = match i {
-            2 => "now".to_string(),
-            _ => format!("-{}s", (secs as f32 * (1.0 - frac)).round() as u64),
-        };
-        let target = ((w.saturating_sub(text.chars().count())) as f32 * frac).round() as usize;
-        if axis.chars().count() < target {
-            axis.push_str(&" ".repeat(target - axis.chars().count()));
-        }
-        axis.push_str(&text);
-    }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            axis,
+            crate::graph::time_axis(plot.width, secs),
             Style::default().fg(t.text_muted),
         ))),
         Rect {
@@ -675,14 +691,17 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
 /// the machine is doing.
 fn render_connections(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let rows = connection_rows(app);
+    let groups = connection_groups(app);
+    let conns: usize = groups.iter().map(|g| g.conns.len()).sum();
+    let meta = if groups.len() == conns {
+        format!("{conns} · sorted by concern")
+    } else {
+        format!("{conns} in {} processes · sorted by concern", groups.len())
+    };
 
     let inner = widgets::Panel::new("connections")
         .tab_badge(crate::app::Tab::Connections)
-        .meta_styled(vec![Span::styled(
-            format!("{} · sorted by concern", rows.len()),
-            Style::default().fg(t.text_muted),
-        )])
+        .meta_styled(vec![Span::styled(meta, Style::default().fg(t.text_muted))])
         .fit(area.width)
         .render(f, t, area);
 
@@ -696,9 +715,9 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
     const RATE: u16 = 10;
     const RTT: u16 = 8;
     const RETR: u16 = 6;
-    const VERDICT: u16 = 18;
-    const SPARK: u16 = 10;
-    let fixed = PROC + RATE * 2 + RTT + RETR + VERDICT + SPARK;
+    // `receiver-limited` is the longest verdict at 16, plus a column of gap.
+    const VERDICT: u16 = 17;
+    let fixed = PROC + RATE * 2 + RTT + RETR + VERDICT;
     if inner.width <= fixed + 20 {
         return;
     }
@@ -715,20 +734,41 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(RTT),
         Constraint::Length(RETR),
         Constraint::Length(VERDICT),
-        Constraint::Length(SPARK),
     ];
 
+    // No `rtt 60s` column: it was ten columns wide, its header promised a
+    // sparkline, and every cell in it was the empty string. Ten columns the
+    // remote and app names can actually use.
     let header = Row::new(
         [
-            "process", "remote", "app", "rx/s", "tx/s", "rtt", "retr", "verdict", "rtt 60s",
+            "process", "remote", "app", "rx/s", "tx/s", "rtt", "retr", "verdict",
         ]
         .map(|h| Cell::from(h).style(Style::default().fg(t.text_muted))),
     );
 
-    let body: Vec<Row> = rows
+    let all = dash_rows(&groups, &app.ui.dashboard_collapsed);
+    let height = inner.height.saturating_sub(1) as usize;
+    // Keep the cursor on screen, through the same windowing the tabs use.
+    // With no cursor the panel stays anchored at the top, which is what a
+    // reader who never pressed an arrow key expects to see.
+    let selected = app
+        .ui
+        .scroll
+        .dashboard_conn_scroll
+        .map(|i| i.min(all.len().saturating_sub(1)));
+    let first = selected
+        .map(|i| crate::ui::tree::window_top(i, all.len(), height))
+        .unwrap_or(0);
+
+    let body: Vec<Row> = all
         .iter()
-        .take(inner.height.saturating_sub(1) as usize)
-        .map(|r| {
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, dr)| {
+            let cells = ConnCells::new(dr, PROC as usize - 1);
+            let r = &cells;
+            let is_selected = selected == Some(i);
             let rate = |v: Option<f64>, color: Color| match v {
                 Some(x) if x >= 1.0 => Cell::from(
                     Line::from(Span::styled(
@@ -743,10 +783,20 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
                 ),
             };
             Row::new(vec![
-                Cell::from(truncate(&r.process, PROC as usize - 1))
-                    .style(Style::default().fg(t.text_primary)),
-                Cell::from(truncate(&r.remote, remote_w as usize - 1))
-                    .style(Style::default().fg(t.text_secondary)),
+                Cell::from(r.process.clone()).style(if r.bold {
+                    Style::default().fg(t.text_primary).bold()
+                } else {
+                    Style::default().fg(t.text_primary)
+                }),
+                Cell::from(truncate(&r.remote, remote_w as usize - 1)).style(Style::default().fg(
+                    if r.muted_remote {
+                        // A count is not an address. Dimming it keeps the
+                        // column scannable as "where is this going".
+                        t.text_muted
+                    } else {
+                        t.text_secondary
+                    },
+                )),
                 Cell::from(truncate(&r.app, app_w as usize - 1))
                     .style(Style::default().fg(t.text_muted)),
                 rate(r.rx_rate, t.rx_rate),
@@ -779,12 +829,16 @@ fn render_connections(f: &mut Frame, app: &App, area: Rect) {
                 match r.verdict {
                     Some(v) => Cell::from(Line::from(widgets::socket_verdict_chip(t, v))),
                     None => Cell::from(Line::from(Span::styled(
-                        " – ",
+                        "–",
                         Style::default().fg(t.text_muted),
                     ))),
                 },
-                Cell::from(""),
             ])
+            .style(if is_selected {
+                Style::default().bg(t.selection_bg)
+            } else {
+                Style::default()
+            })
         })
         .collect();
 
@@ -845,6 +899,248 @@ fn connection_rows(app: &App) -> Vec<ConnRow> {
 
     rows.sort_by(by_concern);
     rows
+}
+
+/// The cells one panel line draws, whether it came from a group or a socket.
+///
+/// Rendering reads this rather than branching on group-or-not at every
+/// column: the two shapes differ in three cells, not nine.
+struct ConnCells {
+    /// Already fitted to the column, chevron or indent included — truncating
+    /// afterwards would eat the glyph that says the row is foldable.
+    process: String,
+    remote: String,
+    app: String,
+    /// True when `remote` is a rollup count rather than an address.
+    muted_remote: bool,
+    /// Headers carry the row's weight; children sit at normal intensity
+    /// beneath, the same relationship the Connections tree draws.
+    bold: bool,
+    rx_rate: Option<f64>,
+    tx_rate: Option<f64>,
+    rtt_ms: Option<f64>,
+    retrans: u32,
+    verdict: Option<crate::diagnose::detectors::SocketVerdict>,
+}
+
+impl ConnCells {
+    fn new(row: &DashRow<'_>, proc_w: usize) -> Self {
+        match row {
+            DashRow::Group { group, collapsed } => Self {
+                process: format!(
+                    "{} {}",
+                    if *collapsed { "▶" } else { "▼" },
+                    truncate(&group.process, proc_w.saturating_sub(2))
+                ),
+                remote: format!("{} conns", group.conns.len()),
+                app: if group.hosts == 1 {
+                    "1 host".to_string()
+                } else {
+                    format!("{} hosts", group.hosts)
+                },
+                muted_remote: true,
+                bold: true,
+                rx_rate: group.rx_rate,
+                tx_rate: group.tx_rate,
+                rtt_ms: group.rtt_ms,
+                retrans: group.retrans,
+                verdict: group.verdict,
+            },
+            DashRow::Solo { group, conn } => Self {
+                // Two columns of lead-in so solo rows line up with the group
+                // names beside them rather than with their chevrons.
+                process: format!("  {}", truncate(&group.process, proc_w.saturating_sub(2))),
+                ..Self::from_conn(conn)
+            },
+            // The header already named the process. Restating it on every
+            // child is exactly what the grouping removed.
+            DashRow::Child { conn, .. } => Self {
+                process: "    ↳".to_string(),
+                ..Self::from_conn(conn)
+            },
+        }
+    }
+
+    fn from_conn(conn: &ConnRow) -> Self {
+        Self {
+            process: String::new(),
+            remote: conn.remote.clone(),
+            app: conn.app.clone(),
+            muted_remote: false,
+            bold: false,
+            rx_rate: conn.rx_rate,
+            tx_rate: conn.tx_rate,
+            rtt_ms: conn.rtt_ms,
+            retrans: conn.retrans,
+            verdict: conn.verdict,
+        }
+    }
+}
+
+/// One line of the connections panel: a process group, or a lone socket.
+///
+/// The Connections tab learned this first — a flat table spends the widest
+/// column repeating the string above it, and `claude` down eleven consecutive
+/// rows is how the process column ends up too narrow to spell
+/// `Google Chrome Helper`. The dashboard has less room than that tab, not
+/// more, so groups here stay rolled up: the panel's job is "is anything
+/// wrong", and the tab is where you go to open one up.
+struct ConnProcess {
+    process: String,
+    /// The group's sockets, worst first. Length 1 renders as a plain
+    /// connection row — a `1 conn` rollup hides a remote address to say
+    /// nothing in its place.
+    conns: Vec<ConnRow>,
+    rx_rate: Option<f64>,
+    tx_rate: Option<f64>,
+    /// Best (lowest) handshake RTT in the group.
+    rtt_ms: Option<f64>,
+    retrans: u32,
+    /// The group's worst verdict, so a rollup never hides a problem that
+    /// would be visible on a row of its own.
+    verdict: Option<crate::diagnose::detectors::SocketVerdict>,
+    concern: u8,
+    /// Distinct remote hosts, which is what makes a rollup worth reading:
+    /// forty sockets to one host and forty to forty hosts are not the same
+    /// row.
+    hosts: usize,
+}
+
+/// One line of the connections panel.
+///
+/// A process with a single socket is a `Solo`, not a header with one child:
+/// a fold control that reveals exactly one row costs a keystroke to learn
+/// nothing, and the rollup would replace a remote address with `1 conn`.
+enum DashRow<'a> {
+    Group {
+        group: &'a ConnProcess,
+        collapsed: bool,
+    },
+    Solo {
+        group: &'a ConnProcess,
+        conn: &'a ConnRow,
+    },
+    Child {
+        group: &'a ConnProcess,
+        conn: &'a ConnRow,
+    },
+}
+
+impl DashRow<'_> {
+    /// The process this row belongs to — the same answer for a header and
+    /// for any row beneath it, which is what lets `space` fold the group you
+    /// are standing inside.
+    fn process(&self) -> &str {
+        match self {
+            DashRow::Group { group, .. }
+            | DashRow::Solo { group, .. }
+            | DashRow::Child { group, .. } => &group.process,
+        }
+    }
+
+    /// Whether folding this row's group does anything.
+    fn foldable(&self) -> bool {
+        !matches!(self, DashRow::Solo { .. })
+    }
+}
+
+/// Flatten groups into the visible row list, honouring fold state.
+///
+/// Single definition of "what is row N" for the renderer and the key
+/// handlers, the same discipline `ui::tree::flatten` enforces on the tabs.
+fn dash_rows<'a>(groups: &'a [ConnProcess], fold: &crate::ui::tree::FoldState) -> Vec<DashRow<'a>> {
+    let mut rows = Vec::new();
+    for group in groups {
+        if let [conn] = group.conns.as_slice() {
+            rows.push(DashRow::Solo { group, conn });
+            continue;
+        }
+        let collapsed = fold.is_collapsed(&group.process);
+        rows.push(DashRow::Group { group, collapsed });
+        if !collapsed {
+            rows.extend(
+                group
+                    .conns
+                    .iter()
+                    .map(|conn| DashRow::Child { group, conn }),
+            );
+        }
+    }
+    rows
+}
+
+/// Number of rows the panel currently draws, for clamping the cursor.
+pub fn visible_row_count(app: &App) -> usize {
+    dash_rows(&connection_groups(app), &app.ui.dashboard_collapsed).len()
+}
+
+/// The process under the cursor, if the cursor is on a foldable group.
+///
+/// Returns `None` for a solo row so `space` on a one-socket process is a
+/// no-op rather than writing an invisible fold state that only shows up
+/// later, when that process opens a second connection.
+pub fn selected_group_key(app: &App) -> Option<String> {
+    let groups = connection_groups(app);
+    let rows = dash_rows(&groups, &app.ui.dashboard_collapsed);
+    let idx = app.ui.scroll.dashboard_conn_scroll?;
+    let row = rows.get(idx.min(rows.len().saturating_sub(1)))?;
+    row.foldable().then(|| row.process().to_string())
+}
+
+/// Row index of `process`'s header, so a collapse can park the cursor on the
+/// row it just folded rather than on whatever slid up into its place.
+pub fn group_header_index(app: &App, process: &str) -> Option<usize> {
+    let groups = connection_groups(app);
+    dash_rows(&groups, &app.ui.dashboard_collapsed)
+        .iter()
+        .position(|r| matches!(r, DashRow::Group { group, .. } if group.process == process))
+}
+
+/// Group [`connection_rows`] by process, worst group first.
+fn connection_groups(app: &App) -> Vec<ConnProcess> {
+    let rows = connection_rows(app);
+    let buckets = crate::ui::tree::group_by(rows, |r: &ConnRow| r.process.clone());
+    let mut groups: Vec<ConnProcess> = buckets
+        .into_iter()
+        .map(|(process, conns)| {
+            let sum = |f: fn(&ConnRow) -> Option<f64>| {
+                let vals: Vec<f64> = conns.iter().filter_map(f).collect();
+                (!vals.is_empty()).then(|| vals.iter().sum())
+            };
+            let worst = conns.iter().max_by_key(|c| c.concern);
+            let hosts: std::collections::BTreeSet<String> =
+                conns.iter().map(|c| remote_host_only(&c.remote)).collect();
+            ConnProcess {
+                process,
+                rx_rate: sum(|c| c.rx_rate),
+                tx_rate: sum(|c| c.tx_rate),
+                rtt_ms: conns
+                    .iter()
+                    .filter_map(|c| c.rtt_ms)
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+                retrans: conns.iter().map(|c| c.retrans).sum(),
+                verdict: worst.and_then(|c| c.verdict),
+                concern: worst.map(|c| c.concern).unwrap_or(0),
+                hosts: hosts.len(),
+                conns,
+            }
+        })
+        .collect();
+    groups.sort_by(group_by_concern);
+    groups
+}
+
+/// Same ordering as [`by_concern`], applied to the rollup.
+fn group_by_concern(a: &ConnProcess, b: &ConnProcess) -> std::cmp::Ordering {
+    b.concern
+        .cmp(&a.concern)
+        .then_with(|| b.retrans.cmp(&a.retrans))
+        .then_with(|| {
+            let ab = a.rx_rate.unwrap_or(0.0) + a.tx_rate.unwrap_or(0.0);
+            let bb = b.rx_rate.unwrap_or(0.0) + b.tx_rate.unwrap_or(0.0);
+            bb.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| a.process.cmp(&b.process))
 }
 
 /// Worst first, then busiest, then a total order so equal rows do not
@@ -1050,188 +1346,199 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// One row of the health panel: a probe target and what it has been doing.
-struct HealthTarget<'a> {
-    name: &'a str,
-    address: Option<String>,
-    rtt_ms: Option<f64>,
-    loss_pct: f64,
-    history: &'a [Option<f64>],
-}
-
-/// Health: the probe targets, then what netwatch makes of them.
+/// Interfaces: which links are carrying traffic, and how much.
 ///
-/// The v0.29 panel listed two targets and closed with an eBPF/errors/drops
-/// strip — counters that belong to the interface, not to reachability. It also
-/// never showed `internet`, which is the one row that separates "my router is
-/// fine and the line is down" from "my router is down".
+/// This half of the mid band used to hold the health findings, which are the
+/// Diagnose tab's subject and are already summarised by the three latency
+/// tiles in the hero row above. What the dashboard had no answer for was
+/// "which link is this going over" — the throughput graph beside it aggregates
+/// every active interface into one series and names only the busiest in its
+/// title, so a host with a VPN up and Wi-Fi underneath showed one line and no
+/// way to tell which link owned it.
 ///
-/// The findings underneath are the engine's, in prose. A sparkline can show
-/// that dns moved; only a sentence can say it moved 3.2σ at 06:48 while the
-/// alternate resolver stayed fast.
-fn render_health(f: &mut Frame, app: &App, area: Rect) {
+/// Addresses, MTU, queues and offload stay on the Interfaces tab. This panel
+/// answers the dashboard's question — where is the traffic — and `3` opens the
+/// tab that answers the rest.
+fn render_interfaces(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
-    let hs = app.health_prober.status();
-    let cfg = &app.config_collector.config;
-    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
+    let interfaces = app.traffic.interfaces();
+    let actives = active_ifaces(&interfaces, &app.interface_info);
 
-    let findings = app.diagnose.engine.primary();
-    let inner = widgets::Panel::new("health")
-        .tab_badge(crate::app::Tab::Diagnose)
+    // "Live" is a few seconds of history, not this tick's rate: `rx_rate` is
+    // genuinely zero on most ticks even on a busy link, and counting it
+    // directly made the live/idle tally flicker between bursts.
+    let live = actives
+        .iter()
+        .filter(|i| widgets::interface_recently_active(i))
+        .count();
+
+    let inner = widgets::Panel::new("interfaces")
+        .tab_badge(crate::app::Tab::Interfaces)
         .meta_styled(vec![Span::styled(
-            match findings.len() {
-                0 => "no findings".to_string(),
-                1 => "1 finding".to_string(),
-                n => format!("{n} findings"),
-            },
-            Style::default().fg(verdict.color(t)),
+            format!("{live} live · {} up", actives.len()),
+            Style::default().fg(if live == 0 {
+                t.text_muted
+            } else {
+                t.status_good
+            }),
         )])
         .fit(area.width)
         .render(f, t, area);
 
-    if inner.height < 2 || inner.width < 24 {
+    if inner.height < 2 || inner.width < 28 {
         return;
     }
 
-    let targets: [HealthTarget<'_>; 3] = [
-        HealthTarget {
-            name: "gateway",
-            address: cfg.gateway.clone(),
-            rtt_ms: hs.gateway_rtt_ms,
-            loss_pct: hs.gateway_loss_pct,
-            history: hs.gateway_rtt_history.as_slices().0,
-        },
-        HealthTarget {
-            name: "dns",
-            address: cfg.primary_dns(),
-            rtt_ms: hs.dns_rtt_ms,
-            loss_pct: hs.dns_loss_pct,
-            history: hs.dns_rtt_history.as_slices().0,
-        },
-        HealthTarget {
-            name: "internet",
-            address: Some(crate::collectors::health::INTERNET_TARGET.to_string()),
-            rtt_ms: hs.internet_rtt_ms,
-            loss_pct: hs.internet_loss_pct,
-            history: hs.internet_rtt_history.as_slices().0,
-        },
-    ];
+    const NAME_W: u16 = 12;
+    const RATE_W: u16 = 9;
+    // Whatever the rates and the name do not need. The address is the column
+    // that degrades gracefully — a truncated IP is still recognisable, a
+    // truncated rate is a wrong number.
+    let addr_w = inner
+        .width
+        .saturating_sub(2 + NAME_W + RATE_W * 2 + 2)
+        .max(4);
 
-    const NAME_W: u16 = 10;
-    const VALUE_W: u16 = 9;
-    let mut y = inner.y;
-    for HealthTarget {
-        name,
-        address,
-        rtt_ms: rtt,
-        loss_pct: loss,
-        history,
-    } in targets
-    {
-        if y >= inner.y + inner.height {
+    let row = |x: u16, y: u16, spans: Vec<Span<'static>>| {
+        (
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            },
+        )
+    };
+
+    let (header, header_area) = row(
+        inner.x + 1,
+        inner.y,
+        // Laid out against the same widths the rows use, including the two
+        // columns the status dot occupies — a header that computes its own
+        // spacing is a header that drifts off the columns it names.
+        vec![Span::styled(
+            format!(
+                "  {:<nw$}{:<aw$} {:>rw$} {:>rw$}",
+                "iface",
+                "address",
+                "rx/s",
+                "tx/s",
+                nw = NAME_W as usize - 2,
+                aw = addr_w as usize,
+                rw = RATE_W as usize,
+            ),
+            Style::default().fg(t.text_muted),
+        )],
+    );
+    f.render_widget(header, header_area);
+
+    let mut y = inner.y + 1;
+    let last_row = inner.y + inner.height;
+    for iface in actives.iter() {
+        // Leave the final row for the idle summary, which is the one line
+        // that says the list is not the whole story.
+        if y + 1 >= last_row {
             break;
         }
-        // A target that has never answered is muted, not red: netwatch not
-        // having a number is different from the number being bad.
-        let color = match rtt {
-            None => t.text_muted,
-            Some(_) if loss >= 50.0 => t.status_error,
-            Some(v) if loss > 0.0 || v > 200.0 => t.status_warn,
-            Some(_) => t.status_good,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("● ", Style::default().fg(color)),
+        let info = app.interface_info.iter().find(|i| i.name == iface.name);
+        let addr = info
+            .and_then(|i| i.ipv4.clone())
+            .or_else(|| info.and_then(|i| i.ipv6.clone()))
+            .unwrap_or_else(|| {
+                crate::ui::interfaces::role_for(&iface.name, info.and_then(|i| i.is_wireless))
+                    .to_string()
+            });
+        let hot = widgets::interface_recently_active(iface);
+
+        let (line, line_area) = row(
+            inner.x + 1,
+            y,
+            vec![
                 Span::styled(
-                    format!("{name:<w$}", w = NAME_W as usize - 2),
+                    "● ",
+                    Style::default().fg(if hot { t.status_good } else { t.text_muted }),
+                ),
+                Span::styled(
+                    format!(
+                        "{:<w$}",
+                        truncate(&iface.name, NAME_W as usize - 2),
+                        w = NAME_W as usize - 2
+                    ),
                     Style::default().fg(t.text_primary),
                 ),
                 Span::styled(
                     format!(
-                        "{:>w$}",
-                        match rtt {
-                            Some(v) => format!("{}ms", fmt_ms(v)),
-                            None => "–".to_string(),
-                        },
-                        w = VALUE_W as usize
+                        "{:<w$}",
+                        truncate(&addr, addr_w as usize),
+                        w = addr_w as usize
                     ),
-                    Style::default().fg(color),
+                    Style::default().fg(t.text_muted),
                 ),
-            ])),
-            Rect {
-                x: inner.x + 1,
-                y,
-                width: (NAME_W + VALUE_W).min(inner.width.saturating_sub(2)),
-                height: 1,
-            },
+                Span::styled(
+                    format!(
+                        " {:>w$}",
+                        widgets::format_bytes_rate(iface.rx_rate),
+                        w = RATE_W as usize
+                    ),
+                    Style::default().fg(if hot { t.rx_rate } else { t.text_muted }),
+                ),
+                Span::styled(
+                    format!(
+                        " {:>w$}",
+                        widgets::format_bytes_rate(iface.tx_rate),
+                        w = RATE_W as usize
+                    ),
+                    Style::default().fg(if hot { t.tx_rate } else { t.text_muted }),
+                ),
+            ],
         );
-
-        let spark_x = inner.x + 1 + NAME_W + VALUE_W + 1;
-        let spark_w = inner
-            .x
-            .saturating_add(inner.width)
-            .saturating_sub(spark_x + 1);
-        if spark_w >= 8 {
-            let data = rtt_history_to_u64(history);
-            crate::graph::render(
-                f,
-                Rect {
-                    x: spark_x,
-                    y,
-                    width: spark_w,
-                    height: 1,
-                },
-                &data,
-                app.graph_style,
-                color,
-                t.status_warn,
-                app.graph_opts(),
-            );
-        }
-        // The target address sits under its own row, dim, so the column of
-        // names and numbers stays scannable.
-        let _ = &address;
+        f.render_widget(line, line_area);
         y += 1;
     }
 
-    // Findings, in the space the targets did not need.
-    let body_y = y + 1;
-    if body_y >= inner.y + inner.height {
+    if actives.is_empty() {
+        let (line, line_area) = row(
+            inner.x + 1,
+            y,
+            vec![Span::styled(
+                "no interfaces up",
+                Style::default().fg(t.text_muted),
+            )],
+        );
+        f.render_widget(line, line_area);
         return;
     }
-    let mut lines: Vec<Line> = Vec::new();
-    if findings.is_empty() {
-        lines.push(Line::from(Span::styled(
-            verdict.chip(),
-            Style::default().fg(t.text_muted),
-        )));
-    }
-    for issue in findings.iter().take(3) {
-        let color = match issue.severity {
-            crate::diagnose::Severity::Critical | crate::diagnose::Severity::High => t.status_error,
-            crate::diagnose::Severity::Medium => t.status_warn,
-            crate::diagnose::Severity::Info => t.status_info,
-        };
-        lines.push(Line::from(vec![
-            Span::styled("▲ ", Style::default().fg(color)),
-            Span::styled(issue.summary_line(), Style::default().fg(t.text_secondary)),
-        ]));
-    }
 
-    f.render_widget(
-        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
-        Rect {
-            x: inner.x + 1,
-            y: body_y,
-            width: inner.width.saturating_sub(2),
-            height: inner.y + inner.height - body_y,
-        },
-    );
+    // Everything the rows above left out: interfaces the kernel knows about
+    // that are down, or up and silent. Named rather than counted — "6 idle"
+    // sends you to the tab to find out which, and the names are short.
+    let idle: Vec<&str> = interfaces
+        .iter()
+        .filter(|i| !actives.iter().any(|a| a.name == i.name))
+        .map(|i| i.name.as_str())
+        .collect();
+    if !idle.is_empty() && y < last_row {
+        let (line, line_area) = row(
+            inner.x + 1,
+            y,
+            vec![Span::styled(
+                truncate(
+                    &format!("{} idle: {}", idle.len(), idle.join(" ")),
+                    inner.width.saturating_sub(2) as usize,
+                ),
+                Style::default().fg(t.text_muted),
+            )],
+        );
+        f.render_widget(line, line_area);
+    }
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = vec![
-        widgets::hint("↵", "drill"),
+        // `↵ drill` lived here for a release with nothing bound behind it.
+        widgets::hint("space", "fold"),
+        widgets::hint("z", "fold all"),
         widgets::hint("9", "diagnose"),
         widgets::hint(
             "t",
@@ -1283,17 +1590,26 @@ fn aggregate_tx(actives: &[&InterfaceTraffic]) -> Vec<u64> {
     aggregate_iter(actives.iter().map(|i| &i.tx_history))
 }
 
+/// Sum per-interface histories onto one series, aligned at *now*.
+///
+/// Every history ends at the current tick and grows backwards, so the right
+/// edges are the same moment and the left edges are not: an interface that
+/// came up two minutes ago holds 120 samples where the one that has been up
+/// all session holds 600. Summing from index 0 lined up the two oldest
+/// samples instead, which slid the newcomer's entire series eight minutes
+/// into the past — the graph showed traffic on a link before it existed and
+/// nothing on it now.
 fn aggregate_iter<'a, I>(iter: I) -> Vec<u64>
 where
     I: Iterator<Item = &'a std::collections::VecDeque<u64>>,
 {
-    let mut acc: Vec<u64> = Vec::new();
-    for hist in iter {
-        if hist.len() > acc.len() {
-            acc.resize(hist.len(), 0);
-        }
+    let hists: Vec<&std::collections::VecDeque<u64>> = iter.collect();
+    let len = hists.iter().map(|h| h.len()).max().unwrap_or(0);
+    let mut acc = vec![0u64; len];
+    for hist in hists {
+        let offset = len - hist.len();
         for (t, &v) in hist.iter().enumerate() {
-            acc[t] += v;
+            acc[offset + t] += v;
         }
     }
     acc
@@ -1373,6 +1689,190 @@ mod tests {
             verdict,
             concern: verdict.map(widgets::socket_verdict_concern).unwrap_or(0),
         }
+    }
+
+    fn group(process: &str, conns: Vec<ConnRow>) -> ConnProcess {
+        let worst = conns.iter().max_by_key(|c| c.concern);
+        let hosts: std::collections::BTreeSet<String> =
+            conns.iter().map(|c| remote_host_only(&c.remote)).collect();
+        ConnProcess {
+            process: process.into(),
+            rx_rate: Some(conns.iter().filter_map(|c| c.rx_rate).sum()),
+            tx_rate: None,
+            rtt_ms: None,
+            retrans: conns.iter().map(|c| c.retrans).sum(),
+            verdict: worst.and_then(|c| c.verdict),
+            concern: worst.map(|c| c.concern).unwrap_or(0),
+            hosts: hosts.len(),
+            conns,
+        }
+    }
+
+    /// The interfaces panel is a third of the row, bounded at both ends —
+    /// wide enough for a full IPv4 on a small screen, and not so wide on a
+    /// large one that the address column is mostly padding.
+    #[test]
+    fn the_interfaces_panel_takes_a_bounded_third() {
+        assert_eq!(iface_width(IFACE_BESIDE_CONNS_MIN_W), IFACE_MIN_W);
+        assert_eq!(
+            iface_width(120),
+            IFACE_MIN_W,
+            "a third of 120 is under the floor"
+        );
+        assert_eq!(iface_width(180), 60);
+        assert_eq!(iface_width(400), IFACE_MAX_W, "and it stops growing");
+
+        // Whatever it takes, the connections table keeps enough to draw.
+        for total in [IFACE_BESIDE_CONNS_MIN_W, 160, 200, 400] {
+            assert!(
+                total - iface_width(total) >= CONN_MIN_W,
+                "{total} columns left connections {} of {CONN_MIN_W}",
+                total - iface_width(total)
+            );
+        }
+    }
+
+    /// The verdict column was sized for a padded pill and kept that width
+    /// after the pill became a plain word. It is now the longest label plus a
+    /// gap, so a shrink has to be checked against the labels themselves.
+    #[test]
+    fn the_verdict_column_fits_the_longest_label() {
+        use crate::diagnose::detectors::SocketVerdict as V;
+        let widest = [
+            V::Ok,
+            V::Bufferbloat,
+            V::ReceiverLimited,
+            V::AppLimited,
+            V::Congestion,
+            V::RetransBurst,
+            V::ZeroWindow,
+        ]
+        .iter()
+        .map(|v| v.label().chars().count())
+        .max()
+        .unwrap();
+        assert_eq!(widest, 16, "labels changed; the column width must follow");
+    }
+
+    /// Interface histories all end at *now* and grow backwards, so they are
+    /// aligned at the right edge, never the left. A link that came up
+    /// mid-session used to have its whole series pushed into the past.
+    #[test]
+    fn interface_histories_are_summed_at_the_present_moment() {
+        use std::collections::VecDeque;
+        let old: VecDeque<u64> = vec![1u64; 10].into();
+        let recent: VecDeque<u64> = vec![100u64; 3].into();
+        let out = aggregate_iter([&old, &recent].into_iter());
+
+        assert_eq!(out.len(), 10);
+        // The newcomer's traffic lands on the last three samples...
+        assert_eq!(&out[7..], &[101, 101, 101]);
+        // ...and nothing appears on it before it existed.
+        assert!(out[..7].iter().all(|&v| v == 1));
+    }
+
+    /// A one-socket process is a row, not a header with one child: a fold
+    /// control that reveals a single line costs a keystroke to learn nothing.
+    #[test]
+    fn a_solo_process_renders_as_one_unfoldable_row() {
+        let groups = [group(
+            "curl",
+            vec![row("curl", Some(SocketVerdict::Ok), 1.0, 0)],
+        )];
+        let fold = crate::ui::tree::FoldState::new(true);
+        let rows = dash_rows(&groups, &fold);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], DashRow::Solo { .. }));
+        assert!(!rows[0].foldable());
+    }
+
+    /// Folded is one row; expanded is the header plus every socket. Both
+    /// answer "what is row N" through the same function the key handlers use.
+    #[test]
+    fn folding_a_group_hides_exactly_its_children() {
+        let groups = [group(
+            "claude",
+            vec![
+                row("claude", Some(SocketVerdict::Ok), 1.0, 0),
+                row("claude", Some(SocketVerdict::Ok), 2.0, 0),
+                row("claude", Some(SocketVerdict::Ok), 3.0, 0),
+            ],
+        )];
+        let mut fold = crate::ui::tree::FoldState::new(true);
+        assert_eq!(dash_rows(&groups, &fold).len(), 1);
+
+        fold.toggle("claude");
+        let rows = dash_rows(&groups, &fold);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(
+            rows[0],
+            DashRow::Group {
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(rows[1..].iter().all(|r| matches!(r, DashRow::Child { .. })));
+        // A child answers with its parent's name, which is what lets `space`
+        // fold the group you are standing inside.
+        assert!(rows.iter().all(|r| r.process() == "claude"));
+    }
+
+    /// A rollup must not launder a problem. `claude` holding one zero-window
+    /// socket among nine healthy ones is exactly the case the panel exists
+    /// to surface, and averaging or first-wins would bury it.
+    #[test]
+    fn a_group_carries_its_worst_socket_verdict() {
+        let g = group(
+            "claude",
+            vec![
+                row("claude", Some(SocketVerdict::Ok), 10.0, 0),
+                row("claude", Some(SocketVerdict::ZeroWindow), 5.0, 3),
+                row("claude", Some(SocketVerdict::Ok), 10.0, 0),
+            ],
+        );
+        assert_eq!(g.verdict, Some(SocketVerdict::ZeroWindow));
+        assert_eq!(
+            g.concern,
+            widgets::socket_verdict_concern(SocketVerdict::ZeroWindow)
+        );
+        // Rates and retransmits are the group's, not one member's.
+        assert_eq!(g.rx_rate, Some(25.0));
+        assert_eq!(g.retrans, 3);
+    }
+
+    /// Groups are ranked by the same rule as sockets were, so the panel's
+    /// promise ("worst first") survives the change of row granularity.
+    #[test]
+    fn groups_rank_by_concern_not_throughput() {
+        let mut groups = [
+            group(
+                "curl",
+                vec![row("curl", Some(SocketVerdict::AppLimited), 4_000_000.0, 0)],
+            ),
+            group(
+                "sshd",
+                vec![row("sshd", Some(SocketVerdict::ZeroWindow), 1_000.0, 0)],
+            ),
+        ];
+        groups.sort_by(group_by_concern);
+        let order: Vec<&str> = groups.iter().map(|g| g.process.as_str()).collect();
+        assert_eq!(order, vec!["sshd", "curl"]);
+    }
+
+    /// Distinct hosts, not socket count: forty sockets to one CDN and forty
+    /// to forty hosts read very differently, and the panel says which.
+    #[test]
+    fn host_count_dedupes_ports() {
+        let mut conns = Vec::new();
+        for port in [443, 8443, 9000] {
+            let mut c = row("claude", Some(SocketVerdict::Ok), 1.0, 0);
+            c.remote = format!("10.0.0.1:{port}");
+            conns.push(c);
+        }
+        let mut other = row("claude", Some(SocketVerdict::Ok), 1.0, 0);
+        other.remote = "10.0.0.2:443".into();
+        conns.push(other);
+        assert_eq!(group("claude", conns).hosts, 2);
     }
 
     /// The panel's job is "is anything wrong", so a broken socket outranks a

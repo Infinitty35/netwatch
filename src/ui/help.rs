@@ -241,6 +241,26 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "Esc / s / q", "Close picker"));
     lines.push(Line::raw(""));
 
+    // DASHBOARD
+    lines.push(section_header(theme, "DASHBOARD (Tab 1)"));
+    lines.push(key_line(
+        theme,
+        "↑↓ / j/k",
+        "Move the cursor in the connections panel (↑ off the top hides it)",
+    ));
+    lines.push(key_line(
+        theme,
+        "space / Enter",
+        "Fold/expand the process under the cursor",
+    ));
+    lines.push(key_line(theme, "z", "Fold/expand every process"));
+    lines.push(key_line(
+        theme,
+        "t",
+        "Toggle the throughput plot's log scale",
+    ));
+    lines.push(Line::raw(""));
+
     // CONNECTIONS
     lines.push(section_header(theme, "CONNECTIONS (Tab 2)"));
     lines.push(key_line(theme, "↑↓ / j/k", "Scroll connection list"));

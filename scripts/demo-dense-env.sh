@@ -24,7 +24,12 @@
 # Usage (from a tape):  export HOME=$(./scripts/demo-dense-env.sh)
 set -euo pipefail
 
-DEMO_HOME="$(mktemp -d -t netwatch-dense-home)"
+# `mktemp -t NAME` is BSD syntax; GNU coreutils rejects a template with no
+# X's ("too few X's in template") and exits 1, which under `export
+# HOME=$(...)` silently sets HOME to the empty string — netwatch then finds no
+# config and records in whatever the defaults are. Spell the template out so
+# both mktemps take it.
+DEMO_HOME="$(mktemp -d "${TMPDIR:-/tmp}/netwatch-dense-home.XXXXXX")"
 CFG_DIR="$DEMO_HOME/Library/Application Support/netwatch"
 
 # Linux puts it under ~/.config; create both so the tape is portable.

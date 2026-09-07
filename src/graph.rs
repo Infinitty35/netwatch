@@ -326,11 +326,22 @@ pub fn resample_to_window(
         if age >= window_secs {
             continue;
         }
+        // A sample stands for the whole interval it was measured over, not
+        // for one instant. Mapping only its timestamp left holes wherever the
+        // source is coarser than a column: 120 five-second probes across 134
+        // columns lit about seven in eight, and the rtt tracks read as a comb
+        // of dropouts next to a solid throughput track — the same window,
+        // drawn as if the probe kept stopping.
+        //
         // Slot 0 is the oldest end of the window.
-        let from_left = window_secs - age - 1;
-        let slot = (from_left as u128 * slots as u128 / window_secs as u128) as usize;
-        let slot = slot.min(slots - 1);
-        out[slot] = out[slot].max(v);
+        let newest = window_secs - age - 1;
+        let oldest = newest.saturating_sub(secs_per_sample - 1);
+        let to_slot =
+            |from_left: u64| (from_left as u128 * slots as u128 / window_secs as u128) as usize;
+        let (first, last) = (to_slot(oldest), to_slot(newest).min(slots - 1));
+        for slot in out.iter_mut().take(last + 1).skip(first) {
+            *slot = (*slot).max(v);
+        }
     }
     out
 }
@@ -532,36 +543,103 @@ pub fn render_with_max(
     }
 }
 
-/// [`render_with_max`], but the plot grows **downward from the top edge**.
+/// A shared-axis pair: `rx` growing up from the zero line, `tx` hanging below.
 ///
-/// The mirrored half of a shared-axis graph: the upload series hangs below the
-/// zero line the download series stands on. It honours `style` like every
-/// other entry point here — a mirrored plot that stayed braille under
-/// `graph_style = "bars"` was the one graph on the Dashboard ignoring the
-/// setting, which reads as the setting being broken rather than partial.
-pub fn render_flipped_with_max(
-    f: &mut Frame,
+/// The zero line is **one row**, and it belongs to the rx half. Drawing the
+/// two halves as independent plots gave each its own baseline — a solid
+/// full-width line on the last row of the top plot *and* another on the first
+/// row of the bottom one. Two parallel lines a row apart, which on a quiet
+/// link is the entire graph and reads as the series being drawn twice.
+///
+/// Returns the height of the rx half, so the caller can label that row `0`
+/// rather than recomputing the split and drifting from it.
+#[allow(clippy::too_many_arguments)]
+pub fn render_mirrored_with_max(
+    buf: &mut Buffer,
+    plot: Rect,
+    rx: &[u64],
+    tx: &[u64],
+    max: u64,
+    style: GraphStyle,
+    rx_color: Color,
+    tx_color: Color,
+    opts: GraphOpts,
+) -> u16 {
+    if plot.width == 0 || plot.height == 0 {
+        return 0;
+    }
+    // An odd number of rows gives the extra one to rx, which is the busier
+    // series on almost every host.
+    let tx_h = plot.height / 2;
+    let rx_h = plot.height - tx_h;
+
+    // One grid across the whole plot. Drawing it per-half put quartile guides
+    // behind rx and nothing behind tx, so the mirror was only half a mirror.
+    if opts.fade && plot.width >= GRID_MIN_W && plot.height >= GRID_MIN_H {
+        render_grid(buf, plot, opts.bg, opts.terminal_palette);
+    }
+
+    render_half(
+        buf,
+        Rect {
+            height: rx_h,
+            ..plot
+        },
+        rx,
+        max,
+        style,
+        rx_color,
+        opts,
+        false,
+    );
+    render_half(
+        buf,
+        Rect {
+            y: plot.y + rx_h,
+            height: tx_h,
+            ..plot
+        },
+        tx,
+        max,
+        style,
+        tx_color,
+        // The zero line the rx half draws is this half's floor too.
+        GraphOpts {
+            baseline: false,
+            ..opts
+        },
+        true,
+    );
+    rx_h
+}
+
+/// One half of a mirrored plot, growing away from the zero line.
+#[allow(clippy::too_many_arguments)]
+fn render_half(
+    buf: &mut Buffer,
     area: Rect,
     data: &[u64],
     max: u64,
     style: GraphStyle,
-    base: Color,
+    color: Color,
     opts: GraphOpts,
+    flip: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    match style {
-        GraphStyle::Bars => render_bars_flipped(f.buffer_mut(), area, data, max, base, opts),
-        GraphStyle::Dots => {
-            let ramp = fade_ramp(base, opts).unwrap_or_else(|| Ramp::flat(base));
+    match (style, flip) {
+        (GraphStyle::Bars, false) => render_bars(buf, area, data, max, color, opts),
+        (GraphStyle::Bars, true) => render_bars_flipped(buf, area, data, max, color, opts),
+        (GraphStyle::Dots, _) => {
+            let ramp = fade_ramp(color, opts).unwrap_or_else(|| Ramp::flat(color));
             area_graph_with(
-                f.buffer_mut(),
+                buf,
                 area,
                 &two_per_column(data, area.width),
                 max,
                 &ramp,
-                true,
+                flip,
                 opts.baseline,
             );
         }
@@ -1015,6 +1093,31 @@ mod tests {
         assert_eq!(c.iter().filter(|&&v| v > 0).count(), SLOTS);
     }
 
+    /// The dashboard draws this window across the panel's full width, which
+    /// is more columns than the probes have samples. Every column inside the
+    /// covered span must carry data: a five-second probe owns five seconds of
+    /// the axis, not one instant of it.
+    #[test]
+    fn a_coarse_cadence_fills_every_column_it_covers() {
+        const WINDOW: u64 = 600;
+        // Wider than the 120 samples a 5s probe retains over ten minutes,
+        // which is the dashboard's real geometry.
+        const SLOTS: usize = 134;
+
+        let probes: Vec<u64> = vec![7; 120];
+        let out = resample_to_window(&probes, 5, WINDOW, SLOTS);
+        assert_eq!(
+            out.iter().filter(|&&v| v > 0).count(),
+            SLOTS,
+            "a fully-retained series must not leave gaps: {out:?}"
+        );
+
+        // And it still agrees column-for-column with a per-tick series over
+        // the same window, which is the whole point of the stack.
+        let ticks: Vec<u64> = vec![7; 600];
+        assert_eq!(out, resample_to_window(&ticks, 1, WINDOW, SLOTS));
+    }
+
     #[test]
     fn the_newest_sample_is_always_the_rightmost_slot() {
         // Whatever the cadence, "now" is the right edge — otherwise stacked
@@ -1132,8 +1235,7 @@ mod tests {
         }
     }
 
-    /// Test shim: `render_flipped_with_max` takes a `Frame`, which a unit test
-    /// has no cheap way to build, so this calls the same two arms directly.
+    /// The downward-growing half of a mirrored plot, on its own.
     fn render_bars_flipped_or_dots(
         buf: &mut Buffer,
         area: Rect,
@@ -1141,18 +1243,163 @@ mod tests {
         max: u64,
         style: GraphStyle,
     ) {
-        let opts = GraphOpts::default();
-        match style {
-            GraphStyle::Bars => render_bars_flipped(buf, area, data, max, Color::Green, opts),
-            GraphStyle::Dots => area_graph(
-                buf,
+        render_half(
+            buf,
+            area,
+            data,
+            max,
+            style,
+            Color::Green,
+            GraphOpts::default(),
+            true,
+        );
+    }
+
+    /// A quiet link is the case that exposed this: with both halves drawing
+    /// their own floor, the throughput panel showed two solid full-width
+    /// lines one row apart, which reads as the series drawn twice. The mirror
+    /// has one zero line and it belongs to the rx half.
+    #[test]
+    fn a_mirrored_plot_draws_one_zero_line() {
+        for style in [GraphStyle::Dots, GraphStyle::Bars] {
+            let area = Rect::new(0, 0, 20, 8);
+            let mut buf = Buffer::empty(area);
+            let quiet = vec![0u64; 40];
+            let rx_h = render_mirrored_with_max(
+                &mut buf,
                 area,
-                &two_per_column(data, area.width),
-                max,
-                &Ramp::flat(Color::Green),
-                true,
-            ),
+                &quiet,
+                &quiet,
+                1,
+                style,
+                Color::Green,
+                Color::Blue,
+                GraphOpts::default(),
+            );
+            assert_eq!(rx_h, 4, "{style:?}: rx takes the extra row of an odd split");
+
+            let painted = |y: u16| {
+                (0..area.width)
+                    .filter(|&x| buf.get(x, y).symbol() != " ")
+                    .count()
+            };
+            assert_eq!(
+                painted(rx_h - 1),
+                area.width as usize,
+                "{style:?}: the zero line spans the plot"
+            );
+            assert_eq!(
+                painted(rx_h),
+                0,
+                "{style:?}: the tx half must not draw a second one below it"
+            );
         }
+    }
+
+    /// The floor rule, for every entry point: a quiet series paints exactly
+    /// **one** row. Two is what "the graph is drawn twice" looks like — it is
+    /// how the dashboard's mirror read before its halves stopped each drawing
+    /// their own baseline, and it is the cheapest thing to regress.
+    #[test]
+    fn a_quiet_series_paints_exactly_one_row() {
+        let area = Rect::new(0, 0, 20, 6);
+        let quiet = vec![0u64; 40];
+
+        for style in [GraphStyle::Dots, GraphStyle::Bars] {
+            let mut plain = Buffer::empty(area);
+            render_half(
+                &mut plain,
+                area,
+                &quiet,
+                1,
+                style,
+                Color::Green,
+                GraphOpts::default(),
+                false,
+            );
+            assert_eq!(
+                painted_rows(&plain, area),
+                vec![area.height - 1],
+                "{style:?}: an upward plot floors on its bottom row and nowhere else"
+            );
+
+            let mut flipped = Buffer::empty(area);
+            render_half(
+                &mut flipped,
+                area,
+                &quiet,
+                1,
+                style,
+                Color::Green,
+                GraphOpts::default(),
+                true,
+            );
+            assert_eq!(
+                painted_rows(&flipped, area),
+                vec![0],
+                "{style:?}: a downward plot floors on its top row and nowhere else"
+            );
+
+            // And the pair of them together is still one line, not two.
+            let mut mirrored = Buffer::empty(area);
+            let rx_h = render_mirrored_with_max(
+                &mut mirrored,
+                area,
+                &quiet,
+                &quiet,
+                1,
+                style,
+                Color::Green,
+                Color::Blue,
+                GraphOpts::default(),
+            );
+            assert_eq!(
+                painted_rows(&mirrored, area),
+                vec![rx_h - 1],
+                "{style:?}: a mirror has one zero line"
+            );
+        }
+    }
+
+    /// Rows with any painted cell in them, top first.
+    fn painted_rows(buf: &Buffer, area: Rect) -> Vec<u16> {
+        (0..area.height)
+            .filter(|&y| (0..area.width).any(|x| buf.get(x, y).symbol() != " "))
+            .collect()
+    }
+
+    /// The grid is one grid across the whole plot. Drawn per-half it put
+    /// quartile guides behind rx and nothing behind tx.
+    #[test]
+    fn a_mirrored_plot_grids_both_halves() {
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        let quiet = vec![0u64; 80];
+        let opts = GraphOpts {
+            fade: true,
+            bg: Color::Rgb(0, 0, 0),
+            terminal_palette: false,
+            baseline: false,
+        };
+        let rx_h = render_mirrored_with_max(
+            &mut buf,
+            area,
+            &quiet,
+            &quiet,
+            1,
+            GraphStyle::Dots,
+            Color::Green,
+            Color::Blue,
+            opts,
+        );
+        let dots = |lo: u16, hi: u16| {
+            (lo..hi)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf.get(x, y).symbol() == "·")
+                .count()
+        };
+        assert!(dots(0, rx_h) > 0, "rx half has grid");
+        assert!(dots(rx_h, area.height) > 0, "tx half has grid too");
     }
 
     /// The dots style and the Dense view's plot are the same renderer, so a

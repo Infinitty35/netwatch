@@ -166,6 +166,13 @@ pub struct AppUiState {
     /// name or remote host), so the fold survives re-sorting and the list
     /// churning between ticks.
     pub connection_collapsed: crate::ui::tree::FoldState,
+    /// Which process groups are folded in the *dashboard's* connections
+    /// panel. Separate from `connection_collapsed`: that one is keyed by
+    /// whatever the Connections tab is grouping by, which is a remote host
+    /// half the time, and the two panels are different sizes with different
+    /// jobs — folding a group to fit a summary panel should not silently
+    /// fold it on the tab you opened to read it in full.
+    pub dashboard_collapsed: crate::ui::tree::FoldState,
 
     /// Process whose rule removal is awaiting confirmation (`x`, then `y`).
     ///
@@ -257,6 +264,10 @@ impl AppUiState {
             egress_sort: EgressSort::default(),
             egress_detail: false,
             connection_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
+            // Folded by default whatever the preference says: the panel is
+            // eight rows tall and its question is "is anything wrong", which
+            // the rollups answer. Expanding is one key away.
+            dashboard_collapsed: crate::ui::tree::FoldState::new(true),
             egress_pending_removal: None,
 
             dashboard_log_scale: false,

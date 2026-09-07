@@ -4,6 +4,55 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-09-07
+
+Dashboard fixes, mostly to graphs that were drawing something other than what
+they claimed.
+
+### Fixed
+- **The mirrored throughput plot drew two zero lines.** rx and tx were rendered
+  as independent plots in adjacent rects, each with its own baseline floor, so
+  the shared zero line was a pair of solid full-width lines one row apart — on a
+  quiet link, the whole graph. The split now lives in
+  `graph::render_mirrored_with_max`, which owns the rule that the zero line is
+  one row belonging to the rx half, and returns its height so the axis labels
+  cannot drift from it. The fade grid is drawn once across the whole plot too;
+  it used to appear behind rx and not behind tx.
+- **The timeline's latency tracks were combed with gaps.** A sample was mapped
+  to the single column its timestamp landed in, so 120 five-second probes
+  across ~134 columns lit about seven in eight — the `dns rtt` and `gateway
+  rtt` tracks read as dashed lines beside a solid `throughput` track over the
+  same window. A sample now fills the columns its measurement interval covers.
+- **Multi-interface throughput was summed at the wrong end of time.**
+  Per-interface histories were aligned at index 0, the oldest sample, but they
+  all end at *now* and grow backwards. A link that came up two minutes ago had
+  its whole series shifted eight minutes into the past against one up all
+  session: traffic drawn on a link before it existed, none on it now.
+- The connections panel's `rtt 60s` column promised a sparkline and rendered
+  the empty string in every cell. Removed; its ten columns go to the remote and
+  app names. `verdict` narrows to its longest label now that the chip is a
+  coloured word rather than a padded pill.
+- The dashboard footer advertised `↵ drill` with nothing bound behind it.
+
+### Added
+- **The dashboard's connections panel groups by process.** One row per process
+  with a rollup — rates summed, best RTT, retransmits summed, the group's
+  *worst* verdict, and a distinct-host count — instead of one row per socket
+  with the process name repeated down the column. `↑↓` moves a cursor (hidden
+  until you press it), `space`/`Enter` folds the group under it, `z` folds
+  everything. A process with a single socket stays a plain row rather than
+  becoming a header with one child.
+- **An `interfaces` panel replaces `health` on the dashboard**, beside
+  connections at 141 columns and wider, and beside the throughput graph below
+  that. Names which link is carrying the traffic that the throughput graph
+  aggregates into one series — the question the dashboard could not answer.
+  Health findings remain the Diagnose tab's subject, summarised by the latency
+  tiles in the hero row.
+- A DASHBOARD section in the help overlay, which had none.
+
+### Changed
+- Socket verdicts render as a coloured word instead of a filled pill.
+
 ## [0.30.0] - 2026-09-05
 
 NetWatch gains a diagnostic engine: a Diagnose tab that names what is wrong,

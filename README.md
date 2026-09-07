@@ -18,15 +18,13 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
+  <img src="docs/media/demo-hero.gif" alt="A tour of NetWatch: the Dashboard with its braille throughput plot and latency heatmap, the Connections table naming the process behind every socket, live L7 packet decode, and the Dense view's mirrored graph with download growing up from the time axis and upload down from it" width="880">
 </p>
 
 <p align="center">
-  <em>The headline of v0.30. Issue → probable cause → remediation → verified close. The engine is never
-  told the problem is fixed; it watches the resolver and closes the issue when
-  <code>dns.rtt_p50 &lt; 5ms</code> has held for 60s. Recorded with
-  <code>netwatch --demo</code>, which replays a scenario through the real engine
-  and says so on every frame.</em>
+  <em>Four screens, one binary, no config — Dashboard, Connections, live packet decode, and the
+  Dense view's mirrored throughput graph. Every box comes from one panel definition, and colour
+  encodes magnitude rather than category.</em>
 </p>
 
 ---
@@ -49,6 +47,29 @@ That diagnosis is deterministic — no model involved. Baselines are learned per
 metric and scoped to the network that taught them, 25 catalogued rules decide
 what counts as wrong, and each explanation is ranked by the checks that
 separated it from the others.
+
+## New in v0.30
+
+<p align="center">
+  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
+</p>
+
+<p align="center">
+  <em>Issue → probable cause → remediation → verified close. The engine is never told the problem
+  is fixed; it watches the resolver and closes the issue when <code>dns.rtt_p50 &lt; 5ms</code> has
+  held for 60s. Recorded with <code>netwatch --demo</code>, which replays a scenario through the
+  real engine and says so on every frame.</em>
+</p>
+
+- 🩺 **[Diagnose](#what-you-get), on tab `9`.** The release's headline. Per-metric EWMA baselines learned over at least 30 minutes and scoped to a fingerprint of the network that taught them — so carrying a laptop from a 1.2 ms office resolver to a hotel hotspot doesn't fire every rule at once. A 25-rule catalogue with a suppression graph, so a dead gateway is one finding with its consequences underneath rather than six. Causes rank as `strong` / `likely` / `possible`, because the number underneath is not a calibrated probability and `92%` invites reading it as one.
+- 🔁 **Fixes that are reversible, and issues that close themselves.** Remediations are key-bound and journal their intent *before* they write, so a `SIGKILL` can't leave `/etc/resolv.conf` pointing where NetWatch put it — the next start reverts what a dead process left behind, and declines if something else edited the file meanwhile. The engine is never told the problem is solved; it watches the rule's own success condition until it holds.
+- 📋 **Coverage it admits to.** Four of the 25 rules are declared `Planned` and can never open an issue, because their inputs don't exist yet; the header states the split. A tool that lists 25 rules and evaluates 19 is misreporting itself.
+- 🎨 **btop-style chrome, everywhere.** Every box now comes from one `widgets::Panel` — rounded corners, title inline in the brand accent, metadata right-aligned in the same border row. It replaced 48 hand-built blocks across 15 files that agreed by convention rather than construction, two of which had already drifted to a different border style *on the same screen*. Dropping the tab brackets returned twenty columns and stopped the status chips clipping at 150 columns.
+- 🗣️ **A verdict line under the tab bar on every tab** — what is wrong, since when, what to press. When the baselines aren't learned yet it says so, rather than claiming health it hasn't earned.
+- 🧠 **AI Insights is no longer a tab.** It renders inside Diagnose as labelled commentary on findings the engine has already established — never as a source of facts. Config keys are unchanged.
+- 🐛 **`pid:0` no longer owns megabytes of traffic.** PID 0 is the kernel swapper; that was the label for *unattributed*, and the invented process sent an investigation hunting the sandbox for a bug that was in a format string. Also fixed: `E` export silently failing under the sandbox, and five KPI sparklines that covered different spans at identical width.
+
+**[Full changelog](CHANGELOG.md)** · **[Release notes](https://github.com/matthart1983/netwatch/releases/latest)**
 
 ## Why NetWatch
 

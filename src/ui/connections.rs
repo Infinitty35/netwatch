@@ -805,6 +805,22 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
         view.groups.iter().map(|g| g.rollup.conns).sum()
     };
 
+    // Attribution warning, in the border row rather than the header line.
+    // The header's `extra` spans are appended after the tab bar, which fills
+    // the row on its own past ~120 columns — so the one message that explains
+    // why half the PROCESS column is empty was being clipped off-screen on
+    // every terminal wide enough to run this tab. Only worth saying when
+    // Landlock is enforced: unsandboxed, the ss/`/proc` fallback still
+    // attributes new connections, and the message would be a lie.
+    let attribution_warning = match app.attribution_status() {
+        AttributionStatus::Failed(source, _) if app.sandbox_report.platform.landlock_abi > 0 => {
+            Some(format!(
+                " ⚠ {source} unavailable · new connections unattributed "
+            ))
+        }
+        _ => None,
+    };
+
     let title_right = if view.groups.is_empty() {
         format!(" {conn_count} shown  group: none ")
     } else {
@@ -824,10 +840,21 @@ fn render_connection_table(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(t.brand).bold(),
         )))
         .title(
-            Line::from(Span::styled(
-                title_right,
-                Style::default().fg(t.brand).bold(),
-            ))
+            Line::from(
+                attribution_warning
+                    .map(|w| {
+                        vec![
+                            Span::styled(w, Style::default().fg(t.status_warn).bold()),
+                            Span::styled(title_right.clone(), Style::default().fg(t.brand).bold()),
+                        ]
+                    })
+                    .unwrap_or_else(|| {
+                        vec![Span::styled(
+                            title_right.clone(),
+                            Style::default().fg(t.brand).bold(),
+                        )]
+                    }),
+            )
             .alignment(Alignment::Right),
         );
     let inner = block.inner(area);

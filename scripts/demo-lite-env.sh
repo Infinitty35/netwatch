@@ -15,7 +15,9 @@
 # Usage (from a tape):  export HOME=$(./scripts/demo-lite-env.sh)
 set -euo pipefail
 
-DEMO_HOME="$(mktemp -d -t netwatch-demo-home)"
+# Explicit template: `mktemp -t NAME` is BSD-only, and GNU coreutils fails it,
+# which under `export HOME=$(...)` empties HOME instead of erroring visibly.
+DEMO_HOME="$(mktemp -d "${TMPDIR:-/tmp}/netwatch-demo-home.XXXXXX")"
 CFG_DIR="$DEMO_HOME/Library/Application Support/netwatch"
 
 # Linux puts it under ~/.config; create both so the tape is portable.

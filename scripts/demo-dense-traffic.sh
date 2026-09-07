@@ -45,7 +45,7 @@ STREAMS=(
 
 # Upload payload for the graph's lower half. Random rather than zeroes so no
 # transport can quietly compress it into nothing.
-PAYLOAD="$(mktemp -t netwatch-dense-upload)"
+PAYLOAD="$(mktemp "${TMPDIR:-/tmp}/netwatch-dense-upload.XXXXXX")"
 head -c 8000000 /dev/urandom > "$PAYLOAD"
 
 pids=()
