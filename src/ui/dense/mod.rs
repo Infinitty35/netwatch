@@ -86,6 +86,33 @@ pub const SAT_LABEL_MAX: u16 = 18;
 /// Invariants (boxes abut, nothing overruns its readout, tables tile) are
 /// asserted across a range of sizes in the tests, which is strictly stronger
 /// than the constant-vs-constant checks the fixed grid allowed.
+/// One of the four boxes, for zooming it to the whole screen.
+///
+/// The number on each box's top border was a label; now it is the key. Press
+/// it and that box takes the full grid — the 60-second chart at forty rows,
+/// every interface instead of the first six, the whole connection list.
+/// Press it again, or `Esc`, to restore the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseBox {
+    Net,
+    Ifaces,
+    Health,
+    Conns,
+}
+
+impl DenseBox {
+    /// The box a number key names, matching the badge on its border.
+    pub fn from_key(c: char) -> Option<Self> {
+        match c {
+            '1' => Some(Self::Net),
+            '2' => Some(Self::Ifaces),
+            '3' => Some(Self::Health),
+            '4' => Some(Self::Conns),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub net: Rect,
@@ -141,6 +168,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The four-box grid.
     pub fn new(area: Rect) -> Self {
         let w = area.width;
         let h = area.height;
@@ -160,26 +188,53 @@ impl Layout {
         let ifaces = Rect::new(0, net_h, if_w, mid_h);
         let health = Rect::new(if_w, net_h, w - if_w, mid_h);
         let conns = Rect::new(0, net_h + mid_h, w, conns_h);
+        Self::from_boxes(area, net, ifaces, health, conns)
+    }
+
+    /// One box on the whole screen, the other three empty.
+    ///
+    /// An empty box is a zero-size rect: the renderers skip it, and the row
+    /// arithmetic below saturates rather than assuming every box has a
+    /// border to sit inside.
+    pub fn zoomed(area: Rect, which: DenseBox) -> Self {
+        let full = Rect::new(0, 0, area.width, area.height);
+        let none = Rect::default();
+        let pick = |b: DenseBox| if b == which { full } else { none };
+        Self::from_boxes(
+            area,
+            pick(DenseBox::Net),
+            pick(DenseBox::Ifaces),
+            pick(DenseBox::Health),
+            pick(DenseBox::Conns),
+        )
+    }
+
+    fn from_boxes(area: Rect, net: Rect, ifaces: Rect, health: Rect, conns: Rect) -> Self {
+        let w = area.width;
+        let net_h = net.height;
+        let mid_h = ifaces.height.max(health.height);
+        let conns_h = conns.height;
+        let if_w = ifaces.width;
 
         // Inside `net`: label, download plot, axis, upload plot, label. The
         // two plots split what's left, download taking the odd row — it is the
         // one you watch.
-        let plot_rows = net_h - 5;
+        let plot_rows = net_h.saturating_sub(5);
         let down_chart_h = plot_rows.div_ceil(2);
         let up_chart_h = plot_rows - down_chart_h;
         let row_down_chart = net.y + 2;
         let row_axis = row_down_chart + down_chart_h;
 
         let content_x_end = w - 3;
-        let mid_bottom = ifaces.y + mid_h - 1;
+        let mid_bottom = (ifaces.y.max(health.y) + mid_h).saturating_sub(1);
 
         // Inside `ifaces`: header, rows, rule, aggregate, saturation.
         let row_if_head = ifaces.y + 1;
-        let row_if_sat = mid_bottom - 1;
-        let row_if_agg = row_if_sat - 1;
-        let row_if_rule = row_if_agg - 1;
+        let row_if_sat = mid_bottom.saturating_sub(1);
+        let row_if_agg = row_if_sat.saturating_sub(1);
+        let row_if_rule = row_if_agg.saturating_sub(1);
         let row_if_first = row_if_head + 1;
-        let if_rows = row_if_rule - row_if_first;
+        let if_rows = row_if_rule.saturating_sub(row_if_first);
 
         // Inside `health`: header, hops, rule, a 2×2 grid, two verdict lines.
         // There are exactly four hops, so the block is top-anchored and the
@@ -193,14 +248,16 @@ impl Layout {
         let row_kv_first = row_health_rule + 1;
         let row_verdict_1 = row_kv_first + 2;
         let row_verdict_2 = row_verdict_1 + 1;
-        debug_assert!(row_verdict_2 < mid_bottom);
+        debug_assert!(health.height == 0 || row_verdict_2 < mid_bottom);
 
         // Inside `conns`: three detail rows, header, then the list to the
         // bottom border.
         let row_detail_1 = conns.y + 1;
         let row_conn_head = row_detail_1 + 3;
         let row_conn_first = row_conn_head + 1;
-        let conn_rows = conns.y + conns_h - 1 - row_conn_first;
+        let conn_rows = (conns.y + conns_h)
+            .saturating_sub(1)
+            .saturating_sub(row_conn_first);
 
         let detail_spark_x = 13;
         let detail_spark_w = content_x_end
@@ -228,7 +285,9 @@ impl Layout {
             row_if_agg,
             row_if_sat,
             sat_meter_x: 13,
-            sat_meter_w: (if_w - 2).saturating_sub(SAT_LABEL_MAX + 13 + 2),
+            sat_meter_w: if_w
+                .saturating_sub(2)
+                .saturating_sub(SAT_LABEL_MAX + 13 + 2),
             row_hop_head,
             row_hop_first,
             hop_rows,
@@ -236,7 +295,7 @@ impl Layout {
             row_kv_first,
             row_verdict_1,
             row_verdict_2,
-            hop_meter_x: health.x + health.width - 22,
+            hop_meter_x: (health.x + health.width).saturating_sub(22),
             hop_meter_w: 20,
             row_detail_1,
             row_detail_2: row_detail_1 + 1,
@@ -359,7 +418,7 @@ pub mod if_col {
 pub fn if_cols(box_w: u16) -> Vec<Col> {
     let spark_x = 51;
     // One cell clear of the box border.
-    let spark_end = box_w - 3;
+    let spark_end = box_w.saturating_sub(3);
     vec![
         left(2, 1, ""),
         left(4, 10, "IFACE"),
@@ -922,11 +981,34 @@ fn render_too_small(f: &mut Frame, app: &App, area: Rect) {
 fn render_full(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let ramps = Ramps::from_theme(t);
-    let l = Layout::new(area);
-    render_net(f, app, t, &ramps, &l);
-    render_ifaces(f, app, t, &ramps, &l);
-    render_health(f, app, t, &ramps, &l);
-    render_conns(f, app, t, &ramps, &l);
+    let l = match app.ui.dense_zoom {
+        None => Layout::new(area),
+        Some(which) => Layout::zoomed(area, which),
+    };
+    let shown = |r: Rect| r.width > 0 && r.height > 0;
+    if shown(l.net) {
+        render_net(f, app, t, &ramps, &l);
+    }
+    if shown(l.ifaces) {
+        render_ifaces(f, app, t, &ramps, &l);
+    }
+    if shown(l.health) {
+        render_health(f, app, t, &ramps, &l);
+    }
+    if shown(l.conns) {
+        render_conns(f, app, t, &ramps, &l);
+    }
+}
+
+/// The bottom-border hint for a box's number key: `zoom` on the grid,
+/// `restore` once that box fills the screen. Every box carries it, because
+/// when one is zoomed it is the only border on screen.
+fn zoom_bind(app: &App, which: DenseBox) -> paint::Bind<'static> {
+    if app.ui.dense_zoom == Some(which) {
+        ("esc", " restore")
+    } else {
+        ("1-4", " zoom")
+    }
 }
 
 // ── box 1: net ──────────────────────────────────────────────────────────────
@@ -966,7 +1048,12 @@ fn render_net(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
         } else {
             t.text_muted
         })),
-        foot_left: &[("V", " view"), ("space", " pause"), ("q", "uit")],
+        foot_left: &[
+            zoom_bind(app, DenseBox::Net),
+            ("V", " view"),
+            ("space", " pause"),
+            ("q", "uit"),
+        ],
         foot_right: None,
     };
     paint::panel(f.buffer_mut(), l.net, t, &inner_opts);
@@ -1163,6 +1250,7 @@ fn render_ifaces(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
             title: Some("ifaces"),
             sub: Some(&sub),
             right: Some("sort ↓ rate"),
+            foot_left: &[zoom_bind(app, DenseBox::Ifaces)],
             ..Default::default()
         },
     );
@@ -1421,6 +1509,7 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
             } else {
                 t.status_good
             })),
+            foot_left: &[zoom_bind(app, DenseBox::Health)],
             ..Default::default()
         },
     );
@@ -1618,6 +1707,7 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
             // documentation, advertising a key that does nothing is the one
             // failure that can't be tolerated.
             foot_left: &[
+                zoom_bind(app, DenseBox::Conns),
                 ("↑↓", " select"),
                 ("p", "ause"),
                 (",", " settings"),
@@ -2733,5 +2823,51 @@ mod tests {
         assert_eq!(short_bytes(512_000), "512K");
         assert_eq!(short_bytes(536_000_000), "536M");
         assert_eq!(short_bytes(2_000_000_000), "2G");
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    /// A zoomed box owns the whole grid and the other three vanish — and the
+    /// row arithmetic for the vanished boxes must not underflow on the way.
+    #[test]
+    fn zooming_a_box_gives_it_the_whole_screen() {
+        let area = Rect::new(0, 0, GRID_W, GRID_H);
+        let full = Rect::new(0, 0, GRID_W, GRID_H);
+        for which in [
+            DenseBox::Net,
+            DenseBox::Ifaces,
+            DenseBox::Health,
+            DenseBox::Conns,
+        ] {
+            let l = Layout::zoomed(area, which);
+            let boxes = [
+                (DenseBox::Net, l.net),
+                (DenseBox::Ifaces, l.ifaces),
+                (DenseBox::Health, l.health),
+                (DenseBox::Conns, l.conns),
+            ];
+            for (b, r) in boxes {
+                if b == which {
+                    assert_eq!(r, full, "{which:?} fills the screen");
+                } else {
+                    assert_eq!(r.area(), 0, "{b:?} is gone while {which:?} is zoomed");
+                }
+            }
+        }
+        // And the zoomed connection list is taller than the grid's.
+        let grid = Layout::new(area);
+        let zoomed = Layout::zoomed(area, DenseBox::Conns);
+        assert!(zoomed.conn_rows > grid.conn_rows);
+        assert!(Layout::zoomed(area, DenseBox::Ifaces).if_rows > grid.if_rows);
+    }
+
+    #[test]
+    fn number_keys_name_the_boxes_by_their_badges() {
+        assert_eq!(DenseBox::from_key('1'), Some(DenseBox::Net));
+        assert_eq!(DenseBox::from_key('4'), Some(DenseBox::Conns));
+        assert_eq!(DenseBox::from_key('5'), None);
     }
 }

@@ -2071,7 +2071,19 @@ fn handle_dense_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('V') | KeyCode::Char('v') => cycle_view(app),
         KeyCode::Char('L') => app.ui.view_mode = ViewMode::Lite,
+        // Esc backs out one level: a zoomed box first, then the view.
+        KeyCode::Esc if app.ui.dense_zoom.is_some() => app.ui.dense_zoom = None,
         KeyCode::Esc => app.ui.view_mode = ViewMode::Full,
+        // The number on a box's border is its key: zoom it, or restore the
+        // grid if it is already zoomed.
+        KeyCode::Char(c @ '1'..='4') => {
+            let which = crate::ui::dense::DenseBox::from_key(c);
+            app.ui.dense_zoom = if app.ui.dense_zoom == which {
+                None
+            } else {
+                which
+            };
+        }
         KeyCode::Char('?') => app.ui.show_help = true,
         KeyCode::Char('p') | KeyCode::Char(' ') => app.ui.paused = !app.ui.paused,
         KeyCode::Char(',') => {

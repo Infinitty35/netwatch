@@ -4,6 +4,31 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-09-08
+
+### Added
+- **Dense view: the number on a box's border is its key.** `1`–`4` zoom
+  that box to the whole screen — the 60-second chart at forty rows, every
+  interface, the full connection list — and again, or `Esc`, restores the
+  grid. `Esc` now backs out one level rather than straight to the full view.
+- Fade works under the `terminal` theme. It used to switch off there, on the
+  grounds that a gradient needs blended colours; the palette already holds a
+  bright variant of every hue, and two tokens are the two-step gradient btop
+  draws on a 16-colour terminal. Nothing in between is synthesised.
+
+### Changed
+- The dashboard timeline scrolls one sample per tick, the same rule as the
+  throughput chart above it, instead of resampling a fixed ten minutes onto
+  the panel's columns — which sat still for four ticks and lurched, with the
+  shape shimmering between lurches as samples crossed column edges on their
+  own schedule. The header says the real window (`last 2m14s`); the ten-minute
+  view stays on the Timeline tab.
+
+### Removed
+- The faint dot grid behind faded graphs. Three dotted horizontals across a
+  plot read as extra copies of the line. `graph_fade` now means only the
+  magnitude gradient.
+
 ## [0.30.1] - 2026-09-07
 
 Dashboard fixes, mostly to graphs that were drawing something other than what

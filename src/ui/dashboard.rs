@@ -21,8 +21,6 @@ const KPI_ROWS: u16 = 5;
 const MID_ROWS: u16 = 14;
 /// The incident timeline, when the screen is tall enough to earn it.
 const TIMELINE_ROWS: u16 = 6;
-/// How far back the timeline looks.
-const TIMELINE_WINDOW_SECS: u64 = 600;
 /// How far back the KPI tiles' sparklines look.
 ///
 /// Fixed, and the same for every tile, because the five sit in one row and are
@@ -162,6 +160,15 @@ impl Reading {
             since,
             severity,
         }
+    }
+}
+
+/// A window length as people say it: `2m14s`, `4m`, `45s`.
+fn fmt_window(secs: u64) -> String {
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m{s:02}s"),
     }
 }
 
@@ -1187,23 +1194,37 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
     let interfaces = app.traffic.interfaces();
     let actives = active_ifaces(&interfaces, &app.interface_info);
 
+    // One row per track plus one for the events. Below that there is nothing
+    // useful to draw, so the panel stays empty rather than drawing a track
+    // with no label or a label with no track.
+    const GUTTER: u16 = 12;
+    // The window is whatever the plot can show at one sample per tick — the
+    // same rule the throughput chart above follows. It used to be a fixed ten
+    // minutes squeezed onto ~134 columns, which is 4.5 seconds a column: the
+    // strip sat still for four ticks and then lurched, and because the bucket
+    // edges were anchored to "now" every sample crossed a column boundary on
+    // its own tick, so the shape crawled and shimmered rather than scrolling.
+    // One sample per slot, one slot per tick, everything moves together.
+    let plot_w = area.width.saturating_sub(2).saturating_sub(GUTTER);
+    let window_secs =
+        crate::graph::axis_window_secs(plot_w, app.graph_style, app.user_config.refresh_rate_ms);
+    let slots = plot_w as usize * crate::graph::samples_per_column(app.graph_style);
+
     let inner = widgets::Panel::new("timeline")
         .tab_badge(crate::app::Tab::Timeline)
         .meta_styled(vec![Span::styled(
-            format!("last {}m", TIMELINE_WINDOW_SECS / 60),
+            format!("last {}", fmt_window(window_secs)),
             Style::default().fg(t.text_muted),
         )])
         .fit(area.width)
         .render(f, t, area);
 
-    // One row per track plus one for the events. Below that there is nothing
-    // useful to draw, so the panel stays empty rather than drawing a track
-    // with no label or a label with no track.
-    const GUTTER: u16 = 12;
     if inner.height < 4 || inner.width < GUTTER + 20 {
         return;
     }
-    let plot_w = inner.width - GUTTER;
+    // The window above was sized from `area` before the panel existed; the
+    // border is one column each side, so this is the same number.
+    debug_assert_eq!(plot_w, inner.width - GUTTER);
 
     let throughput: Vec<u64> = aggregate_rx(&actives)
         .into_iter()
@@ -1251,20 +1272,18 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
                 height: 1,
             },
         );
-        // One value per column, on the panel's shared grid. The time base is
+        // One sample per slot on the panel's shared grid. The time base is
         // common; the *scale* deliberately is not — these are different units,
         // and a shared maximum would flatten every track but throughput.
-        let data = crate::graph::resample_to_window(
-            &raw,
-            secs_per_sample,
-            TIMELINE_WINDOW_SECS,
-            plot_w as usize,
-        );
+        let data = crate::graph::resample_to_window(&raw, secs_per_sample, window_secs, slots);
         // A ceiling one outlier cannot own — see `graph::robust_max`. With a
         // raw max, a single rtt excursion scaled every other sample to the
         // floor and the track read as a dead flat line.
         let max = crate::graph::robust_max(&data, 0.95);
-        crate::graph::render_bucketed_with_max(
+        // Through the same entry point as the throughput chart, so a braille
+        // column carries two consecutive samples here as it does there,
+        // rather than one value doubled.
+        crate::graph::render_with_max(
             f,
             Rect {
                 x: inner.x + GUTTER,
@@ -1276,6 +1295,7 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
             max,
             app.graph_style,
             color,
+            t.status_warn,
             app.graph_opts(),
         );
     }
@@ -1288,10 +1308,10 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
             continue;
         };
         let age = now.signed_duration_since(at).num_seconds();
-        if age < 0 || age > TIMELINE_WINDOW_SECS as i64 {
+        if age < 0 || age > window_secs as i64 {
             continue;
         }
-        let frac = 1.0 - (age as f32 / TIMELINE_WINDOW_SECS as f32);
+        let frac = 1.0 - (age as f32 / window_secs.max(1) as f32);
         let x = (frac * plot_w.saturating_sub(1) as f32).round() as u16;
         marks.push((
             x,
@@ -1706,6 +1726,14 @@ mod tests {
             hosts: hosts.len(),
             conns,
         }
+    }
+
+    #[test]
+    fn window_labels_read_like_speech() {
+        assert_eq!(fmt_window(45), "45s");
+        assert_eq!(fmt_window(240), "4m");
+        assert_eq!(fmt_window(134), "2m14s");
+        assert_eq!(fmt_window(605), "10m05s");
     }
 
     /// The interfaces panel is a third of the row, bounded at both ends —

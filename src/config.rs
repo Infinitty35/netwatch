@@ -71,12 +71,12 @@ pub struct NetwatchConfig {
 
     /// The magnitude gradient. When `true`, every chart colours each cell by
     /// how high it sits — dim at the baseline, the series colour in the
-    /// middle, lightened at the peak — and overlays a faint dot grid so the
-    /// magnitude is easier to read.
+    /// middle, lightened at the peak.
     ///
     /// On by default: it is what makes a filled area read as depth rather
-    /// than as a block. Themes that defer to the terminal palette switch it
-    /// off regardless, having no 16-colour gradient to degrade to.
+    /// than as a block. Under the `terminal` theme it steps from each series
+    /// colour to its bright palette variant instead of blending, so no colour
+    /// is invented.
     #[serde(default = "default_graph_fade")]
     pub graph_fade: bool,
 

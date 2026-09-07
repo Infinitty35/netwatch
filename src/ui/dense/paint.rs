@@ -63,16 +63,16 @@ impl Ramps {
     pub fn from_theme(t: &Theme) -> Self {
         if t.defers_to_terminal() {
             return Self {
-                down: Ramp::flat(t.rx_rate),
-                up: Ramp::flat(t.tx_rate),
-                // `load` is the one ramp that still ramps here. The magnitude
-                // ramps collapse because their intermediate values only exist
-                // as synthesised blends, but severity already has three
-                // palette tokens of its own — so the meter steps
-                // good → warn → error instead of losing the vocabulary the
-                // README promises. No colour is invented: `lerp` returns its
-                // lower stop for non-RGB inputs, which quantises the sample to
-                // whichever token it landed on.
+                // The same two-token step the Dashboard's graphs use under
+                // this theme, so a Dense plot and a Dashboard plot of the
+                // same series look like the same tool.
+                down: crate::graph::palette_ramp(t.rx_rate),
+                up: crate::graph::palette_ramp(t.tx_rate),
+                // Severity already has three palette tokens of its own, so
+                // the meter steps good → warn → error instead of losing the
+                // vocabulary the README promises. No colour is invented:
+                // `lerp` returns its lower stop for non-RGB inputs, which
+                // quantises the sample to whichever token it landed on.
                 load: Ramp::new(vec![t.status_good, t.status_warn, t.status_error]),
                 dim: Ramp::flat(t.text_muted),
             };
@@ -570,14 +570,25 @@ mod tests {
     }
 
     #[test]
-    fn ramps_collapse_to_flat_on_terminal_palette_themes() {
-        // `terminal` defers to the user's 16 colours; synthesising a gradient
-        // there would ignore the palette it exists to honour.
+    fn ramps_step_between_palette_tokens_on_terminal_themes() {
+        // `terminal` defers to the user's 16 colours. The magnitude ramps
+        // step from the series token to its bright variant — the palette's
+        // own two-stop gradient — and never blend a value in between.
         let t = crate::theme::by_name("terminal");
         assert!(t.defers_to_terminal());
         let r = Ramps::from_theme(&t);
-        assert_eq!(r.down.at(0.0), r.down.at(1.0));
-        assert_eq!(r.up.at(0.0), r.up.at(1.0));
+        assert_eq!(r.down.at(0.0), t.rx_rate);
+        assert_eq!(r.down.at(1.0), crate::graph::bright_token(t.rx_rate));
+        assert_eq!(r.up.at(0.0), t.tx_rate);
+        assert_eq!(r.up.at(1.0), crate::graph::bright_token(t.tx_rate));
+        for step in 0..=20 {
+            let c = r.down.at(step as f32 / 20.0);
+            assert!(
+                !matches!(c, Color::Rgb(..)),
+                "step {step} blended a 24-bit value: {c:?}"
+            );
+        }
+        // Dim has no second token to step to, so it stays flat.
         assert_eq!(r.dim.at(0.0), r.dim.at(1.0));
     }
 

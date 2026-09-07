@@ -8,7 +8,7 @@
 //! them all.
 //!
 //! `GraphOpts.fade` enables the magnitude gradient: every cell is coloured by
-//! how high it sits in the plot, plus a faint dot grid behind the data. Call
+//! how high it sits in the plot. Call
 //! sites build the opts from `App::graph_opts()` so a single config toggle
 //! governs the entire UI.
 //!
@@ -50,22 +50,23 @@ impl GraphStyle {
 }
 
 /// Cross-cutting render preferences passed to every chart call site.
-/// Fade + grid travel together because users want btop's whole look or
-/// none of it — not partial.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphOpts {
-    /// Apply right-bright / left-dim color gradient per column AND draw
-    /// a faint dot grid behind the data. Off → render the original
-    /// solid-color look identical to pre-v0.21.
+    /// Colour each cell by its height in the plot — dim at the baseline,
+    /// the series colour through the body, bright at the peak. Off renders
+    /// the flat solid-colour look.
+    ///
+    /// This used to also draw a faint dot grid behind the data. It went:
+    /// three dotted horizontals across a plot read as extra copies of the
+    /// line, which is the opposite of what a guide is for.
     pub fade: bool,
     /// Theme background color, used as the "fade-to" anchor when
     /// interpolating column colors and as the fallback when no Rgb
     /// information is available.
     pub bg: Color,
-    /// True under the `terminal` theme, where every color must resolve
-    /// through the user's own palette. Fade and the grid interpolate in
-    /// RGB, so they switch off rather than emit 24-bit values the theme
-    /// exists to avoid.
+    /// True under the `terminal` theme, where every colour must resolve
+    /// through the user's own palette. Fade then steps between palette
+    /// tokens instead of blending in RGB — see [`palette_ramp`].
     pub terminal_palette: bool,
     /// Draw a floor under a zero sample, so a quiet series reads as "no
     /// traffic" rather than "no data".
@@ -389,11 +390,18 @@ pub fn robust_max(data: &[u64], percentile: f64) -> u64 {
 /// blocks one — and a sample is one refresh interval, not one second. Getting
 /// either wrong makes the axis name a window the graph is not drawing.
 pub fn axis_window_secs(width: u16, style: GraphStyle, refresh_ms: u64) -> u64 {
-    let per_column = match style {
+    width as u64 * samples_per_column(style) as u64 * refresh_ms / 1000
+}
+
+/// Samples a column of this style shows: braille packs two, blocks one.
+///
+/// A plot that scrolls one sample per tick needs exactly this many slots per
+/// column, or the axis under it names a window the plot is not drawing.
+pub fn samples_per_column(style: GraphStyle) -> usize {
+    match style {
         GraphStyle::Dots => 2,
         GraphStyle::Bars => 1,
-    };
-    width as u64 * per_column * refresh_ms / 1000
+    }
 }
 
 /// The x-axis strip under a time-series plot: the window's start, its
@@ -426,10 +434,55 @@ pub fn time_axis(width: u16, secs: u64) -> String {
 /// — there is no 16-color equivalent of a gradient, so it degrades to off
 /// rather than to wrong.
 fn fade_ramp(base: Color, opts: GraphOpts) -> Option<Ramp> {
-    if !opts.fade || opts.terminal_palette {
+    if !opts.fade {
         return None;
     }
+    if opts.terminal_palette {
+        return Some(palette_ramp(base));
+    }
     Some(magnitude_ramp(base, opts.bg))
+}
+
+/// The magnitude gradient in the terminal's own sixteen colours.
+///
+/// Fade used to switch off entirely under the `terminal` theme, on the
+/// grounds that a gradient needs blended colours and the theme exists to
+/// never synthesise one. But the palette already holds a second stop for
+/// every hue: `Green` has `LightGreen`, `Blue` has `LightBlue`. Two tokens
+/// are a two-step gradient, which is what btop itself draws on a 16-colour
+/// terminal — the series colour along the body of the plot, the bright
+/// variant at the peak. No colour is invented: [`lerp`] returns its lower
+/// stop for non-RGB inputs, so the ramp quantises to the tokens it names.
+///
+/// The bright step covers the top quarter. A one-row sparkline samples the
+/// ramp at its midpoint and stays the series colour; only a plot tall enough
+/// to have a peak gets the highlight on it.
+pub fn palette_ramp(base: Color) -> Ramp {
+    let bright = bright_token(base);
+    Ramp::new(vec![base, base, base, bright, bright])
+}
+
+/// The palette's bright variant of a named or indexed colour.
+///
+/// Already-bright tokens and `Reset` come back unchanged rather than mapped
+/// to `White`: a series drawn in the terminal's foreground has no brighter
+/// self, and inventing one is exactly what the palette-deferring theme
+/// promises not to do. RGB values pass through — they never reach here under
+/// that theme, and outside it a gradient is blended, not stepped.
+pub fn bright_token(c: Color) -> Color {
+    match c {
+        Color::Black => Color::DarkGray,
+        Color::Red => Color::LightRed,
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::Cyan => Color::LightCyan,
+        Color::Gray => Color::White,
+        Color::DarkGray => Color::Gray,
+        Color::Indexed(n) if n < 8 => Color::Indexed(n + 8),
+        other => other,
+    }
 }
 
 /// The magnitude gradient: dim at the baseline, the series color in the
@@ -492,12 +545,6 @@ fn rgb(c: Color) -> Option<(u8, u8, u8)> {
 /// hierarchy, not as illegibility.
 const MIN_ROW_FADE_ALPHA: f32 = 0.55;
 
-/// Smallest chart (cells) where the grid overlay renders. In-row
-/// sparklines on Connections / Stats rows are too narrow to benefit
-/// from the grid — the overlay just becomes visual noise.
-const GRID_MIN_W: u16 = 16;
-const GRID_MIN_H: u16 = 4;
-
 /// Render `data` into `area` using the chosen style.
 ///
 /// `base` is the primary series color (e.g. `theme.rx_rate`). `accent` is
@@ -534,9 +581,6 @@ pub fn render_with_max(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if opts.fade && area.width >= GRID_MIN_W && area.height >= GRID_MIN_H {
-        render_grid(f.buffer_mut(), area, opts.bg, opts.terminal_palette);
-    }
     match style {
         GraphStyle::Bars => render_bars(f.buffer_mut(), area, data, max, base, opts),
         GraphStyle::Dots => render_dots(f.buffer_mut(), area, data, max, base, opts),
@@ -572,12 +616,6 @@ pub fn render_mirrored_with_max(
     // series on almost every host.
     let tx_h = plot.height / 2;
     let rx_h = plot.height - tx_h;
-
-    // One grid across the whole plot. Drawing it per-half put quartile guides
-    // behind rx and nothing behind tx, so the mirror was only half a mirror.
-    if opts.fade && plot.width >= GRID_MIN_W && plot.height >= GRID_MIN_H {
-        render_grid(buf, plot, opts.bg, opts.terminal_palette);
-    }
 
     render_half(
         buf,
@@ -821,7 +859,7 @@ fn render_dots(
     );
 }
 
-// ── fade + grid helpers ─────────────────────────────────────────────────────
+// ── fade helpers ────────────────────────────────────────────────────────────
 
 /// Linear-interpolate from `bg` toward `base` at fraction `alpha`. Only
 /// works in RGB; named/indexed colors are returned unchanged so we don't
@@ -915,50 +953,6 @@ pub fn fade_spans_fg(
             s
         })
         .collect()
-}
-
-/// Faint dot grid behind the chart. Renders before the data so any data
-/// cell overwrites a grid cell; the empty regions of the chart show the
-/// grid through. Only runs on charts at least `GRID_MIN_W` × `GRID_MIN_H`
-/// to avoid making narrow sparklines look noisy.
-fn render_grid(buf: &mut Buffer, area: Rect, bg: Color, defer_to_terminal: bool) {
-    // Grid color: half-way between bg and a neutral gray, so it sits well
-    // below the data on every theme.
-    // The grid's base is a fixed grey, so it would survive fade_color's
-    // passthrough as raw RGB. DarkGray is the palette's own answer to
-    // "faint chrome" and tracks whatever the user's theme defines.
-    let grid_color = if defer_to_terminal {
-        Color::DarkGray
-    } else {
-        fade_color(Color::Rgb(150, 150, 150), bg, 0.20, false)
-    };
-    let cell_w = area.width as usize;
-    let cell_h = area.height as usize;
-    if cell_w < GRID_MIN_W as usize || cell_h < GRID_MIN_H as usize {
-        return;
-    }
-    // 4 verticals + 4 horizontals → quartile guides.
-    let v_step = (cell_w / 4).max(2);
-    let h_step = (cell_h / 4).max(1);
-
-    for x in (v_step..cell_w).step_by(v_step) {
-        for cy in 0..cell_h {
-            let cell = buf.get_mut(area.x + x as u16, area.y + cy as u16);
-            cell.set_char('·');
-            cell.set_style(Style::default().fg(grid_color));
-        }
-    }
-    for y in (h_step..cell_h).step_by(h_step) {
-        for cx in 0..cell_w {
-            let cell = buf.get_mut(area.x + cx as u16, area.y + y as u16);
-            // Don't overwrite an existing vertical grid dot — leave the
-            // intersection visually balanced.
-            if cell.symbol() != "·" {
-                cell.set_char('·');
-                cell.set_style(Style::default().fg(grid_color));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1116,6 +1110,33 @@ mod tests {
         // the same window, which is the whole point of the stack.
         let ticks: Vec<u64> = vec![7; 600];
         assert_eq!(out, resample_to_window(&ticks, 1, WINDOW, SLOTS));
+    }
+
+    /// What "smooth" means for a scrolling strip: one tick later, every slot
+    /// holds what its right-hand neighbour held, and the new sample is at the
+    /// end. A window sized to the slots at the source cadence gives exactly
+    /// that. The old fixed ten-minute window over ~134 columns did not — a
+    /// sample crossed a column edge on its own schedule, so the shape
+    /// crawled and shimmered between lurches instead of scrolling.
+    #[test]
+    fn one_tick_later_the_strip_has_shifted_by_exactly_one_slot() {
+        const SLOTS: usize = 134;
+        let mut history: Vec<u64> = (0..600).map(|i| i * 7 % 101).collect();
+        let before = resample_to_window(&history, 1, SLOTS as u64, SLOTS);
+
+        history.remove(0);
+        history.push(999);
+        let after = resample_to_window(&history, 1, SLOTS as u64, SLOTS);
+
+        assert_eq!(&after[..SLOTS - 1], &before[1..]);
+        assert_eq!(after[SLOTS - 1], 999);
+
+        // And a slower source over the same window shifts in step with it:
+        // a 5s probe covers five slots, and next tick covers the next five.
+        let probes: Vec<u64> = (0..120).map(|i| i + 1).collect();
+        let a = resample_to_window(&probes, 5, SLOTS as u64, SLOTS);
+        let newest_run = a.iter().rev().take_while(|&&v| v == 120).count();
+        assert_eq!(newest_run, 5, "the newest probe owns its five slots: {a:?}");
     }
 
     #[test]
@@ -1296,6 +1317,61 @@ mod tests {
         }
     }
 
+    /// Under the `terminal` theme fade is a two-step gradient in palette
+    /// tokens, not off. The body of the plot is the series colour and the
+    /// peak is its bright variant; nothing in between is synthesised.
+    #[test]
+    fn terminal_fade_steps_between_two_palette_tokens() {
+        let opts = GraphOpts {
+            fade: true,
+            bg: Color::Reset,
+            terminal_palette: true,
+            baseline: true,
+        };
+        let ramp = fade_ramp(Color::Green, opts).expect("fade is on, so there is a ramp");
+
+        assert_eq!(ramp.at(0.0), Color::Green, "the floor is the series colour");
+        assert_eq!(
+            ramp.at(0.5),
+            Color::Green,
+            "a one-row sparkline stays the series colour"
+        );
+        assert_eq!(
+            ramp.at(1.0),
+            Color::LightGreen,
+            "the peak is the bright token"
+        );
+        for f in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0] {
+            assert!(
+                matches!(ramp.at(f), Color::Green | Color::LightGreen),
+                "at {f} the ramp invented {:?}",
+                ramp.at(f)
+            );
+        }
+
+        // Fade off is still off, whatever the theme.
+        assert!(fade_ramp(
+            Color::Green,
+            GraphOpts {
+                fade: false,
+                ..opts
+            }
+        )
+        .is_none());
+    }
+
+    /// Every dull palette token has a bright one; the bright ones and the
+    /// terminal's own foreground have nowhere brighter to go.
+    #[test]
+    fn bright_tokens_stay_inside_the_palette() {
+        assert_eq!(bright_token(Color::Blue), Color::LightBlue);
+        assert_eq!(bright_token(Color::Indexed(2)), Color::Indexed(10));
+        assert_eq!(bright_token(Color::LightGreen), Color::LightGreen);
+        assert_eq!(bright_token(Color::Indexed(10)), Color::Indexed(10));
+        assert_eq!(bright_token(Color::Reset), Color::Reset);
+        assert_eq!(bright_token(Color::Rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
+    }
+
     /// The floor rule, for every entry point: a quiet series paints exactly
     /// **one** row. Two is what "the graph is drawn twice" looks like — it is
     /// how the dashboard's mirror read before its halves stopped each drawing
@@ -1366,40 +1442,6 @@ mod tests {
         (0..area.height)
             .filter(|&y| (0..area.width).any(|x| buf.get(x, y).symbol() != " "))
             .collect()
-    }
-
-    /// The grid is one grid across the whole plot. Drawn per-half it put
-    /// quartile guides behind rx and nothing behind tx.
-    #[test]
-    fn a_mirrored_plot_grids_both_halves() {
-        let area = Rect::new(0, 0, 40, 12);
-        let mut buf = Buffer::empty(area);
-        let quiet = vec![0u64; 80];
-        let opts = GraphOpts {
-            fade: true,
-            bg: Color::Rgb(0, 0, 0),
-            terminal_palette: false,
-            baseline: false,
-        };
-        let rx_h = render_mirrored_with_max(
-            &mut buf,
-            area,
-            &quiet,
-            &quiet,
-            1,
-            GraphStyle::Dots,
-            Color::Green,
-            Color::Blue,
-            opts,
-        );
-        let dots = |lo: u16, hi: u16| {
-            (lo..hi)
-                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
-                .filter(|&(x, y)| buf.get(x, y).symbol() == "·")
-                .count()
-        };
-        assert!(dots(0, rx_h) > 0, "rx half has grid");
-        assert!(dots(rx_h, area.height) > 0, "tx half has grid too");
     }
 
     /// The dots style and the Dense view's plot are the same renderer, so a
@@ -1888,20 +1930,6 @@ mod tests {
         );
         assert_eq!(buf.get(0, 0).fg, base);
         assert_eq!(buf.get(0, 3).fg, base);
-    }
-
-    /// A palette-deferring theme has no 16-colour gradient to degrade to, so
-    /// the ramp switches off rather than synthesising 24-bit values the theme
-    /// exists to avoid.
-    #[test]
-    fn a_terminal_palette_theme_gets_no_gradient() {
-        let opts = GraphOpts {
-            fade: true,
-            bg: Color::Reset,
-            terminal_palette: true,
-            baseline: true,
-        };
-        assert!(fade_ramp(Color::Green, opts).is_none());
     }
 
     /// The gradient is dim at the baseline and bright at the peak, and its

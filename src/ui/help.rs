@@ -100,7 +100,16 @@ fn build_dense_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(section_header(theme, "NETWATCH DENSE"));
     lines.push(key_line(theme, "q / Ctrl+C", "Quit"));
     lines.push(key_line(theme, "V", "Cycle view: full → lite → dense"));
-    lines.push(key_line(theme, "Esc", "Back to the full view"));
+    lines.push(key_line(
+        theme,
+        "1-4",
+        "Zoom that box to the whole screen; again to restore",
+    ));
+    lines.push(key_line(
+        theme,
+        "Esc",
+        "Restore the grid, then back to the full view",
+    ));
     lines.push(key_line(theme, "p / Space", "Pause/resume"));
     lines.push(key_line(theme, ",", "Settings"));
     lines.push(key_line(theme, "?", "Toggle this overlay"));

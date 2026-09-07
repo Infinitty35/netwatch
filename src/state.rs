@@ -125,6 +125,8 @@ pub struct AppUiState {
     /// Full tabbed TUI vs the single-screen Lite view. Opt-in only.
     pub view_mode: ViewMode,
     pub lite: LiteState,
+    /// Which Dense box fills the screen, if any. Its number key toggles it.
+    pub dense_zoom: Option<crate::ui::dense::DenseBox>,
     pub scroll: UiScrollState,
     pub sort_states: HashMap<Tab, TabSortState>,
     pub sort_picker: SortPickerState,
@@ -236,6 +238,7 @@ impl AppUiState {
             // The saved default; `--view` overrides it in `app::run`.
             view_mode: ViewMode::by_name(&cfg.view),
             lite: LiteState::default(),
+            dense_zoom: None,
             scroll: UiScrollState::default(),
             sort_states: default_sort_states(),
             sort_picker: SortPickerState::default(),
