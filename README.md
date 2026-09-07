@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-hero.gif" alt="A tour of NetWatch: the Dashboard with its braille throughput plot and latency heatmap, the Connections table naming the process behind every socket, live L7 packet decode, and the Dense view's mirrored graph with download growing up from the time axis and upload down from it" width="880">
+  <img src="docs/media/demo-hero.gif" alt="A tour of NetWatch: the Dashboard with its mirrored braille throughput plot, latency tiles and per-process connection rollups, the Connections table naming the process behind every socket with GeoIP and retransmit counts, a decoded packet with its payload and the conversation it belongs to, and the Dense view filling the terminal with four zero-chrome boxes" width="880">
 </p>
 
 <p align="center">
@@ -61,6 +61,8 @@ separated it from the others.
   real engine and says so on every frame.</em>
 </p>
 
+### v0.30.0 — the diagnostic engine
+
 - 🩺 **[Diagnose](#what-you-get), on tab `9`.** The release's headline. Per-metric EWMA baselines learned over at least 30 minutes and scoped to a fingerprint of the network that taught them — so carrying a laptop from a 1.2 ms office resolver to a hotel hotspot doesn't fire every rule at once. A 25-rule catalogue with a suppression graph, so a dead gateway is one finding with its consequences underneath rather than six. Causes rank as `strong` / `likely` / `possible`, because the number underneath is not a calibrated probability and `92%` invites reading it as one.
 - 🔁 **Fixes that are reversible, and issues that close themselves.** Remediations are key-bound and journal their intent *before* they write, so a `SIGKILL` can't leave `/etc/resolv.conf` pointing where NetWatch put it — the next start reverts what a dead process left behind, and declines if something else edited the file meanwhile. The engine is never told the problem is solved; it watches the rule's own success condition until it holds.
 - 📋 **Coverage it admits to.** Four of the 25 rules are declared `Planned` and can never open an issue, because their inputs don't exist yet; the header states the split. A tool that lists 25 rules and evaluates 19 is misreporting itself.
@@ -68,6 +70,16 @@ separated it from the others.
 - 🗣️ **A verdict line under the tab bar on every tab** — what is wrong, since when, what to press. When the baselines aren't learned yet it says so, rather than claiming health it hasn't earned.
 - 🧠 **AI Insights is no longer a tab.** It renders inside Diagnose as labelled commentary on findings the engine has already established — never as a source of facts. Config keys are unchanged.
 - 🐛 **`pid:0` no longer owns megabytes of traffic.** PID 0 is the kernel swapper; that was the label for *unattributed*, and the invented process sent an investigation hunting the sandbox for a bug that was in a format string. Also fixed: `E` export silently failing under the sandbox, and five KPI sparklines that covered different spans at identical width.
+
+### v0.30.1 — the dashboard graphs draw what they claim
+
+The 0.30 chrome landed with three plots quietly drawing something other than what they said.
+
+- 📉 **The mirrored throughput plot drew two zero lines.** rx and tx were rendered as independent plots in adjacent rects, each with its own baseline floor — so the shared zero line was a pair of solid full-width lines one row apart, which on a quiet link is the entire graph. `graph::render_mirrored_with_max` now owns the rule that the zero line is one row belonging to the rx half, and returns its height so the axis labels can't drift from it.
+- 📏 **The timeline's latency tracks were combed with gaps.** Each sample lit only the column its timestamp landed in, so 120 five-second probes across ~134 columns lit about seven in eight — `dns rtt` and `gateway rtt` read as dashed lines beside a solid `throughput` track over the same window. A sample now fills the columns its measurement interval actually covers.
+- ⏪ **Multi-interface throughput was summed at the wrong end of time.** Per-interface histories were aligned at index 0 — the oldest sample — but they all end at *now* and grow backwards. A link that came up two minutes ago had its whole series shifted eight minutes into the past: traffic drawn on a link before it existed, and none on it now.
+- 🧩 **The dashboard's connections panel groups by process** — one row per process with rates summed, best RTT, retransmits summed, the group's *worst* verdict, and a distinct-host count, instead of the process name repeated down every socket. `↑↓` moves a cursor, `space` folds a group, `z` folds everything.
+- 🔌 **An `interfaces` panel replaces `health` on the dashboard**, naming which link is carrying the traffic the throughput graph aggregates into one series — the question the dashboard couldn't answer. Health findings stay Diagnose's subject.
 
 **[Full changelog](CHANGELOG.md)** · **[Release notes](https://github.com/matthart1983/netwatch/releases/latest)**
 
@@ -217,8 +229,8 @@ Ten tabs, switched with `1`–`9` and `0`:
 
 | # | Tab | What it shows |
 |---|-----|---------------|
-| 1 | **Dashboard** | Interfaces, bandwidth graph, top connections, gateway/DNS health, latency heatmap. Useful in 5 seconds. |
-| 2 | **Connections** | Every socket with its process + PID, protocol, state, GeoIP, and latency sparklines. |
+| 1 | **Dashboard** | Latency and loss tiles, a mirrored throughput graph, the interface carrying it, and connections rolled up per process. Useful in 5 seconds. |
+| 2 | **Connections** | Every socket with its process + PID, protocol, state, GeoIP, RTT, retransmit counts, and age. |
 | 3 | **Interfaces** | Per-interface IPv4/IPv6, MAC, MTU, RX/TX, errors, drops. |
 | 4 | **Packets** | Live capture with real L7 decode, TLS 1.3 decryption, JA4, per-flow stream tracking, filters, PCAP export. |
 | 5 | **Stats** | Protocol breakdown by bytes + TCP handshake-timing histogram. |

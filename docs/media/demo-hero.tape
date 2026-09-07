@@ -49,12 +49,18 @@
 
 #   - THE FONT IS 11, NOT THE 14 THE OTHER TAPES USE, and that is a size
 #     decision rather than a taste one. Dense's floor sets the character grid,
-#     so the only way to spend fewer pixels on it is a smaller cell: 1035x745
-#     carries 141x47 in fewer pixels than 1250x935 spends on 133x47, and lands
-#     near the 880px the README renders it at, so the browser barely resamples
-#     it. At FontSize 14 this recording is 15 MB. 141 columns rather than the
-#     135 that 990px gives: below ~140 the tab bar truncates `0 egress` to
-#     `0 e`, which is a visible blemish on the frame a reader sees first.
+#     so the only way to spend fewer pixels on it is a smaller cell: 1100x745
+#     carries 150x47 in fewer pixels than 1250x935 spends on 133x47. At
+#     FontSize 14 this recording is 15 MB.
+#
+#     THE COLUMN COUNT IS LOAD-BEARING TWICE OVER, in opposite directions:
+#       - Below ~140 the tab bar truncates `0 egress` to `0 egr`, which reads
+#         as a broken render on the very first frame.
+#       - At exactly 141 the Dashboard puts `interfaces` beside `connections`
+#         (v0.30.1), and connections is then narrow enough to truncate half its
+#         process names — `Socket T`, `isc-net-`, `unattrib`. Honest, ugly.
+#     150 clears both: the tab bar is whole and the side-by-side layout has
+#     room. Re-check this if the Dashboard's panel split moves again.
 #
 #   - TRAFFIC MUST START AFTER CAPTURE or REMOTE/HOST reads back raw IPs: the
 #     name comes from the ClientHello's SNI, and a handshake that predates
@@ -116,7 +122,7 @@ Output docs/media/demo-hero.gif
 
 Set Shell "bash"
 Set FontSize 11
-Set Width 1035
+Set Width 1100
 Set Height 745
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 30ms
