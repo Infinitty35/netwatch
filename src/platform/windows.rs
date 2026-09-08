@@ -116,6 +116,8 @@ fn collect_stats_netstat() -> Result<HashMap<String, InterfaceStats>> {
             tx_errors,
             rx_drops,
             tx_drops,
+            signal_dbm: None,
+            tx_retries: None,
         },
     );
 
