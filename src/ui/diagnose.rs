@@ -1226,7 +1226,7 @@ mod tests {
         assert!(s.contains("baselines"), "{s}");
         assert!(s.contains("ruleset"), "{s}");
         assert!(
-            s.contains("planned"),
+            s.contains("all active"),
             "coverage must be stated honestly:\n{s}"
         );
     }

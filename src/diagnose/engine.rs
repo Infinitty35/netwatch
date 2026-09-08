@@ -591,6 +591,16 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         }
         m.insert("dns.failure_rate".to_string(), dns.failure_rate_pct);
         m.insert("dns.tc_rate".to_string(), dns.truncation_rate_pct);
+        if let Some(c) = &dns.cross {
+            // A private answer is a total mismatch, whatever the history
+            // says — the verify condition must not clear while it persists.
+            let v = if c.private_answer {
+                100.0
+            } else {
+                c.mismatch_pct
+            };
+            m.insert("dns.answer_mismatch".to_string(), v);
+        }
     }
     if let Some(gw) = &obs.gateway {
         m.insert("gateway.loss".to_string(), gw.loss_pct);
@@ -610,6 +620,18 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         if let Some(u) = iface.utilisation_pct() {
             m.insert("iface.utilisation".to_string(), u);
         }
+        if let Some(s) = iface.signal_dbm {
+            m.insert("wifi.rssi".to_string(), s as f64);
+        }
+        if let Some(r) = iface.tx_retry_pct {
+            m.insert("wifi.tx_retry_pct".to_string(), r);
+        }
+    }
+    if let Some(nat) = &obs.nat {
+        m.insert(
+            "nat.symmetric".to_string(),
+            if nat.symmetric { 1.0 } else { 0.0 },
+        );
     }
     if let (Some(idle), Some(loaded)) = (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
         m.insert("tcp.loaded_rtt_delta".to_string(), loaded - idle);
@@ -666,6 +688,7 @@ mod tests {
             icmp_rtt_ms: Some(0.1),
             cached_rtt_ms: Some(0.9),
             window_secs: 180,
+            cross: None,
         }
     }
 

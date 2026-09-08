@@ -45,6 +45,8 @@ fn parse_netstat_output(text: &str) -> HashMap<String, InterfaceStats> {
                 tx_errors,
                 rx_drops: 0,
                 tx_drops: 0,
+                signal_dbm: None,
+                tx_retries: None,
             },
         );
     }

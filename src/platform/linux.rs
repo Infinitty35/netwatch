@@ -4,9 +4,45 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Signal level and retry counter per wireless interface, from
+/// `/proc/net/wireless`.
+///
+/// The file has one row per 802.11 device: `iface: status link level noise
+/// nwid crypt frag retry misc beacon`. `level` is dBm on every driver that
+/// matters now (mac80211 reports it signed); a positive value is a legacy
+/// percentage and is dropped rather than reported as +60 dBm.
+pub fn collect_wireless_stats() -> HashMap<String, (Option<i32>, u64)> {
+    fs::read_to_string("/proc/net/wireless")
+        .map(|t| parse_wireless(&t))
+        .unwrap_or_default()
+}
+
+fn parse_wireless(text: &str) -> HashMap<String, (Option<i32>, u64)> {
+    let mut out = HashMap::new();
+    for line in text.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let cols: Vec<&str> = rest.split_whitespace().collect();
+        if cols.len() < 8 {
+            continue;
+        }
+        let level = cols[2]
+            .trim_end_matches('.')
+            .parse::<f64>()
+            .ok()
+            .map(|v| v as i32)
+            .filter(|v| *v < 0);
+        let retry = cols[7].parse::<u64>().unwrap_or(0);
+        out.insert(name.trim().to_string(), (level, retry));
+    }
+    out
+}
+
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     let mut stats = HashMap::new();
     let net_dir = Path::new("/sys/class/net");
+    let wireless = collect_wireless_stats();
 
     for entry in fs::read_dir(net_dir)? {
         let entry = entry?;
@@ -21,6 +57,7 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
                 .unwrap_or(0)
         };
 
+        let wifi = wireless.get(&name).copied();
         stats.insert(
             name.clone(),
             InterfaceStats {
@@ -33,6 +70,8 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
                 tx_errors: read("tx_errors"),
                 rx_drops: read("rx_dropped"),
                 tx_drops: read("tx_dropped"),
+                signal_dbm: wifi.and_then(|w| w.0),
+                tx_retries: wifi.map(|w| w.1),
             },
         );
     }
@@ -187,5 +226,24 @@ mod tests {
     fn default_route_dev_none_when_dev_missing() {
         // Malformed / unexpected line: "default" but no dev token.
         assert_eq!(parse_default_route_dev("default via 192.168.1.1\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod wireless_tests {
+    use super::*;
+
+    #[test]
+    fn proc_net_wireless_yields_level_and_retries() {
+        let text =
+            "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n\
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n\
+ wlan0: 0000   54.  -56.  -256        0      0      0   1234      0        0\n\
+ wlan1: 0000   70.   70.  -256        0      0      0      7      0        0\n";
+        let m = parse_wireless(text);
+        assert_eq!(m["wlan0"], (Some(-56), 1234));
+        // A positive level is a legacy percentage, not dBm.
+        assert_eq!(m["wlan1"], (None, 7));
+        assert!(parse_wireless("").is_empty());
     }
 }

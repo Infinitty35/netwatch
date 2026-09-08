@@ -4,6 +4,24 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.3] - 2026-09-08
+
+### Added
+- **All 25 Diagnose rules are active.** The four that shipped `Planned` now
+  have their inputs:
+  - `dns.truncation_retry` — the DNS probe decodes reply flags, so TC and
+    SERVFAIL are counted rather than folded into "answered".
+  - `dns.hijack_suspect` — each probe cycle also asks the configured resolver
+    and a validating reference (1.1.1.1, DO bit set) for `dns.google`, a name
+    with the same answer everywhere. A private address for a public name, or
+    disagreement on most cycles, opens the issue.
+  - `wifi.weak_signal` — signal level and transmit retries from
+    `/proc/net/wireless` on Linux; other platforms report none, so the rule
+    stays quiet there rather than guessing.
+  - `nat.symmetric` — a STUN Binding Request to two servers from one socket,
+    about once a minute; different public ports means an address-dependent
+    mapping.
+
 ## [0.30.2] - 2026-09-08
 
 ### Added

@@ -1199,6 +1199,19 @@ impl App {
         }
     }
 
+    /// Collapse or expand the Dense conns group under the cursor — from a
+    /// child row as well as the header, like every other tree in netwatch.
+    fn toggle_dense_fold(&mut self) {
+        let Some(process) = crate::ui::dense::selected_conn_group(self) else {
+            return;
+        };
+        if self.ui.dense_collapsed.toggle(&process) {
+            if let Some(idx) = crate::ui::dense::conn_header_index(self, &process) {
+                self.ui.scroll.connection_scroll = idx;
+            }
+        }
+    }
+
     /// Collapse or expand the dashboard connection group under the cursor.
     ///
     /// Works from a child row as well as the header, like the Connections
@@ -2065,8 +2078,16 @@ fn cycle_view(app: &mut App) {
 /// bindings in the box borders, and a binding that isn't written on the screen
 /// may as well not exist. Everything here appears in a footer somewhere.
 fn handle_dense_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
-    let conn_count = app.connection_collector.connections().len();
+    // Rows as drawn — headers plus the children of open groups — so the
+    // cursor cannot run past a folded group into rows nobody is seeing.
+    let conn_count = crate::ui::dense::visible_conn_count(app);
     match key.code {
+        // Space folds here as it does on every other tree; pause is `p`.
+        KeyCode::Enter | KeyCode::Char(' ') => app.toggle_dense_fold(),
+        KeyCode::Char('z') => {
+            app.ui.dense_collapsed.toggle_all();
+            app.ui.scroll.connection_scroll = 0;
+        }
         KeyCode::Char('q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('V') | KeyCode::Char('v') => cycle_view(app),
@@ -2085,7 +2106,7 @@ fn handle_dense_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             };
         }
         KeyCode::Char('?') => app.ui.show_help = true,
-        KeyCode::Char('p') | KeyCode::Char(' ') => app.ui.paused = !app.ui.paused,
+        KeyCode::Char('p') => app.ui.paused = !app.ui.paused,
         KeyCode::Char(',') => {
             app.ui.show_settings = !app.ui.show_settings;
             app.ui.settings_editing = false;
@@ -2952,9 +2973,11 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 if app.user_config.groups_start_collapsed {
                     app.ui.egress_collapsed.collapse_all();
                     app.ui.connection_collapsed.collapse_all();
+                    app.ui.dense_collapsed.collapse_all();
                 } else {
                     app.ui.egress_collapsed.expand_all();
                     app.ui.connection_collapsed.expand_all();
+                    app.ui.dense_collapsed.expand_all();
                 }
                 app.ui.settings_status = Some(format!(
                     "Groups start folded: {}",
@@ -4344,6 +4367,8 @@ mod tests {
             tx_errors: 0,
             rx_drops: 0,
             tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
             rx_history: std::collections::VecDeque::new(),
             tx_history: std::collections::VecDeque::new(),
         }

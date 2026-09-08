@@ -29,6 +29,12 @@ pub struct InterfaceStats {
     pub tx_errors: u64,
     pub rx_drops: u64,
     pub tx_drops: u64,
+    /// Signal level in dBm for an 802.11 interface, where the kernel reports
+    /// one. `None` on wired links and on platforms without a source.
+    pub signal_dbm: Option<i32>,
+    /// Cumulative 802.11 transmit retries, same caveat. A rate is derived
+    /// against `tx_packets` upstream.
+    pub tx_retries: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

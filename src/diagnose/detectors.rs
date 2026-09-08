@@ -42,6 +42,16 @@ pub struct Thresholds {
     /// as a matter of course, and reporting one drop a minute as a fault
     /// trains people to ignore the tab.
     pub iface_drop_floor: f64,
+    /// Share of DNS replies carrying the TC bit before truncation is a
+    /// finding. Some truncation is normal for large answers over UDP.
+    pub dns_tc_pct: f64,
+    /// Share of cross-check cycles whose local answer disagreed with the
+    /// validating reference before the resolver is suspected.
+    pub dns_mismatch_pct: f64,
+    /// Signal level at or below which wifi is weak.
+    pub wifi_rssi_dbm: f64,
+    /// 802.11 transmit retries as a share of transmitted frames.
+    pub wifi_retry_pct: f64,
 }
 
 impl Default for Thresholds {
@@ -56,6 +66,10 @@ impl Default for Thresholds {
             saturation_pct: 90.0,
             iface_error_floor: 1.0,
             iface_drop_floor: 60.0,
+            dns_tc_pct: 10.0,
+            dns_mismatch_pct: 50.0,
+            wifi_rssi_dbm: -70.0,
+            wifi_retry_pct: 20.0,
         }
     }
 }
@@ -203,6 +217,12 @@ pub struct IfaceObs {
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
+    /// The kernel registered this as an 802.11 device.
+    pub wireless: bool,
+    /// Signal level, where the platform reports one.
+    pub signal_dbm: Option<i32>,
+    /// Transmit retries over the last minute as a share of frames sent.
+    pub tx_retry_pct: Option<f64>,
 }
 
 impl IfaceObs {
@@ -234,6 +254,30 @@ pub struct DnsObs {
     /// Cached names still answering fast points at the upstream forwarder.
     pub cached_rtt_ms: Option<f64>,
     pub window_secs: u64,
+    /// The latest answer cross-check against a validating reference.
+    pub cross: Option<DnsCross>,
+}
+
+/// A public name asked of the configured resolver and of a validating
+/// reference, and whether they agreed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DnsCross {
+    pub name: String,
+    pub local: Vec<String>,
+    pub reference_resolver: String,
+    pub reference: Vec<String>,
+    pub validated: bool,
+    pub private_answer: bool,
+    /// Share of recent cycles where the two disagreed.
+    pub mismatch_pct: f64,
+    pub cycles: u32,
+}
+
+/// What STUN said about the NAT in front of us.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NatObs {
+    pub mappings: Vec<(String, String)>,
+    pub symmetric: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -270,6 +314,8 @@ pub struct Observations {
     pub loaded_rtt_ms: Option<f64>,
     /// Set when the http 204 probe came back redirected.
     pub captive_portal_url: Option<String>,
+    /// The STUN mapping probe, when one has run.
+    pub nat: Option<NatObs>,
 }
 
 /// A candidate issue. The engine supplies identity and history.
@@ -317,6 +363,7 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out.extend(detect_paths(obs, base, t));
     out.extend(detect_sockets(obs, t));
     out.extend(detect_bufferbloat_local(obs, t));
+    out.extend(detect_nat(obs));
     out
 }
 
@@ -427,6 +474,78 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             Step::instruct("check for softirq drops", "cat /proc/net/softnet_stat"),
         ];
         out.push(d);
+    }
+
+    if iface.wireless {
+        let weak = matches!(iface.signal_dbm, Some(s) if (s as f64) <= t.wifi_rssi_dbm);
+        let retrying = matches!(iface.tx_retry_pct, Some(r) if r > t.wifi_retry_pct);
+        if weak || retrying {
+            let mut d = Detection::new(
+                "wifi.weak_signal",
+                Subject::Iface {
+                    name: iface.name.clone(),
+                },
+            );
+            if let Some(rssi) = iface.signal_dbm {
+                d.evidence
+                    .push(Evidence::new("wifi.rssi", rssi as f64, "dBm").with_window(1, 1));
+            }
+            if let Some(r) = iface.tx_retry_pct {
+                d.evidence
+                    .push(Evidence::new("wifi.tx_retry_pct", r, "%").with_window(60, 60));
+            }
+            d.causes = vec![
+                Cause::new(
+                    "too far from the access point, or something in the way",
+                    vec![match iface.signal_dbm {
+                        Some(s) if weak => CheckResult::pass(
+                            "signal weak",
+                            format!("{s} dBm, at or below {:.0}", t.wifi_rssi_dbm),
+                        ),
+                        Some(s) => CheckResult::fail("signal weak", format!("{s} dBm is fine")),
+                        None => CheckResult::skipped("signal weak", "no signal level reported"),
+                    }],
+                ),
+                Cause::new(
+                    "a congested channel — retries with a healthy signal",
+                    vec![
+                        match iface.tx_retry_pct {
+                            Some(r) if retrying => CheckResult::pass(
+                                "retries high",
+                                format!("{r:.0}% of frames retried"),
+                            ),
+                            Some(r) => CheckResult::fail(
+                                "retries high",
+                                format!("{r:.0}% of frames retried"),
+                            ),
+                            None => CheckResult::skipped("retries high", "no retry counter"),
+                        },
+                        match iface.signal_dbm {
+                            Some(s) if !weak => {
+                                CheckResult::pass("signal fine", format!("{s} dBm"))
+                            }
+                            Some(s) => CheckResult::fail("signal fine", format!("{s} dBm")),
+                            None => CheckResult::skipped("signal fine", "no signal level"),
+                        },
+                    ],
+                ),
+            ];
+            d.remediation = vec![
+                Step::instruct(
+                    "see the link as the driver does",
+                    format!("iw dev {} link", iface.name),
+                ),
+                Step::instruct(
+                    "move nearer the access point, or onto 5 GHz",
+                    "a wall or a floor costs 10–20 dB; 2.4 GHz shares three usable channels with every neighbour",
+                ),
+                Step::instruct(
+                    "look for a quieter channel",
+                    format!("iw dev {} scan | grep -E 'freq|signal'", iface.name),
+                ),
+            ];
+            out.push(d);
+        }
     }
 
     if let Some(util) = iface.utilisation_pct() {
@@ -633,6 +752,164 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         out.push(d);
         // A resolver that is failing outright makes its latency uninteresting.
         return out;
+    }
+
+    // Truncation: the resolver keeps answering with TC set, which makes
+    // every such lookup a second round trip over TCP — visible as a slow
+    // resolver that the rtt probe, asking a small question, never sees.
+    if dns.queries >= 10 && dns.truncation_rate_pct > t.dns_tc_pct {
+        let mut d = Detection::new(
+            "dns.truncation_retry",
+            Subject::Resolver {
+                addr: dns.resolver.clone(),
+            },
+        );
+        d.evidence.push(
+            Evidence::new("dns.tc_rate", dns.truncation_rate_pct, "%")
+                .with_window(dns.window_secs, dns.queries),
+        );
+        d.causes = vec![
+            Cause::new(
+                "the resolver is not offering EDNS, so anything over 512 bytes truncates",
+                vec![CheckResult::pass(
+                    "truncated replies",
+                    format!("{} of {} replies carried TC", dns.truncated, dns.queries),
+                )],
+            ),
+            Cause::new(
+                "a middlebox strips EDNS or clamps UDP replies",
+                vec![CheckResult::skipped(
+                    "edns through the path",
+                    "not probed — compare a direct query against the resolver's",
+                )],
+            ),
+        ];
+        d.remediation = vec![
+            Step::instruct(
+                "see the truncation from the client's side",
+                format!("dig @{} . NS +noedns | grep -i flags", dns.resolver),
+            ),
+            Step::instruct(
+                "check whether EDNS gets through",
+                format!("dig @{} . NS +bufsize=1232 | grep -i flags", dns.resolver),
+            ),
+            Step::instruct(
+                "use a resolver that speaks EDNS, or forward over TCP",
+                "most stub resolvers retry over TCP on TC; the cost is one extra round trip per lookup",
+            ),
+        ];
+        out.push(d);
+    }
+
+    if let Some(cross) = &dns.cross {
+        let forged = cross.cycles >= 3 && cross.mismatch_pct > t.dns_mismatch_pct;
+        if cross.private_answer || forged {
+            let mut d = Detection::new(
+                "dns.hijack_suspect",
+                Subject::Resolver {
+                    addr: dns.resolver.clone(),
+                },
+            );
+            d.evidence.push(
+                Evidence::new("dns.answer_mismatch", cross.mismatch_pct, "%")
+                    .with_window(dns.window_secs, cross.cycles),
+            );
+            let local = if cross.local.is_empty() {
+                "nothing".to_string()
+            } else {
+                cross.local.join(", ")
+            };
+            let reference = if cross.reference.is_empty() {
+                "no answer".to_string()
+            } else {
+                cross.reference.join(", ")
+            };
+            d.causes = vec![
+                Cause::new(
+                    "a captive portal or interceptor answering for every name",
+                    vec![if cross.private_answer {
+                        CheckResult::pass(
+                            "private answer for a public name",
+                            format!("{} → {local}", cross.name),
+                        )
+                        .weighted(2.0)
+                    } else {
+                        CheckResult::fail(
+                            "private answer for a public name",
+                            format!("{} → {local}", cross.name),
+                        )
+                        .weighted(2.0)
+                    }],
+                ),
+                Cause::new(
+                    "the resolver returns records the validating reference does not",
+                    vec![
+                        if forged {
+                            CheckResult::pass(
+                                "disagrees with reference",
+                                format!(
+                                    "{local} here, {reference} from {}",
+                                    cross.reference_resolver
+                                ),
+                            )
+                            .weighted(2.0)
+                        } else {
+                            CheckResult::fail(
+                                "disagrees with reference",
+                                format!("{local} agrees with {}", cross.reference_resolver),
+                            )
+                            .weighted(2.0)
+                        },
+                        if cross.validated {
+                            CheckResult::pass(
+                                "reference validated",
+                                format!("{} set AD on its answer", cross.reference_resolver),
+                            )
+                        } else {
+                            CheckResult::skipped(
+                                "reference validated",
+                                "reference did not validate the answer",
+                            )
+                        },
+                    ],
+                ),
+                Cause::new(
+                    "split-horizon dns on this network, by design",
+                    vec![if cross.private_answer {
+                        CheckResult::fail(
+                            "public name, public answer",
+                            "a private answer for a public name is not split horizon",
+                        )
+                    } else {
+                        CheckResult::skipped(
+                            "public name, public answer",
+                            "cannot tell an interceptor from an intentional override",
+                        )
+                    }],
+                ),
+            ];
+            d.remediation = vec![
+                Step::instruct(
+                    "compare the two answers yourself",
+                    format!(
+                        "dig @{} {} A +short; dig @{} {} A +short +dnssec",
+                        dns.resolver, cross.name, cross.reference_resolver, cross.name
+                    ),
+                ),
+                Step::instruct(
+                    "if this is a portal, open a browser and sign in",
+                    "portals answer every name with their own address until you do",
+                ),
+                Step::escalate(
+                    "use a validating resolver you trust",
+                    format!(
+                        "resolvectl dns <iface> {} — or DNS over HTTPS in the browser",
+                        cross.reference_resolver
+                    ),
+                ),
+            ];
+            out.push(d);
+        }
     }
 
     let Some(p50) = dns.rtt_p50_ms else {
@@ -1261,6 +1538,51 @@ fn socket_detection(
     Some(d)
 }
 
+// ----------------------------------------------------------------- nat
+
+/// Symmetric NAT: the mapping STUN reports depends on who asked.
+fn detect_nat(obs: &Observations) -> Vec<Detection> {
+    let Some(nat) = &obs.nat else {
+        return vec![];
+    };
+    if !nat.symmetric {
+        return vec![];
+    }
+    let mut d = Detection::new("nat.symmetric", Subject::Host);
+    d.evidence
+        .push(Evidence::new("nat.symmetric", 1.0, "").with_window(60, nat.mappings.len() as u32));
+    let seen = nat
+        .mappings
+        .iter()
+        .map(|(server, mapped)| format!("{mapped} via {server}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    d.causes = vec![
+        Cause::new(
+            "a carrier-grade or enterprise nat with address-dependent mapping",
+            vec![CheckResult::pass("mapping depends on destination", seen)],
+        ),
+        Cause::new(
+            "the router's nat set to symmetric or 'strict'",
+            vec![CheckResult::skipped(
+                "single nat layer",
+                "cannot tell the router from a carrier nat behind it",
+            )],
+        ),
+    ];
+    d.remediation = vec![
+        Step::instruct(
+            "expect peer-to-peer to fall back to relays",
+            "webrtc, voip and games hole-punch through cone nats; a symmetric one needs turn",
+        ),
+        Step::instruct(
+            "check the router for a full-cone or upnp setting",
+            "consumer routers often call it 'nat type' or 'open nat'",
+        ),
+    ];
+    vec![d]
+}
+
 /// Whether a traced path to this peer is losing packets. Tri-state on
 /// purpose: without a trace there is no evidence either way, and reporting
 /// that as a failed check would let an untested cause be "ruled out".
@@ -1355,6 +1677,7 @@ mod tests {
             icmp_rtt_ms: Some(0.1),
             cached_rtt_ms: Some(0.9),
             window_secs: 180,
+            cross: None,
         }
     }
 
@@ -1364,6 +1687,138 @@ mod tests {
             dns: Some(dns),
             ..Default::default()
         }
+    }
+
+    fn rules_of(found: &[Detection]) -> Vec<&str> {
+        found.iter().map(|d| d.rule).collect()
+    }
+
+    #[test]
+    fn truncation_fires_on_a_tc_rate_over_the_floor_and_needs_a_sample_size() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.truncation_rate_pct = 25.0;
+        dns.queries = 40;
+        dns.truncated = 10;
+        let found = detect(&obs_with_dns(dns.clone()), &store(), &Thresholds::default());
+        assert!(
+            rules_of(&found).contains(&"dns.truncation_retry"),
+            "{:?}",
+            rules_of(&found)
+        );
+
+        dns.queries = 4;
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        assert!(
+            !rules_of(&found).contains(&"dns.truncation_retry"),
+            "four replies is not a rate"
+        );
+    }
+
+    #[test]
+    fn hijack_fires_on_a_private_answer_at_once_and_on_disagreement_only_with_history() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        let cross = |private: bool, mismatch_pct: f64, cycles: u32| DnsCross {
+            name: "dns.google".into(),
+            local: vec!["10.0.0.1".into()],
+            reference_resolver: "1.1.1.1".into(),
+            reference: vec!["8.8.8.8".into()],
+            validated: true,
+            private_answer: private,
+            mismatch_pct,
+            cycles,
+        };
+        dns.cross = Some(cross(true, 100.0, 1));
+        let found = detect(&obs_with_dns(dns.clone()), &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.hijack_suspect")
+            .expect("portal answer");
+        assert_eq!(
+            d.causes[0].label,
+            "a captive portal or interceptor answering for every name"
+        );
+
+        dns.cross = Some(cross(false, 100.0, 1));
+        let found = detect(&obs_with_dns(dns.clone()), &store(), &Thresholds::default());
+        assert!(
+            !rules_of(&found).contains(&"dns.hijack_suspect"),
+            "one cycle is not a pattern"
+        );
+
+        dns.cross = Some(cross(false, 100.0, 5));
+        let found = detect(&obs_with_dns(dns.clone()), &store(), &Thresholds::default());
+        assert!(rules_of(&found).contains(&"dns.hijack_suspect"));
+
+        dns.cross = Some(cross(false, 0.0, 50));
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        assert!(
+            !rules_of(&found).contains(&"dns.hijack_suspect"),
+            "agreement is not a finding"
+        );
+    }
+
+    #[test]
+    fn weak_wifi_fires_on_signal_or_retries_and_only_on_wireless() {
+        let iface = |wireless: bool, signal: Option<i32>, retry: Option<f64>| IfaceObs {
+            name: "wlan0".into(),
+            carrier: true,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_dropped: 0,
+            tx_dropped: 0,
+            errors_per_min: 0,
+            drops_per_min: 0,
+            link_rate_bps: None,
+            wireless,
+            signal_dbm: signal,
+            tx_retry_pct: retry,
+            rx_bps: 0.0,
+            tx_bps: 0.0,
+        };
+        let obs = |i: IfaceObs| Observations {
+            now: "2026-09-03 06:51:19".into(),
+            iface: Some(i),
+            ..Default::default()
+        };
+        let t = Thresholds::default();
+        let fires =
+            |i: IfaceObs| rules_of(&detect(&obs(i), &store(), &t)).contains(&"wifi.weak_signal");
+        assert!(fires(iface(true, Some(-75), Some(2.0))), "weak signal");
+        assert!(
+            fires(iface(true, Some(-50), Some(35.0))),
+            "retries with a fine signal"
+        );
+        assert!(!fires(iface(true, Some(-50), Some(2.0))), "healthy");
+        assert!(!fires(iface(true, None, None)), "no wireless statistics");
+        assert!(!fires(iface(false, Some(-90), Some(90.0))), "not wireless");
+    }
+
+    #[test]
+    fn symmetric_nat_fires_only_when_the_mapping_differs() {
+        let obs = |symmetric: bool| Observations {
+            now: "2026-09-03 06:51:19".into(),
+            nat: Some(NatObs {
+                mappings: vec![
+                    ("stun.a".into(), "203.0.113.9:51234".into()),
+                    (
+                        "stun.b".into(),
+                        if symmetric {
+                            "203.0.113.9:51240"
+                        } else {
+                            "203.0.113.9:51234"
+                        }
+                        .into(),
+                    ),
+                ],
+                symmetric,
+            }),
+            ..Default::default()
+        };
+        let t = Thresholds::default();
+        assert!(rules_of(&detect(&obs(true), &store(), &t)).contains(&"nat.symmetric"));
+        assert!(!rules_of(&detect(&obs(false), &store(), &t)).contains(&"nat.symmetric"));
     }
 
     #[test]
@@ -1846,6 +2301,9 @@ mod tests {
                 errors_per_min: 40,
                 drops_per_min: 12,
                 link_rate_bps: Some(1e9),
+                wireless: false,
+                signal_dbm: None,
+                tx_retry_pct: None,
                 rx_bps: 0.0,
                 tx_bps: 0.0,
             }),

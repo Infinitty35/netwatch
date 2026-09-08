@@ -728,6 +728,10 @@ mod tests {
             gateway_rtt_history: VecDeque::new(),
             dns_rtt_history: VecDeque::new(),
             internet_rtt_history: VecDeque::new(),
+            dns_probe_history: VecDeque::new(),
+            dns_cross: None,
+            dns_cross_history: VecDeque::new(),
+            nat: None,
         }
     }
 
@@ -744,6 +748,8 @@ mod tests {
             tx_errors: 0,
             rx_drops: 0,
             tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
         }

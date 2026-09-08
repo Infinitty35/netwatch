@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use super::baseline::{BaselineStore, NetworkFingerprint};
 use super::detectors::{
-    classify_socket, DnsObs, GatewayObs, HopObs, IfaceObs, Observations, PathObs, SocketObs,
-    SocketVerdict, Thresholds,
+    classify_socket, DnsCross, DnsObs, GatewayObs, HopObs, IfaceObs, NatObs, Observations, PathObs,
+    SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
 
@@ -47,6 +47,9 @@ pub struct LiveSampler {
     iface_history: HashMap<String, IfaceCounters>,
     /// Target → the last trace we saw, for the path diff.
     prev_path: HashMap<String, Vec<HopObs>>,
+    /// Interface name → the last minute of (tx retries, tx packets) deltas,
+    /// for the wifi retry rate. Same shape as `iface_history`.
+    wifi_history: HashMap<String, IfaceCounters>,
 }
 
 /// A rolling one-minute window of interface counter deltas.
@@ -171,6 +174,7 @@ impl LiveSampler {
             idle_rtt_ms: None,
             loaded_rtt_ms: None,
             captive_portal_url: None,
+            nat: nat(app),
         }
     }
 
@@ -189,6 +193,22 @@ impl LiveSampler {
             .or_insert_with(|| IfaceCounters::new(errors, drops))
             .observe(errors, drops);
 
+        let wireless = info.and_then(|i| i.is_wireless).unwrap_or(false);
+        // Retries as a share of frames sent over the same minute. Both are
+        // lifetime counters, so the rate is delta over delta.
+        let tx_retry_pct = t.tx_retries.map(|retries| {
+            let (d_retries, d_packets) = self
+                .wifi_history
+                .entry(t.name.clone())
+                .or_insert_with(|| IfaceCounters::new(retries, t.tx_packets))
+                .observe(retries, t.tx_packets);
+            if d_packets == 0 {
+                0.0
+            } else {
+                d_retries as f64 / d_packets as f64 * 100.0
+            }
+        });
+
         Some(IfaceObs {
             name: t.name.clone(),
             carrier: info.map(|i| i.is_up).unwrap_or(true),
@@ -201,6 +221,9 @@ impl LiveSampler {
             // Link rate isn't collected yet, so the saturation rule stays
             // dormant rather than guessing at 1Gb and crying wolf on wifi.
             link_rate_bps: None,
+            wireless,
+            signal_dbm: t.signal_dbm,
+            tx_retry_pct,
             rx_bps: t.rx_rate,
             tx_bps: t.tx_rate,
         })
@@ -343,19 +366,55 @@ fn dns(app: &App) -> Option<DnsObs> {
     // constant moved.
     let window_secs = health.dns_rtt_history.len() as u64 * crate::app::HEALTH_PROBE_TICKS as u64;
 
+    // Reply flags across the window: every reply the probe decoded, and how
+    // many of them were truncated.
+    let replies: u32 = health
+        .dns_probe_history
+        .iter()
+        .map(|p| p.replies as u32)
+        .sum();
+    let truncated: u32 = health
+        .dns_probe_history
+        .iter()
+        .map(|p| p.truncated as u32)
+        .sum();
+    let truncation_rate_pct = if replies == 0 {
+        0.0
+    } else {
+        truncated as f64 / replies as f64 * 100.0
+    };
+    let cross = health.dns_cross.as_ref().map(|c| {
+        let cycles = health.dns_cross_history.len() as u32;
+        let disagreed = health.dns_cross_history.iter().filter(|b| **b).count();
+        DnsCross {
+            name: c.name.clone(),
+            local: c.local.iter().map(|ip| ip.to_string()).collect(),
+            reference_resolver: c.reference_resolver.clone(),
+            reference: c.reference.iter().map(|ip| ip.to_string()).collect(),
+            validated: c.validated,
+            private_answer: c.private_answer,
+            mismatch_pct: if cycles == 0 {
+                0.0
+            } else {
+                disagreed as f64 / cycles as f64 * 100.0
+            },
+            cycles,
+        }
+    });
+
     Some(DnsObs {
         resolver,
         rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
         rtt_p95_ms: percentile(&samples, 0.95),
         failure_rate_pct: health.dns_loss_pct,
-        truncation_rate_pct: 0.0,
-        queries: samples.len() as u32,
+        truncation_rate_pct,
+        queries: replies.max(samples.len() as u32),
         failed: health
             .dns_rtt_history
             .iter()
             .filter(|s| s.is_none())
             .count() as u32,
-        truncated: 0,
+        truncated,
         // netwatch probes one resolver today. The alternate-resolver check is
         // the strongest discriminator the DNS rule has, so this is the first
         // thing the pipeline should add; until then it reports "not run".
@@ -364,6 +423,15 @@ fn dns(app: &App) -> Option<DnsObs> {
         icmp_rtt_ms: None,
         cached_rtt_ms: None,
         window_secs,
+        cross,
+    })
+}
+
+fn nat(app: &App) -> Option<NatObs> {
+    let health = app.health_prober.status();
+    health.nat.as_ref().map(|n| NatObs {
+        mappings: n.mappings.clone(),
+        symmetric: n.symmetric,
     })
 }
 

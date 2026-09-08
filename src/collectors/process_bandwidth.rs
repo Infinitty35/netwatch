@@ -311,6 +311,8 @@ mod tests {
             tx_errors: 0,
             rx_drops: 0,
             tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
         }

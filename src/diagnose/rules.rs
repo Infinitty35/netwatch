@@ -69,19 +69,18 @@ pub const CATALOGUE: &[Rule] = &[
         title: "dns replies truncating",
         category: "dns",
         severity: Severity::Info,
-        trigger: "more than 10% of replies carry the TC bit",
+        trigger: "more than 10% of probe replies carry the TC bit",
         suppresses: &[],
-        status: RuleStatus::Planned("needs per-reply DNS flag decoding"),
+        status: RuleStatus::Active,
     },
     Rule {
         id: "dns.hijack_suspect",
         title: "dns answers disagree",
         category: "dns",
         severity: Severity::High,
-        trigger:
-            "dhcp resolver and validating reference disagree, or private answers for public names",
+        trigger: "a private address for a public name, or disagreement with a validating reference on most cycles",
         suppresses: &[],
-        status: RuleStatus::Planned("needs a DNSSEC-validating reference query"),
+        status: RuleStatus::Active,
     },
     // ------------------------------------------------------- gateway / link
     Rule {
@@ -143,9 +142,9 @@ pub const CATALOGUE: &[Rule] = &[
         title: "weak wifi signal",
         category: "link",
         severity: Severity::Medium,
-        trigger: "rssi below −70 dBm or tx retries above 20%",
+        trigger: "signal at or below −70 dBm, or more than 20% of frames retried over a minute",
         suppresses: &[],
-        status: RuleStatus::Planned("needs per-interface wireless statistics"),
+        status: RuleStatus::Active,
     },
     // --------------------------------------------------------------- path
     Rule {
@@ -248,9 +247,9 @@ pub const CATALOGUE: &[Rule] = &[
         title: "symmetric nat",
         category: "nat",
         severity: Severity::Info,
-        trigger: "stun reports an address-dependent mapping",
+        trigger: "two stun servers see different public ports from one socket",
         suppresses: &[],
-        status: RuleStatus::Planned("needs a STUN probe"),
+        status: RuleStatus::Active,
     },
     Rule {
         id: "ipv6.broken",
@@ -507,6 +506,9 @@ mod tests {
         }
     }
 
+    /// Every rule now has an input. The label must say so rather than keep
+    /// a split that no longer exists; if a rule is ever added as `Planned`
+    /// again, the label goes back to stating the count and this changes.
     #[test]
     fn catalogue_label_reports_the_active_split_honestly() {
         let label = catalogue_label();
@@ -514,11 +516,8 @@ mod tests {
             label.starts_with(&format!("{} rules", CATALOGUE.len())),
             "{label}"
         );
-        assert!(
-            active_count() < CATALOGUE.len(),
-            "if every rule became active, update this test and the label"
-        );
-        assert!(label.contains("planned"), "{label}");
+        assert_eq!(active_count(), CATALOGUE.len(), "{label}");
+        assert!(label.ends_with("all active"), "{label}");
     }
 
     #[test]

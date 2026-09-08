@@ -24,6 +24,8 @@ pub struct InterfaceTraffic {
     pub tx_errors: u64,
     pub rx_drops: u64,
     pub tx_drops: u64,
+    pub signal_dbm: Option<i32>,
+    pub tx_retries: Option<u64>,
     pub rx_history: VecDeque<u64>,
     pub tx_history: VecDeque<u64>,
 }
@@ -158,6 +160,8 @@ impl TrafficCollector {
                     tx_errors: cur.tx_errors,
                     rx_drops: cur.rx_drops,
                     tx_drops: cur.tx_drops,
+                    signal_dbm: cur.signal_dbm,
+                    tx_retries: cur.tx_retries,
                     rx_history: rx_hist,
                     tx_history: tx_hist,
                 });
@@ -206,6 +210,8 @@ mod tests {
             tx_errors: 0,
             rx_drops: 0,
             tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
         }]);

@@ -114,6 +114,9 @@ fn healthy_iface() -> IfaceObs {
         errors_per_min: 0,
         drops_per_min: 0,
         link_rate_bps: Some(1e9),
+        wireless: false,
+        signal_dbm: None,
+        tx_retry_pct: None,
         rx_bps: 3.1e6,
         tx_bps: 2.6e6,
     }
@@ -145,6 +148,7 @@ fn slow_dns() -> DnsObs {
         icmp_rtt_ms: Some(0.1),
         cached_rtt_ms: Some(0.9),
         window_secs: 189,
+        cross: None,
     }
 }
 
@@ -225,6 +229,7 @@ pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observat
         idle_rtt_ms: Some(12.0),
         loaded_rtt_ms: Some(18.0),
         captive_portal_url: None,
+        nat: None,
     }
 }
 

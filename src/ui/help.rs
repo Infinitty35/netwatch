@@ -110,7 +110,7 @@ fn build_dense_help_lines(theme: &Theme) -> Vec<Line<'static>> {
         "Esc",
         "Restore the grid, then back to the full view",
     ));
-    lines.push(key_line(theme, "p / Space", "Pause/resume"));
+    lines.push(key_line(theme, "p", "Pause/resume"));
     lines.push(key_line(theme, ",", "Settings"));
     lines.push(key_line(theme, "?", "Toggle this overlay"));
     lines.push(Line::from(""));
@@ -119,6 +119,12 @@ fn build_dense_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(theme, "↑ / k", "Select the previous connection"));
     lines.push(key_line(theme, "↓ / j", "Select the next connection"));
     lines.push(key_line(theme, "Home / End", "First / last connection"));
+    lines.push(key_line(
+        theme,
+        "space / Enter",
+        "Fold/expand the process under the cursor",
+    ));
+    lines.push(key_line(theme, "z", "Fold/expand every process"));
     lines.push(Line::from(""));
 
     lines.push(section_header(theme, "READING THE SCREEN"));

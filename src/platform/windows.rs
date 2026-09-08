@@ -56,6 +56,8 @@ fn collect_stats_powershell() -> Result<HashMap<String, InterfaceStats>> {
                 tx_errors: adapter["OutboundPacketErrors"].as_u64().unwrap_or(0),
                 rx_drops: adapter["ReceivedDiscards"].as_u64().unwrap_or(0),
                 tx_drops: adapter["OutboundDiscards"].as_u64().unwrap_or(0),
+                signal_dbm: None,
+                tx_retries: None,
             },
         );
     }

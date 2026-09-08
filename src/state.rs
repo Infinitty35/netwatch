@@ -127,6 +127,10 @@ pub struct AppUiState {
     pub lite: LiteState,
     /// Which Dense box fills the screen, if any. Its number key toggles it.
     pub dense_zoom: Option<crate::ui::dense::DenseBox>,
+    /// Which process groups are folded in the Dense conns box. Its own
+    /// state, like the Dashboard's: the Connections tab's is keyed by a
+    /// remote host half the time.
+    pub dense_collapsed: crate::ui::tree::FoldState,
     pub scroll: UiScrollState,
     pub sort_states: HashMap<Tab, TabSortState>,
     pub sort_picker: SortPickerState,
@@ -239,6 +243,7 @@ impl AppUiState {
             view_mode: ViewMode::by_name(&cfg.view),
             lite: LiteState::default(),
             dense_zoom: None,
+            dense_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             scroll: UiScrollState::default(),
             sort_states: default_sort_states(),
             sort_picker: SortPickerState::default(),

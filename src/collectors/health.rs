@@ -1,7 +1,7 @@
 use crate::app::{safe_read, safe_write};
 use std::collections::VecDeque;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -27,7 +27,71 @@ pub struct HealthStatus {
     pub gateway_rtt_history: VecDeque<Option<f64>>,
     pub dns_rtt_history: VecDeque<Option<f64>>,
     pub internet_rtt_history: VecDeque<Option<f64>>,
+    /// Per-cycle reply flags from the DNS probe, one entry per probe cycle.
+    /// The RTT series says whether the resolver answered; this says *what*
+    /// it answered — a truncated reply or a SERVFAIL is a reply.
+    pub dns_probe_history: VecDeque<DnsProbe>,
+    /// The latest answer cross-check, and whether each past cycle's local
+    /// answer disagreed with the validating reference.
+    pub dns_cross: Option<DnsCrossCheck>,
+    pub dns_cross_history: VecDeque<bool>,
+    /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
+    pub nat: Option<NatProbe>,
 }
+
+/// Reply flags for one DNS probe cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnsProbe {
+    pub replies: u8,
+    pub truncated: u8,
+    pub servfail: u8,
+}
+
+/// One name asked of the configured resolver and of a validating reference.
+///
+/// The name is chosen for a stable answer set (`dns.google` → 8.8.8.8 and
+/// 8.8.4.4 everywhere), so a disagreement is not a CDN handing out the
+/// nearest POP; it is the local resolver saying something the reference
+/// does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsCrossCheck {
+    pub name: String,
+    pub local: Vec<std::net::Ipv4Addr>,
+    pub reference_resolver: String,
+    pub reference: Vec<std::net::Ipv4Addr>,
+    /// The reference set the AD bit: its answer was DNSSEC-validated.
+    pub validated: bool,
+    /// The local resolver answered a public name with a private, loopback,
+    /// link-local or CGNAT address — the signature of a portal or an
+    /// interceptor, whatever the reference says.
+    pub private_answer: bool,
+    /// Local and reference answer sets share no address.
+    pub mismatch: bool,
+}
+
+/// What two STUN servers said our address was, asked from one socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NatProbe {
+    /// `(server, mapped address)` for each server that answered.
+    pub mappings: Vec<(String, String)>,
+    /// The mapping depended on the destination: a different public port for
+    /// each server, from the same local socket. That is a symmetric NAT, and
+    /// it is why hole-punching fails behind it.
+    pub symmetric: bool,
+}
+
+/// Reference resolver for the answer cross-check. Asked with the DO bit so a
+/// validated answer comes back with AD set.
+pub const REFERENCE_RESOLVER: &str = "1.1.1.1";
+/// A public name whose answer set is the same from every vantage point.
+pub const CROSS_CHECK_NAME: &str = "dns.google";
+/// Two STUN servers on different addresses, so a destination-dependent
+/// mapping has something to depend on.
+pub const STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+/// STUN runs once in this many probe cycles — about a minute at defaults.
+/// NAT mappings do not change from second to second, and two UDP packets a
+/// minute to public servers is the whole cost.
+pub const STUN_EVERY: u32 = 12;
 
 /// Fixed target for the internet reachability probe.
 ///
@@ -44,6 +108,9 @@ pub struct HealthProber {
     /// lock so renders never block on an in-flight ping.
     snapshot: Arc<RwLock<Arc<HealthStatus>>>,
     busy: Arc<AtomicBool>,
+    /// Probe cycles so far, for the checks that run less often than every
+    /// cycle.
+    cycles: Arc<AtomicU32>,
 }
 
 impl Default for HealthProber {
@@ -65,8 +132,13 @@ impl HealthProber {
                 gateway_rtt_history: VecDeque::new(),
                 dns_rtt_history: VecDeque::new(),
                 internet_rtt_history: VecDeque::new(),
+                dns_probe_history: VecDeque::new(),
+                dns_cross: None,
+                dns_cross_history: VecDeque::new(),
+                nat: None,
             }))),
             busy: Arc::new(AtomicBool::new(false)),
+            cycles: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -85,6 +157,7 @@ impl HealthProber {
         let snapshot = Arc::clone(&self.snapshot);
         let gw = gateway.map(|s| s.to_string());
         let dns = dns_server.map(|s| s.to_string());
+        let cycle = self.cycles.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             // Each probe block builds a new HealthStatus off the latest
             // published snapshot, then swaps it in. The deep-clone is cheap:
@@ -109,7 +182,10 @@ impl HealthProber {
                 // on Linux hosts where `net.ipv4.ping_group_range = 1 0`
                 // and the sandbox has dropped CAP_NET_RAW, even though UDP
                 // queries to port 53 work fine.
-                let (rtt, loss) = run_dns_query(dns);
+                let (rtt, loss, flags) = run_dns_query(dns);
+                // Same cycle, same resolver: what does it say a public name
+                // resolves to, against a reference that validates?
+                let cross = run_dns_cross_check(dns);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_dns")).clone();
                 next.dns_rtt_ms = rtt;
                 next.dns_loss_pct = loss;
@@ -118,7 +194,26 @@ impl HealthProber {
                     next.dns_rtt_history.pop_front();
                 }
                 next.dns_rtt_history.make_contiguous();
+                next.dns_probe_history.push_back(flags);
+                if next.dns_probe_history.len() > RTT_HISTORY_MAX {
+                    next.dns_probe_history.pop_front();
+                }
+                if let Some(c) = &cross {
+                    next.dns_cross_history
+                        .push_back(c.mismatch || c.private_answer);
+                    if next.dns_cross_history.len() > RTT_HISTORY_MAX {
+                        next.dns_cross_history.pop_front();
+                    }
+                }
+                next.dns_cross = cross;
                 *safe_write(&snapshot, "health::probe::publish_dns") = Arc::new(next);
+            }
+            if cycle.is_multiple_of(STUN_EVERY) {
+                if let Some(nat) = run_stun_probe() {
+                    let mut next = (**safe_read(&snapshot, "health::probe::read_nat")).clone();
+                    next.nat = Some(nat);
+                    *safe_write(&snapshot, "health::probe::publish_nat") = Arc::new(next);
+                }
             }
             {
                 // Same ICMP-then-TCP shape as the gateway probe: on hosts
@@ -249,73 +344,141 @@ fn run_tcp_probe_port(addr: std::net::IpAddr, port: u16) -> (Option<f64>, f64) {
     (avg, loss)
 }
 
-/// Probe a DNS server by sending a real DNS query over UDP/53 and timing
-/// the response. Returns the same `(avg_rtt_ms, loss_pct)` shape as
-/// [`run_ping`] so the Health widget consumes both the same way.
+/// One decoded DNS reply: the header bits the rules read, plus any A records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsReply {
+    id: u16,
+    truncated: bool,
+    /// Authentic Data — the resolver validated the answer with DNSSEC.
+    authentic: bool,
+    rcode: u8,
+    answers: Vec<std::net::Ipv4Addr>,
+}
+
+const RCODE_SERVFAIL: u8 = 2;
+
+/// Parse the header and walk the sections for A records.
 ///
-/// Why a DNS query instead of ICMP:
-/// - Many resolvers don't respond to ICMP echo (cloud LBs, hardened
-///   routers) but happily answer DNS — ICMP loss has no correlation with
-///   DNS health for those targets.
-/// - Linux with `net.ipv4.ping_group_range = 1 0` blocks unprivileged
-///   SOCK_DGRAM ICMP. Combined with netwatch's sandbox dropping
-///   CAP_NET_RAW and Landlock setting NO_NEW_PRIVS (which makes the
-///   kernel ignore the file-cap on `/usr/bin/ping`), ICMP probes are
-///   silently impossible for some users. UDP/53 is unprivileged.
-/// - It tests the thing that actually matters — DNS resolution — rather
-///   than a proxy for it.
-fn run_dns_query(server: &str) -> (Option<f64>, f64) {
-    use std::net::{IpAddr, SocketAddr, UdpSocket};
-    use std::time::{Duration, Instant};
+/// Names are skipped, not decoded — a compression pointer is two bytes and
+/// ends the name, a label is its length plus one. Anything malformed returns
+/// `None` and counts as no reply, which is the safe way to be wrong here.
+fn parse_dns_reply(buf: &[u8]) -> Option<DnsReply> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut reply = DnsReply {
+        id,
+        truncated: flags & 0x0200 != 0,
+        authentic: flags & 0x0020 != 0,
+        rcode: (flags & 0x000f) as u8,
+        answers: Vec::new(),
+    };
+    let skip_name = |mut i: usize| -> Option<usize> {
+        loop {
+            let len = *buf.get(i)?;
+            if len == 0 {
+                return Some(i + 1);
+            }
+            if len & 0xc0 == 0xc0 {
+                return Some(i + 2);
+            }
+            i += 1 + len as usize;
+        }
+    };
+    let mut i = 12;
+    for _ in 0..qd {
+        i = skip_name(i)? + 4;
+    }
+    for _ in 0..an {
+        i = skip_name(i)?;
+        let rtype = u16::from_be_bytes([*buf.get(i)?, *buf.get(i + 1)?]);
+        let rdlen = u16::from_be_bytes([*buf.get(i + 8)?, *buf.get(i + 9)?]) as usize;
+        let rdata = buf.get(i + 10..i + 10 + rdlen)?;
+        if rtype == 1 && rdlen == 4 {
+            reply.answers.push(std::net::Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3],
+            ));
+        }
+        i += 10 + rdlen;
+    }
+    Some(reply)
+}
+
+/// Send one query and wait up to a second for the reply that matches its id.
+fn dns_exchange(
+    sock: &std::net::UdpSocket,
+    dest: std::net::SocketAddr,
+    query: &[u8],
+    id: u16,
+) -> Option<(DnsReply, f64)> {
+    let send_t = std::time::Instant::now();
+    sock.send_to(query, dest).ok()?;
+    let mut buf = [0u8; 1232];
+    // Stale replies from an earlier probe can land in the same socket; keep
+    // reading until the id matches or the timeout does its job.
+    loop {
+        let (n, _src) = sock.recv_from(&mut buf).ok()?;
+        if let Some(reply) = parse_dns_reply(&buf[..n]) {
+            if reply.id == id {
+                return Some((reply, send_t.elapsed().as_secs_f64() * 1000.0));
+            }
+        }
+    }
+}
+
+fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> {
+    let bind_addr = match addr {
+        std::net::IpAddr::V4(_) => "0.0.0.0:0",
+        std::net::IpAddr::V6(_) => "[::]:0",
+    };
+    let sock = std::net::UdpSocket::bind(bind_addr).ok()?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .ok()?;
+    Some(sock)
+}
+
+/// The reachability probe: three root-NS queries, timed.
+///
+/// Returns the mean rtt, the loss, and the reply flags — a SERVFAIL or a
+/// truncated reply is still a reply for reachability, but the diagnostic
+/// rules want to know it happened.
+fn run_dns_query(server: &str) -> (Option<f64>, f64, DnsProbe) {
+    use std::net::{IpAddr, SocketAddr};
+
+    const PROBES: usize = 3;
+    let lost = |n: usize| (PROBES - n) as f64 / PROBES as f64 * 100.0;
 
     // `IpAddr::parse` rejects IPv6 zone identifiers (e.g. `fe80::1%en0`),
     // which means `primary_dns()` should already have skipped link-local
     // entries upstream. If it didn't (only link-local servers configured),
     // we report 100% loss rather than panic — same as the old ICMP path.
-    let addr: IpAddr = match server.parse() {
-        Ok(a) => a,
-        Err(_) => return (None, 100.0),
+    let Ok(addr) = server.parse::<IpAddr>() else {
+        return (None, 100.0, DnsProbe::default());
     };
-
-    let bind_addr = match addr {
-        IpAddr::V4(_) => "0.0.0.0:0",
-        IpAddr::V6(_) => "[::]:0",
+    let Some(sock) = dns_socket(addr) else {
+        return (None, 100.0, DnsProbe::default());
     };
-    let sock = match UdpSocket::bind(bind_addr) {
-        Ok(s) => s,
-        Err(_) => return (None, 100.0),
-    };
-    if sock.set_read_timeout(Some(Duration::from_secs(1))).is_err() {
-        return (None, 100.0);
-    }
     let dest = SocketAddr::new(addr, 53);
 
-    const PROBES: usize = 3;
     let mut rtts = Vec::with_capacity(PROBES);
-
+    let mut flags = DnsProbe::default();
     for seq in 0..PROBES as u16 {
         // Per-probe IDs let us reject stale replies from earlier probes
         // landing late inside the same socket's recv buffer.
         let id = 0xa6b4u16.wrapping_add(seq);
-        let query = build_dns_query(id);
-
-        let send_t = Instant::now();
-        if sock.send_to(&query, dest).is_err() {
-            continue;
-        }
-
-        let mut buf = [0u8; 512];
-        if let Ok((n, _src)) = sock.recv_from(&mut buf) {
-            // Header is 12 bytes; first 2 are the transaction ID.
-            if n >= 12 {
-                let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
-                // We don't validate RCODE — even a SERVFAIL means the
-                // resolver is reachable and responsive, which is what
-                // the Health widget measures.
-                if resp_id == id {
-                    rtts.push(send_t.elapsed().as_secs_f64() * 1000.0);
-                }
-            }
+        let query = build_dns_query(id, ".", 2, false);
+        if let Some((reply, rtt)) = dns_exchange(&sock, dest, &query, id) {
+            // RCODE is not a failure here — even a SERVFAIL means the
+            // resolver is reachable and responsive, which is what the
+            // Health widget measures. It is recorded for the rules.
+            rtts.push(rtt);
+            flags.replies += 1;
+            flags.truncated += u8::from(reply.truncated);
+            flags.servfail += u8::from(reply.rcode == RCODE_SERVFAIL);
         }
     }
 
@@ -324,25 +487,188 @@ fn run_dns_query(server: &str) -> (Option<f64>, f64) {
     } else {
         Some(rtts.iter().sum::<f64>() / rtts.len() as f64)
     };
-    let loss = (PROBES - rtts.len()) as f64 / PROBES as f64 * 100.0;
-    (avg, loss)
+    (avg, lost(rtts.len()), flags)
 }
 
-/// Minimal DNS query: standard query (RD=1) for the root zone's NS
-/// record. Total payload is 17 bytes — smallest valid query we can send
-/// without depending on any name being resolvable.
-fn build_dns_query(id: u16) -> Vec<u8> {
-    let mut q = Vec::with_capacity(17);
+/// Not a routable public address: RFC 1918, loopback, link-local, CGNAT,
+/// or unspecified. A public name answering with one of these is the mark of
+/// a captive portal or an interceptor.
+pub fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+}
+
+/// Ask the configured resolver and a validating reference the same public
+/// name, and compare.
+fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let local_addr: IpAddr = server.parse().ok()?;
+    let sock = dns_socket(local_addr)?;
+    let local_q = build_dns_query(0x5a11, CROSS_CHECK_NAME, 1, false);
+    let (local_reply, _) = dns_exchange(&sock, SocketAddr::new(local_addr, 53), &local_q, 0x5a11)?;
+
+    let reference_addr: IpAddr = REFERENCE_RESOLVER.parse().ok()?;
+    let ref_sock = dns_socket(reference_addr)?;
+    let ref_q = build_dns_query(0x5a12, CROSS_CHECK_NAME, 1, true);
+    let reference = dns_exchange(
+        &ref_sock,
+        SocketAddr::new(reference_addr, 53),
+        &ref_q,
+        0x5a12,
+    )
+    .map(|(r, _)| r);
+
+    let private_answer = local_reply.answers.iter().any(|ip| is_private_v4(*ip));
+    let (reference_answers, validated) = match &reference {
+        Some(r) => (r.answers.clone(), r.authentic),
+        None => (Vec::new(), false),
+    };
+    // Disagreement needs both sides to have said something. An empty local
+    // answer is a failing resolver (its own rule); an empty reference is a
+    // reference we could not reach, which says nothing about the resolver.
+    let mismatch = !local_reply.answers.is_empty()
+        && !reference_answers.is_empty()
+        && !local_reply
+            .answers
+            .iter()
+            .any(|ip| reference_answers.contains(ip));
+
+    Some(DnsCrossCheck {
+        name: CROSS_CHECK_NAME.to_string(),
+        local: local_reply.answers,
+        reference_resolver: REFERENCE_RESOLVER.to_string(),
+        reference: reference_answers,
+        validated,
+        private_answer,
+        mismatch,
+    })
+}
+
+/// A standard recursive query for `name`/`qtype`. With `dnssec`, an EDNS OPT
+/// record with the DO bit asks the resolver to validate and say so via AD.
+fn build_dns_query(id: u16, name: &str, qtype: u16, dnssec: bool) -> Vec<u8> {
+    let mut q = Vec::with_capacity(64);
     q.extend_from_slice(&id.to_be_bytes()); // transaction id
     q.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD=1
     q.extend_from_slice(&[0x00, 0x01]); // qdcount = 1
     q.extend_from_slice(&[0x00, 0x00]); // ancount = 0
     q.extend_from_slice(&[0x00, 0x00]); // nscount = 0
-    q.extend_from_slice(&[0x00, 0x00]); // arcount = 0
-    q.push(0x00); // qname: root (single null label)
-    q.extend_from_slice(&[0x00, 0x02]); // qtype = NS
+    q.extend_from_slice(&[0x00, u8::from(dnssec)]); // arcount: the OPT record
+    for label in name.split('.').filter(|l| !l.is_empty()) {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0x00); // root
+    q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]); // qclass = IN
+    if dnssec {
+        q.push(0x00); // OPT owner: root
+        q.extend_from_slice(&[0x00, 0x29]); // type OPT
+        q.extend_from_slice(&1232u16.to_be_bytes()); // udp payload size
+        q.extend_from_slice(&[0x00, 0x00, 0x80, 0x00]); // ext rcode/version, DO
+        q.extend_from_slice(&[0x00, 0x00]); // rdlen
+    }
     q
+}
+
+// ── STUN ────────────────────────────────────────────────────────────────────
+
+const STUN_MAGIC: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+
+/// A Binding Request, RFC 5389 §6: type, zero length, cookie, transaction id.
+fn build_stun_binding(txid: [u8; 12]) -> [u8; 20] {
+    let mut m = [0u8; 20];
+    m[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+    m[4..8].copy_from_slice(&STUN_MAGIC);
+    m[8..20].copy_from_slice(&txid);
+    m
+}
+
+/// The mapped address in a Binding Success, from XOR-MAPPED-ADDRESS or the
+/// older MAPPED-ADDRESS. IPv4 only, which is what a NAT is.
+fn parse_stun_mapped(buf: &[u8], txid: [u8; 12]) -> Option<std::net::SocketAddrV4> {
+    if buf.len() < 20 || buf[0..2] != [0x01, 0x01] || buf[4..8] != STUN_MAGIC || buf[8..20] != txid
+    {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let body = buf.get(20..20 + len)?;
+    let mut i = 0;
+    let mut plain = None;
+    while i + 4 <= body.len() {
+        let atype = u16::from_be_bytes([body[i], body[i + 1]]);
+        let alen = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+        let v = body.get(i + 4..i + 4 + alen)?;
+        if alen == 8 && v[1] == 0x01 {
+            let port = u16::from_be_bytes([v[2], v[3]]);
+            let ip = [v[4], v[5], v[6], v[7]];
+            match atype {
+                0x0020 => {
+                    let port = port ^ 0x2112;
+                    let ip = std::net::Ipv4Addr::new(
+                        ip[0] ^ STUN_MAGIC[0],
+                        ip[1] ^ STUN_MAGIC[1],
+                        ip[2] ^ STUN_MAGIC[2],
+                        ip[3] ^ STUN_MAGIC[3],
+                    );
+                    return Some(std::net::SocketAddrV4::new(ip, port));
+                }
+                0x0001 => plain = Some(std::net::SocketAddrV4::new(ip.into(), port)),
+                _ => {}
+            }
+        }
+        // Attributes are padded to four bytes.
+        i += 4 + alen.div_ceil(4) * 4;
+    }
+    plain
+}
+
+/// Ask two STUN servers what our address is, from one socket.
+///
+/// A NAT that hands the same public port to both is endpoint-independent
+/// and hole-punching works through it. One that hands each a different port
+/// is address-dependent — symmetric — and only a relay gets through.
+fn run_stun_probe() -> Option<NatProbe> {
+    use std::net::{ToSocketAddrs, UdpSocket};
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok()?;
+    let mut mappings = Vec::new();
+    for (n, server) in STUN_SERVERS.iter().enumerate() {
+        let Some(dest) = server
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.find(|a| a.is_ipv4()))
+        else {
+            continue;
+        };
+        let mut txid = [0u8; 12];
+        txid[0] = n as u8;
+        txid[1..9].copy_from_slice(&std::process::id().to_be_bytes()[..4].repeat(2)[..8]);
+        let req = build_stun_binding(txid);
+        if sock.send_to(&req, dest).is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        if let Ok((len, _)) = sock.recv_from(&mut buf) {
+            if let Some(mapped) = parse_stun_mapped(&buf[..len], txid) {
+                mappings.push((server.to_string(), mapped.to_string()));
+            }
+        }
+    }
+    if mappings.is_empty() {
+        return None;
+    }
+    let symmetric = mappings.len() >= 2 && mappings.iter().any(|(_, m)| m != &mappings[0].1);
+    Some(NatProbe {
+        mappings,
+        symmetric,
+    })
 }
 
 fn run_ping(target: &str) -> (Option<f64>, f64) {
@@ -711,7 +1037,7 @@ Approximate round trip times in milli-seconds:
 
     #[test]
     fn dns_query_has_correct_header_and_question() {
-        let q = build_dns_query(0xa6b4);
+        let q = build_dns_query(0xa6b4, ".", 2, false);
         // 12-byte header + 1 byte qname + 2 qtype + 2 qclass = 17
         assert_eq!(q.len(), 17);
 
@@ -730,7 +1056,7 @@ Approximate round trip times in milli-seconds:
     #[test]
     fn dns_query_id_round_trips() {
         for id in [0u16, 1, 0x1234, 0xfffe, 0xffff] {
-            let q = build_dns_query(id);
+            let q = build_dns_query(id, ".", 2, false);
             let parsed = u16::from_be_bytes([q[0], q[1]]);
             assert_eq!(parsed, id, "id round-trip failed for {id:#x}");
         }
@@ -809,5 +1135,121 @@ Approximate round trip times in milli-seconds:
             loss > 0.0,
             "probe must report loss for unrouted host (got rtt={rtt:?}, loss={loss})"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_format_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// A reply as a resolver would send it: header with TC and AD set, the
+    /// question echoed, and two A records using a compression pointer.
+    fn reply(flags: u16, answers: &[[u8; 4]]) -> Vec<u8> {
+        let mut r = vec![0x5a, 0x11];
+        r.extend_from_slice(&flags.to_be_bytes());
+        r.extend_from_slice(&[0, 1, 0, answers.len() as u8, 0, 0, 0, 0]);
+        r.extend_from_slice(&[
+            3, b'd', b'n', b's', 6, b'g', b'o', b'o', b'g', b'l', b'e', 0,
+        ]);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        for a in answers {
+            r.extend_from_slice(&[0xc0, 0x0c]); // pointer to the question name
+            r.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            r.extend_from_slice(a);
+        }
+        r
+    }
+
+    #[test]
+    fn a_reply_decodes_its_flags_and_a_records() {
+        let r = parse_dns_reply(&reply(
+            0x8000 | 0x0200 | 0x0020 | 0x0002,
+            &[[8, 8, 8, 8], [8, 8, 4, 4]],
+        ))
+        .expect("well-formed");
+        assert_eq!(r.id, 0x5a11);
+        assert!(r.truncated, "TC");
+        assert!(r.authentic, "AD");
+        assert_eq!(r.rcode, RCODE_SERVFAIL);
+        assert_eq!(
+            r.answers,
+            vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)]
+        );
+    }
+
+    #[test]
+    fn a_truncated_packet_is_no_reply_rather_than_a_panic() {
+        let full = reply(0x8180, &[[8, 8, 8, 8]]);
+        for cut in [0, 5, 11, 20, full.len() - 3] {
+            assert!(
+                parse_dns_reply(&full[..cut])
+                    .map(|r| r.answers.len())
+                    .unwrap_or(0)
+                    <= 1,
+                "cut at {cut}"
+            );
+        }
+        assert!(parse_dns_reply(&full[..11]).is_none());
+    }
+
+    /// The reference query asks for validation: an OPT record with DO set
+    /// in the additional section, and arcount says so.
+    #[test]
+    fn a_dnssec_query_carries_an_opt_record_with_do() {
+        let q = build_dns_query(7, "dns.google", 1, true);
+        assert_eq!(&q[10..12], &[0, 1], "arcount");
+        assert_eq!(q[12], 3, "first label length");
+        let opt = &q[q.len() - 11..];
+        assert_eq!(&opt[0..3], &[0, 0, 0x29], "root owner, type OPT");
+        assert_eq!(
+            opt[7] & 0x80,
+            0x80,
+            "DO bit: ttl bytes follow the 2-byte udp size"
+        );
+        let plain = build_dns_query(7, ".", 2, false);
+        assert_eq!(&plain[10..12], &[0, 0]);
+        assert_eq!(plain[12], 0, "root name is one null label");
+    }
+
+    #[test]
+    fn private_answers_for_public_names_are_the_portal_signature() {
+        for ip in [
+            "10.1.1.1",
+            "192.168.1.1",
+            "172.16.0.5",
+            "127.0.0.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+        ] {
+            assert!(is_private_v4(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "100.128.0.1", "172.32.0.1"] {
+            assert!(!is_private_v4(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    /// XOR-MAPPED-ADDRESS decodes back to the address the server saw; a
+    /// response for another transaction is ignored.
+    #[test]
+    fn stun_mapped_address_unxors() {
+        let txid = [7u8; 12];
+        let mut m = vec![0x01, 0x01, 0x00, 0x0c];
+        m.extend_from_slice(&STUN_MAGIC);
+        m.extend_from_slice(&txid);
+        m.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01]);
+        m.extend_from_slice(&(51234u16 ^ 0x2112).to_be_bytes());
+        let ip = [203u8, 0, 113, 9];
+        for (i, b) in ip.iter().enumerate() {
+            m.push(b ^ STUN_MAGIC[i]);
+        }
+        let got = parse_stun_mapped(&m, txid).expect("mapped");
+        assert_eq!(got.to_string(), "203.0.113.9:51234");
+        assert!(
+            parse_stun_mapped(&m, [8u8; 12]).is_none(),
+            "wrong transaction"
+        );
+        assert_eq!(build_stun_binding(txid)[4..8], STUN_MAGIC);
     }
 }

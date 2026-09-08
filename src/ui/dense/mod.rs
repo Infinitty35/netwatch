@@ -812,6 +812,186 @@ fn collect_conns(app: &App) -> Vec<ConnRow> {
     rows
 }
 
+// ── grouped connection list ─────────────────────────────────────────────────
+//
+// The same tree the Connections tab and the Dashboard draw: one parent row per
+// process carrying the rollup, children foldable beneath it. A flat list here
+// spent the PROCESS column repeating `claude` down twenty rows, and the box is
+// the shortest of the four — the one place that can least afford it.
+
+/// What a process's header row says about its sockets.
+struct ConnRollup {
+    conns: usize,
+    pids: usize,
+    hosts: usize,
+    rx_rate: f64,
+    tx_rate: f64,
+    /// Best (lowest) handshake RTT in the group.
+    rtt_ms: Option<f64>,
+    /// Any member with retransmits — a rollup must not hide a problem a child
+    /// row would show.
+    degraded: bool,
+    /// Every member finished: the header dims like a dead row would.
+    dead: bool,
+    /// Dominant state, so the STATE column says something for the group.
+    state: String,
+    /// Members' sparklines summed, aligned at now.
+    history: Vec<u64>,
+}
+
+type ConnGroup = crate::ui::tree::Group<ConnRollup, ConnRow>;
+
+/// One line of the conns table.
+enum DenseRow<'a> {
+    /// A process with several sockets: the rollup, foldable.
+    Parent {
+        group: &'a ConnGroup,
+        collapsed: bool,
+    },
+    /// A process with exactly one socket: the socket itself. A header that
+    /// reveals a single child is a keystroke to learn nothing.
+    Solo {
+        group: &'a ConnGroup,
+        conn: &'a ConnRow,
+    },
+    Child {
+        group: &'a ConnGroup,
+        conn: &'a ConnRow,
+    },
+}
+
+impl<'a> DenseRow<'a> {
+    fn key(&self) -> &'a str {
+        match self {
+            DenseRow::Parent { group, .. }
+            | DenseRow::Solo { group, .. }
+            | DenseRow::Child { group, .. } => &group.key,
+        }
+    }
+
+    fn conn(&self) -> Option<&'a ConnRow> {
+        match self {
+            DenseRow::Solo { conn, .. } | DenseRow::Child { conn, .. } => Some(conn),
+            DenseRow::Parent { .. } => None,
+        }
+    }
+
+    fn foldable(&self) -> bool {
+        !matches!(self, DenseRow::Solo { .. })
+    }
+}
+
+fn rollup(conns: &[ConnRow]) -> ConnRollup {
+    let pids: std::collections::BTreeSet<Option<u32>> = conns.iter().map(|c| c.pid).collect();
+    let hosts: std::collections::BTreeSet<&str> = conns.iter().map(|c| c.host.as_str()).collect();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for c in conns {
+        *counts.entry(c.state.as_str()).or_insert(0) += 1;
+    }
+    let state = counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_default();
+    // Histories all end at now; sum them aligned at the right edge.
+    let len = conns.iter().map(|c| c.history.len()).max().unwrap_or(0);
+    let mut history = vec![0u64; len];
+    for c in conns {
+        let off = len - c.history.len();
+        for (i, v) in c.history.iter().enumerate() {
+            history[off + i] += v;
+        }
+    }
+    ConnRollup {
+        conns: conns.len(),
+        pids: pids.len(),
+        hosts: hosts.len(),
+        rx_rate: conns.iter().map(|c| c.rx_rate).sum(),
+        tx_rate: conns.iter().map(|c| c.tx_rate).sum(),
+        rtt_ms: conns
+            .iter()
+            .filter_map(|c| c.rtt_ms)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+        degraded: conns.iter().any(|c| c.retransmits > 0),
+        dead: conns.iter().all(|c| c.is_dead()),
+        state,
+        history,
+    }
+}
+
+/// Group the sorted rows by process, busiest group first.
+fn conn_groups(rows: Vec<ConnRow>) -> Vec<ConnGroup> {
+    let mut groups: Vec<ConnGroup> =
+        crate::ui::tree::group_by(rows, |c: &ConnRow| c.process.clone())
+            .into_iter()
+            .map(|(key, children)| ConnGroup {
+                key,
+                rollup: rollup(&children),
+                children,
+            })
+            .collect();
+    groups.sort_by(|a, b| {
+        (b.rollup.rx_rate + b.rollup.tx_rate)
+            .partial_cmp(&(a.rollup.rx_rate + a.rollup.tx_rate))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    groups
+}
+
+/// The visible rows, honouring fold state. Single definition of "what is
+/// row N" for the renderer and the key handlers.
+fn dense_rows<'a>(groups: &'a [ConnGroup], fold: &crate::ui::tree::FoldState) -> Vec<DenseRow<'a>> {
+    let mut rows = Vec::new();
+    for group in groups {
+        if let [conn] = group.children.as_slice() {
+            rows.push(DenseRow::Solo { group, conn });
+            continue;
+        }
+        let collapsed = fold.is_collapsed(&group.key);
+        rows.push(DenseRow::Parent { group, collapsed });
+        if !collapsed {
+            rows.extend(
+                group
+                    .children
+                    .iter()
+                    .map(|conn| DenseRow::Child { group, conn }),
+            );
+        }
+    }
+    rows
+}
+
+/// Rows the conns box currently lists, for clamping the cursor.
+pub fn visible_conn_count(app: &App) -> usize {
+    dense_rows(&conn_groups(collect_conns(app)), &app.ui.dense_collapsed).len()
+}
+
+/// The process under the cursor, if its group folds — from a child row as
+/// well as the header. `None` on a solo row, so the key is a no-op rather
+/// than a fold state that surfaces later when that process opens a second
+/// socket.
+pub fn selected_conn_group(app: &App) -> Option<String> {
+    let groups = conn_groups(collect_conns(app));
+    let rows = dense_rows(&groups, &app.ui.dense_collapsed);
+    let idx = app
+        .ui
+        .scroll
+        .connection_scroll
+        .min(rows.len().saturating_sub(1));
+    let row = rows.get(idx)?;
+    row.foldable().then(|| row.key().to_string())
+}
+
+/// Row index of `process`'s header, so a collapse can park the cursor on the
+/// row it just folded rather than on whatever slid up into its place.
+pub fn conn_header_index(app: &App, process: &str) -> Option<usize> {
+    let groups = conn_groups(collect_conns(app));
+    dense_rows(&groups, &app.ui.dense_collapsed)
+        .iter()
+        .position(|r| matches!(r, DenseRow::Parent { group, .. } if group.key == process))
+}
+
 /// Split an address into host and port.
 ///
 /// Has to cope with everything the platforms actually print, not just the
@@ -1051,7 +1231,7 @@ fn render_net(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
         foot_left: &[
             zoom_bind(app, DenseBox::Net),
             ("V", " view"),
-            ("space", " pause"),
+            ("p", "ause"),
             ("q", "uit"),
         ],
         foot_right: None,
@@ -1668,20 +1848,26 @@ fn render_health(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout)
 // ── box 4: conns ────────────────────────────────────────────────────────────
 
 fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) {
-    let rows = collect_conns(app);
+    let groups = conn_groups(collect_conns(app));
+    let rows = dense_rows(&groups, &app.ui.dense_collapsed);
+    let conn_count: usize = groups.iter().map(|g| g.rollup.conns).sum();
     let sel = app
         .ui
         .scroll
         .connection_scroll
         .min(rows.len().saturating_sub(1));
     let page_start = sel.saturating_sub(l.conn_rows as usize - 1);
-    let visible: Vec<&ConnRow> = rows
+    let visible: Vec<&DenseRow> = rows
         .iter()
         .skip(page_start)
         .take(l.conn_rows as usize)
         .collect();
 
-    let sub = format!("{} · 1 selected", rows.len());
+    let sub = if groups.len() == conn_count {
+        format!("{conn_count} · 1 selected")
+    } else {
+        format!("{conn_count} in {} procs · 1 selected", groups.len())
+    };
     let foot_right = if rows.is_empty() {
         "0 of 0".to_string()
     } else {
@@ -1709,8 +1895,9 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
             foot_left: &[
                 zoom_bind(app, DenseBox::Conns),
                 ("↑↓", " select"),
+                ("space", " fold"),
+                ("z", " fold all"),
                 ("p", "ause"),
-                (",", " settings"),
                 ("?", " help"),
             ],
             foot_right: Some(&foot_right),
@@ -1718,14 +1905,26 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
         },
     );
 
-    if let Some(c) = rows.get(sel) {
-        render_detail(f, app, t, ramps, c, l);
+    match rows.get(sel) {
+        Some(DenseRow::Parent { group, .. }) => render_group_detail(f, t, group, l),
+        Some(row) => {
+            if let Some(c) = row.conn() {
+                render_detail(f, app, t, ramps, c, l);
+            }
+        }
+        None => {}
     }
 
     header(f, l.row_conn_head, &l.conn_cols, Some(conn_col::DOWN), t);
-    for (i, c) in visible.iter().enumerate() {
+    for (i, row) in visible.iter().enumerate() {
         let y = l.row_conn_first + i as u16;
         let is_sel = page_start + i == sel;
+        if let DenseRow::Parent { group, collapsed } = row {
+            render_group_row(f, t, ramps, l, group, *collapsed, is_sel, y);
+            continue;
+        }
+        let Some(c) = row.conn() else { continue };
+        let child = matches!(row, DenseRow::Child { .. });
         let dead = c.is_dead();
         // The active row gets the band — the same `selection_bg` every other
         // list in netwatch uses. Nothing else on this screen paints a
@@ -1758,12 +1957,18 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
                 t.status_good
             }),
         );
+        // Under a header the process is already named one row up; a child
+        // shows the indent instead and spends the eye on what differs.
         cell(
             f,
             &l.conn_cols[conn_col::PROC],
             y,
-            &c.process,
-            fg(t.text_primary),
+            if child { "  ↳" } else { &c.process },
+            if child {
+                Style::default().fg(t.brand)
+            } else {
+                fg(t.text_primary)
+            },
         );
         cell(
             f,
@@ -1832,6 +2037,179 @@ fn render_conns(f: &mut Frame, app: &App, t: &Theme, ramps: &Ramps, l: &Layout) 
             paint::spark(f.buffer_mut(), spark.x, y, spark.w, &s, chart_max(&s), ramp);
         }
     }
+}
+
+/// A process's header row: the rollup, with a chevron for the fold state.
+#[allow(clippy::too_many_arguments)]
+fn render_group_row(
+    f: &mut Frame,
+    t: &Theme,
+    ramps: &Ramps,
+    l: &Layout,
+    group: &ConnGroup,
+    collapsed: bool,
+    is_sel: bool,
+    y: u16,
+) {
+    let r = &group.rollup;
+    if is_sel {
+        for x in l.conns.x + 1..l.conns.x + l.conns.width - 1 {
+            f.buffer_mut().get_mut(x, y).set_bg(t.selection_bg);
+        }
+    }
+    let quiet = if is_sel { t.text_primary } else { t.text_muted };
+    let fg = |c: Color| Style::default().fg(if r.dead { quiet } else { c });
+    // The chevron stays on the selected row: fold state is what the row is
+    // for, and the selection band already says where the cursor is.
+    cell(
+        f,
+        &l.conn_cols[conn_col::MARK],
+        y,
+        if collapsed { "▶" } else { "▼" },
+        Style::default().fg(t.brand),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::PROC],
+        y,
+        &group.key,
+        fg(t.text_primary).add_modifier(Modifier::BOLD),
+    );
+    let pid = &group.children[0].pid;
+    cell(
+        f,
+        &l.conn_cols[conn_col::PID],
+        y,
+        &if r.pids == 1 {
+            pid.map(|p| p.to_string()).unwrap_or(NA.into())
+        } else {
+            format!("{}×", r.pids)
+        },
+        Style::default().fg(quiet),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::HOST],
+        y,
+        &format!(
+            "{} conns · {} host{}",
+            r.conns,
+            r.hosts,
+            if r.hosts == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(quiet),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::DOWN],
+        y,
+        &format_bytes_rate(r.rx_rate),
+        fg(t.rx_rate),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::UP],
+        y,
+        &format_bytes_rate(r.tx_rate),
+        fg(t.tx_rate),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::RTT],
+        y,
+        &rtt_str(r.rtt_ms),
+        Style::default().fg(quiet),
+    );
+    cell(
+        f,
+        &l.conn_cols[conn_col::STATE],
+        y,
+        short_state(&r.state),
+        Style::default().fg(if r.dead { quiet } else { t.text_secondary }),
+    );
+    let spark = &l.conn_cols[conn_col::SPARK];
+    if r.dead || r.history.is_empty() {
+        paint::baseline(f.buffer_mut(), spark.x, y, spark.w, t.border);
+    } else {
+        let s = fit_samples(&r.history, spark.w as usize * 2);
+        let ramp = if r.degraded { &ramps.load } else { &ramps.down };
+        paint::spark(f.buffer_mut(), spark.x, y, spark.w, &s, chart_max(&s), ramp);
+    }
+}
+
+/// The detail strip for a header row: the group as a whole, since there is
+/// no single socket pair to name.
+fn render_group_detail(f: &mut Frame, t: &Theme, group: &ConnGroup, l: &Layout) {
+    let r = &group.rollup;
+    let dim = Style::default().fg(t.text_muted);
+    put(
+        f,
+        2,
+        l.row_detail_1,
+        "↳",
+        Style::default().fg(t.brand).add_modifier(Modifier::BOLD),
+    );
+    put(
+        f,
+        4,
+        l.row_detail_1,
+        &truncate(&group.key, DETAIL_PROC_W as usize),
+        Style::default()
+            .fg(t.text_primary)
+            .add_modifier(Modifier::BOLD),
+    );
+    let pids: Vec<String> = group
+        .children
+        .iter()
+        .filter_map(|c| c.pid)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect();
+    put(
+        f,
+        DETAIL_PID_X,
+        l.row_detail_1,
+        &truncate(
+            &format!(
+                "pid {}",
+                if pids.is_empty() {
+                    NA.to_string()
+                } else {
+                    pids.join(",")
+                }
+            ),
+            (l.content_x_end - DETAIL_PID_X) as usize,
+        ),
+        dim,
+    );
+    put(
+        f,
+        4,
+        l.row_detail_2,
+        &format!(
+            "{} connection{} to {} host{}",
+            r.conns,
+            if r.conns == 1 { "" } else { "s" },
+            r.hosts,
+            if r.hosts == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(t.text_secondary),
+    );
+    let hosts: Vec<&str> = group
+        .children
+        .iter()
+        .map(|c| c.host.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    put(
+        f,
+        4,
+        l.row_detail_3,
+        &truncate(&hosts.join("  "), (l.content_x_end - 4) as usize),
+        dim,
+    );
 }
 
 /// The selected row's detail, hoisted into the top of the same box.
@@ -2470,12 +2848,15 @@ mod tests {
         // Every key spelled in a box footer, and the fact that it is handled.
         const ADVERTISED: &[(&str, bool)] = &[
             ("V", true),     // cycle view
-            ("space", true), // pause
             ("q", true),     // quit
             ("↑↓", true),    // select
+            ("space", true), // fold the process under the cursor
+            ("z", true),     // fold all
             ("p", true),     // pause
             (",", true),     // settings
             ("?", true),     // help
+            ("1-4", true),   // zoom a box
+            ("esc", true),   // restore the grid
         ];
         for (key, implemented) in ADVERTISED {
             assert!(
@@ -2869,5 +3250,74 @@ mod zoom_tests {
         assert_eq!(DenseBox::from_key('1'), Some(DenseBox::Net));
         assert_eq!(DenseBox::from_key('4'), Some(DenseBox::Conns));
         assert_eq!(DenseBox::from_key('5'), None);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    fn conn(process: &str, pid: u32, host: &str, rx: f64, retrans: u32, state: &str) -> ConnRow {
+        ConnRow {
+            process: process.into(),
+            pid: Some(pid),
+            host: host.into(),
+            port: "443".into(),
+            proto: "tcp".into(),
+            rx_rate: rx,
+            tx_rate: 0.0,
+            rtt_ms: Some(pid as f64),
+            state: state.into(),
+            retransmits: retrans,
+            out_of_order: 0,
+            app_proto: None,
+            local: "10.0.0.2:1".into(),
+            remote: format!("{host}:443"),
+            history: vec![1; 3],
+        }
+    }
+
+    /// One socket is a row; several are a header with foldable children.
+    /// The same function answers "what is row N" for the renderer and the
+    /// key handlers, so it is the one to pin.
+    #[test]
+    fn a_solo_process_is_a_row_and_a_busy_one_is_a_tree() {
+        let groups = conn_groups(vec![
+            conn("curl", 1, "a", 5.0, 0, "ESTABLISHED"),
+            conn("claude", 2, "b", 3.0, 0, "ESTABLISHED"),
+            conn("claude", 2, "c", 4.0, 2, "ESTABLISHED"),
+            conn("claude", 3, "c", 1.0, 0, "TIME_WAIT"),
+        ]);
+        // Busiest group first: claude sums to 8 against curl's 5.
+        assert_eq!(groups[0].key, "claude");
+
+        let open = crate::ui::tree::FoldState::new(false);
+        let rows = dense_rows(&groups, &open);
+        assert_eq!(rows.len(), 5, "header + 3 children + 1 solo");
+        assert!(matches!(
+            rows[0],
+            DenseRow::Parent {
+                collapsed: false,
+                ..
+            }
+        ));
+        assert!(rows[1..4]
+            .iter()
+            .all(|r| matches!(r, DenseRow::Child { .. })));
+        assert!(matches!(rows[4], DenseRow::Solo { .. }));
+        assert!(!rows[4].foldable());
+        assert!(rows[1].foldable(), "a child folds its parent");
+        assert_eq!(rows[1].key(), "claude");
+
+        let folded = crate::ui::tree::FoldState::new(true);
+        assert_eq!(dense_rows(&groups, &folded).len(), 2, "header + solo");
+
+        // The rollup carries the group's worst, not its first.
+        let r = &groups[0].rollup;
+        assert_eq!((r.conns, r.pids, r.hosts), (3, 2, 2));
+        assert!(r.degraded, "one retransmitting socket marks the group");
+        assert_eq!(r.rtt_ms, Some(2.0), "best rtt, not first");
+        assert_eq!(r.state, "ESTABLISHED", "dominant state");
+        assert_eq!(r.history, vec![3, 3, 3], "sparklines summed");
     }
 }
