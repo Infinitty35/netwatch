@@ -1,15 +1,14 @@
 <p align="center">
   <h1 align="center">NetWatch</h1>
   <p align="center">
-    <strong>See what your network is actually doing — live, in your terminal.</strong><br>
-    <em>A network monitor that reads encrypted traffic, names the process behind every connection, catches malware calling home — and tells you what's wrong, why, and how to fix it. One binary. Zero config.</em>
+    <strong>A network monitor for the terminal that names the process behind every connection, reads TLS you hold the keys to, and tells you what is wrong and how to fix it.</strong>
   </p>
   <p align="center">
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/d/netwatch-tui.svg" alt="downloads"></a>
     <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Release"></a>
     <a href="https://repology.org/project/netwatch-tui/versions"><img src="https://repology.org/badge/tiny-repos/netwatch-tui.svg" alt="Packaging status"></a>
-    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue" alt="Platform">
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="Platform">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   </p>
   <p align="center">
@@ -18,327 +17,114 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/demo-hero.gif" alt="A tour of NetWatch: the Dashboard with its mirrored braille throughput plot, latency tiles and per-process connection rollups, the Connections table naming the process behind every socket with GeoIP and retransmit counts, a decoded packet with its payload and the conversation it belongs to, and the Dense view filling the terminal with four zero-chrome boxes" width="880">
+  <img src="docs/media/demo-dense.gif" alt="NetWatch's dense view: a mirrored braille throughput graph with download above the axis and upload below, per-interface rates with sparklines, four-hop latency budgets, and a connection table with the selected socket's kernel TCP state" width="900">
 </p>
 
 <p align="center">
-  <em>Four screens, one binary, no config — Dashboard, Connections, live packet decode, and the
-  Dense view's mirrored throughput graph. Every box comes from one panel definition, and colour
-  encodes magnitude rather than category.</em>
+  <em><code>netwatch --view dense</code>. Four boxes, no chrome, every keybind on a border. Download grows up from the axis, upload grows down.</em>
 </p>
 
----
-
-Most network tools answer one question — *"what's using my bandwidth?"* — and stop. NetWatch keeps going. It decodes the protocols on the wire, tells you **which program** opened each connection, and watches for the patterns that mean trouble — a port scan, malware beaconing to a command server, data sneaking out over DNS. When something looks wrong, one keypress freezes a portable evidence bundle you can attach to a bug report.
-
-And when something *is* wrong it doesn't stop at the graph. It names the issue, ranks the explanations by the checks that ruled the others out, offers the fix, and closes the issue itself once its own success condition holds.
-
-Think of it as **one zero-config binary that does the job of a bandwidth meter, the triage view of Wireshark, a lightweight intrusion detector, and the engineer who reads the output** — without leaving the terminal.
-
-It scales to the question you're asking — in both directions: [`--view dense`](#dense-view) fills a big terminal with four zero-chrome boxes, and `netwatch --lite` is [one 80×24 screen](#lite-view) for *"what's using my network right now?"*; the full ten-tab view is there when the answer is "something I need to investigate" — one keypress apart, sharing the same live capture.
-
-**Made for** blue-teamers, incident responders, SREs, and homelabbers who need to see what's happening *right now* — not parse a capture file an hour later.
-
-<samp>920+ tests · Landlock-sandboxed (Linux) · safely parses hostile traffic</samp>
-
-And the part no other terminal tool does at all: NetWatch learns what each program on the machine talks to, turns that observed baseline into a policy with one keypress, and tells you the moment a program starts talking somewhere new.
-
-That diagnosis is deterministic — no model involved. Baselines are learned per
-metric and scoped to the network that taught them, 25 catalogued rules decide
-what counts as wrong, and each explanation is ranked by the checks that
-separated it from the others.
-
-## New in v0.30
-
-<p align="center">
-  <img src="docs/media/demo-diagnose.gif" alt="NetWatch Diagnose: a slow DNS resolver at 33× its learned baseline, three ranked causes with the checks that separated them, a key-bound fix that switches the session resolver, and the issue auto-closing once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
-</p>
-
-<p align="center">
-  <em>Issue → probable cause → remediation → verified close. The engine is never told the problem
-  is fixed; it watches the resolver and closes the issue when <code>dns.rtt_p50 &lt; 5ms</code> has
-  held for 60s. Recorded with <code>netwatch --demo</code>, which replays a scenario through the
-  real engine and says so on every frame.</em>
-</p>
-
-### v0.30.0 — the diagnostic engine
-
-- 🩺 **[Diagnose](#what-you-get), on tab `9`.** The release's headline. Per-metric EWMA baselines learned over at least 30 minutes and scoped to a fingerprint of the network that taught them — so carrying a laptop from a 1.2 ms office resolver to a hotel hotspot doesn't fire every rule at once. A 25-rule catalogue with a suppression graph, so a dead gateway is one finding with its consequences underneath rather than six. Causes rank as `strong` / `likely` / `possible`, because the number underneath is not a calibrated probability and `92%` invites reading it as one.
-- 🔁 **Fixes that are reversible, and issues that close themselves.** Remediations are key-bound and journal their intent *before* they write, so a `SIGKILL` can't leave `/etc/resolv.conf` pointing where NetWatch put it — the next start reverts what a dead process left behind, and declines if something else edited the file meanwhile. The engine is never told the problem is solved; it watches the rule's own success condition until it holds.
-- 📋 **Coverage it admits to.** Every rule declares whether netwatch can evaluate it, and the header states the split. Four shipped as `Planned` in 0.30.0 because their inputs didn't exist; 0.30.3 built the inputs — decoded DNS reply flags, a validating cross-check, `/proc/net/wireless`, a STUN probe — and all 25 are active. A tool that lists 25 rules and evaluates 19 is misreporting itself.
-- 🎨 **btop-style chrome, everywhere.** Every box now comes from one `widgets::Panel` — rounded corners, title inline in the brand accent, metadata right-aligned in the same border row. It replaced 48 hand-built blocks across 15 files that agreed by convention rather than construction, two of which had already drifted to a different border style *on the same screen*. Dropping the tab brackets returned twenty columns and stopped the status chips clipping at 150 columns.
-- 🗣️ **A verdict line under the tab bar on every tab** — what is wrong, since when, what to press. When the baselines aren't learned yet it says so, rather than claiming health it hasn't earned.
-- 🧠 **AI Insights is no longer a tab.** It renders inside Diagnose as labelled commentary on findings the engine has already established — never as a source of facts. Config keys are unchanged.
-- 🐛 **`pid:0` no longer owns megabytes of traffic.** PID 0 is the kernel swapper; that was the label for *unattributed*, and the invented process sent an investigation hunting the sandbox for a bug that was in a format string. Also fixed: `E` export silently failing under the sandbox, and five KPI sparklines that covered different spans at identical width.
-
-### v0.30.1 — the dashboard graphs draw what they claim
-
-The 0.30 chrome landed with three plots quietly drawing something other than what they said.
-
-- 📉 **The mirrored throughput plot drew two zero lines.** rx and tx were rendered as independent plots in adjacent rects, each with its own baseline floor — so the shared zero line was a pair of solid full-width lines one row apart, which on a quiet link is the entire graph. `graph::render_mirrored_with_max` now owns the rule that the zero line is one row belonging to the rx half, and returns its height so the axis labels can't drift from it.
-- 📏 **The timeline's latency tracks were combed with gaps.** Each sample lit only the column its timestamp landed in, so 120 five-second probes across ~134 columns lit about seven in eight — `dns rtt` and `gateway rtt` read as dashed lines beside a solid `throughput` track over the same window. A sample now fills the columns its measurement interval actually covers.
-- ⏪ **Multi-interface throughput was summed at the wrong end of time.** Per-interface histories were aligned at index 0 — the oldest sample — but they all end at *now* and grow backwards. A link that came up two minutes ago had its whole series shifted eight minutes into the past: traffic drawn on a link before it existed, and none on it now.
-- 🧩 **The dashboard's connections panel groups by process** — one row per process with rates summed, best RTT, retransmits summed, the group's *worst* verdict, and a distinct-host count, instead of the process name repeated down every socket. `↑↓` moves a cursor, `space` folds a group, `z` folds everything.
-- 🔌 **An `interfaces` panel replaces `health` on the dashboard**, naming which link is carrying the traffic the throughput graph aggregates into one series — the question the dashboard couldn't answer. Health findings stay Diagnose's subject.
-
-**[Full changelog](CHANGELOG.md)** · **[Release notes](https://github.com/matthart1983/netwatch/releases/latest)**
-
-## Why NetWatch
-
-- 🩺 **Get told what's wrong, not just what's happening** — NetWatch learns what normal looks like on *this* network, then names the issue, ranks the probable causes by the checks that ruled the others out, and offers a fix it can apply and reverse. It closes the issue itself when the rule's own success condition holds — the engine is never told the problem is fixed, it watches until it is. Deterministic: no model, no cloud, and it says which of its rules it cannot yet evaluate rather than implying full coverage.
-- 🔓 **Read encrypted traffic you control** — point a browser or app's `SSLKEYLOGFILE` at NetWatch and watch the plaintext of its TLS 1.3 sessions decode live, the same way Wireshark does it. No proxy, no certificates, nothing in the middle.
-- 🛰️ **Learn what every program talks to, then get told when it changes** — NetWatch watches which destinations each process reaches (hostname from the ClientHello, autonomous system, port), and one keypress promotes that observed baseline into an egress policy. From then on it warns when a program starts talking somewhere new. That is the sentence a firewall ruleset cannot express: *`curl` used to reach only `api.github.com`, and today it reached something else.* Observe-only — it never blocks.
-- 🧬 **Fingerprint the software behind a connection** — JA4 turns each TLS/QUIC handshake into a stable fingerprint, so you can recognize a specific client — or a specific piece of malware — *even though the traffic is encrypted*, the way you'd recognize a browser by its user-agent. Pivot on a fingerprint to find every other flow from the same software.
-- 🚨 **Catch malware calling home** — built-in detection for C2 beaconing (regular, low-jitter check-ins), port scans, and DNS tunneling runs in the background with zero setup. A critical alert auto-freezes the recorder so the evidence is already saved when you look.
-- ⚙️ **Name the process behind every connection** — maps each socket to the program that opened it from `ss`/`lsof`, with an optional kernel-level eBPF kprobe (Linux, the `ebpf` feature) that also catches short-lived flows polling can miss. Works everywhere; the kprobe is an enhancement, not a requirement.
-- 📡 **Decode the protocols, not just the ports** — real L7 parsing of TLS, QUIC, HTTP, and DNS (plus an SSH banner/version sniff) and a dozen more, with per-flow stream tracking and handshake timing — so you see `api.github.com` and the JA4 fingerprint, not just "port 443."
-- 🎥 **Freeze the evidence** — arm a rolling recorder and freeze any incident into a portable bundle: the packets *plus* the connections, DNS, health, and alerts that explain them. Built for bug reports and post-mortems.
-- 🛡️ **Safe by design** — after setup, NetWatch drops its privileges and locks itself into a Landlock filesystem allow-list (Linux). A tool that parses hostile traffic *cannot* read your SSH keys, browser profiles, or `/etc/shadow`.
-- 🪟 **Scales down to one screen** — `--lite` answers *"what's using my network, and is my connection OK?"* on a single 80×24 screen with six keys, so it fits an SSH session to a Pi or a tmux split. One keypress escalates to the full forensics view with the collectors already warm.
-
-**No config files. No setup. No flags required.**
+One binary, no config. `sudo netwatch` and you have live capture with L7 decode, the program behind each socket, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
 
 ## Install
 
 ```bash
 brew install netwatch                 # macOS / Linux
 nix-shell -p netwatch                 # NixOS / Nix
-paru -S netwatch-tui-bin              # Arch (prebuilt; netwatch-tui builds from source)
-scoop install netwatch                # Windows
-cargo install netwatch-tui            # anywhere with Rust
+paru -S netwatch-tui-bin              # Arch
+scoop install netwatch                # Windows (needs Npcap)
+cargo install netwatch-tui            # anywhere with Rust and libpcap headers
 ```
 
-Or grab a pre-built binary from [Releases](https://github.com/matthart1983/netwatch/releases/latest).
+Prebuilt binaries, including static Linux builds with libpcap bundled, are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
 
-**Windows needs [Npcap](https://npcap.com/#download) installed** — the installer's defaults are fine, and without it NetWatch exits at startup saying so. **Building from source** (`cargo install`, `paru -S netwatch-tui`) needs libpcap's development headers: `libpcap-dev` on Debian/Ubuntu and Alpine, `libpcap-devel` on Fedora/RHEL, `libpcap` on Arch. Missing them shows up as `cannot find -lpcap` at link time. macOS ships libpcap; the `-static` Linux binaries below bundle it and need nothing installed.
-
-The Nix, Arch and Scoop packages are maintained by community packagers — thank you. File
-packaging issues with them; file netwatch bugs here. If a package lags a release, the
-[Repology page](https://repology.org/project/netwatch-tui/versions) shows it.
-
-<details>
-<summary><strong>All platforms &amp; build-from-source</strong></summary>
-
-| Platform | Download |
-|----------|----------|
-| Linux (x86_64, Debian/Ubuntu) | [`netwatch-linux-x86_64.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| Linux (aarch64, Debian/Ubuntu) | [`netwatch-linux-aarch64.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| Linux (x86_64, static — Arch/Fedora/Alpine/any distro) | [`netwatch-linux-x86_64-static.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| Linux (aarch64, static — Arch/Fedora/Alpine/any distro) | [`netwatch-linux-aarch64-static.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| macOS (Intel) | [`netwatch-macos-x86_64.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| macOS (Apple Silicon) | [`netwatch-macos-aarch64.tar.gz`](https://github.com/matthart1983/netwatch/releases/latest) |
-| Windows (x86_64) | [`netwatch-windows-x86_64.exe.zip`](https://github.com/matthart1983/netwatch/releases/latest) |
-
-The `-static` Linux builds bundle libpcap and have no runtime dependencies — use these on Arch, Fedora, Alpine, or any distro where the default builds report `libpcap.so.0.8: cannot open shared object file`.
-
-The Windows build requires [Npcap](https://npcap.com/#download) — install it before first run. The installer's defaults are fine: NetWatch looks in `System32\Npcap`, where Npcap actually puts `wpcap.dll`, so *Install Npcap in WinPcap API-compatible Mode* is not needed. With no Npcap at all you get a NetWatch message naming what's missing, not a Windows error box. (On v0.29.1 and earlier you did need that checkbox — see [#47](https://github.com/matthart1983/netwatch/issues/47).)
-
-**From source:**
+## Run
 
 ```bash
-git clone https://github.com/matthart1983/netwatch.git && cd netwatch
-cargo build --release
+netwatch              # interfaces, connections, config. No privileges.
+sudo netwatch         # adds packet capture and health probes
+netwatch --lite       # one 80x24 screen
+netwatch --view dense # four boxes, 130x44 or larger
 ```
 
-**Prerequisites:** Rust 1.70+ and libpcap's development headers. The same applies to `cargo install netwatch-tui`.
+`1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. To run without sudo on Linux, grant the capabilities once: `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"` ([why and when to repeat it](docs/REFERENCE.md#running-without-sudo-linux)).
 
-| Platform | Install |
-|----------|---------|
-| Debian / Ubuntu | `sudo apt install libpcap-dev` |
-| Fedora / RHEL | `sudo dnf install libpcap-devel` |
-| Arch | `sudo pacman -S libpcap` |
-| Alpine | `sudo apk add libpcap-dev` |
-| macOS | included with the system |
-| Windows | [Npcap](https://npcap.com/#download) — the build fetches the Npcap SDK automatically, or set `NPCAP_SDK` to an extracted copy |
+## What it does
 
-Without them the build fails at link time with `/usr/bin/ld: cannot find -lpcap`. If you only want to run NetWatch rather than build it, the `-static` Linux binaries above need none of this.
+**Diagnose (tab `9`).** Per-metric baselines learned over 30 minutes and scoped to the network that taught them. 25 rules, all active as of 0.30.3, with a suppression graph so a dead gateway is one finding with its consequences underneath. Each cause is ranked by the checks that separated it from the others. Fixes are key-bound, journal before they write, and revert on the next start if the process died mid-write. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
 
-</details>
+<p align="center">
+  <img src="docs/media/demo-diagnose.gif" alt="A slow resolver at 33 times its baseline, three ranked causes, a key-bound fix, and the issue closing itself once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
+</p>
 
-## Quick start
+**Decrypt TLS you control.** Point any client's `SSLKEYLOGFILE` at NetWatch and the plaintext of its TLS 1.3 sessions decodes in the Packets tab. Same mechanism as Wireshark, so it only works for traffic you hold the keys to. [TLS decryption](docs/REFERENCE.md#tls-13--12-decryption).
 
 ```bash
-netwatch            # interface stats, connections, config — no privileges needed
-sudo netwatch       # full mode — adds live packet capture + health probes
+sudo netwatch                                              # open Packets (4)
+SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exports keys
+# filter the tab with:  decrypted:true
 ```
 
-That's it. Switch tabs with `1`–`9`, press `?` for help, `q` to quit. The Dashboard is useful in five seconds; everything below is there when you need to go deeper.
+**Egress drift.** The Egress tab (`0`) learns which hosts, autonomous systems and ports each process reaches. `Enter` promotes that baseline to a rule; the next new destination arrives as `drift` with an alert. It observes and never blocks. Verdicts are `sni`, `ip`, `asn`, `ech`, `drift`, `no rule` and `undeclared` under `strict = true`, because "matched by AS" admits everything a hyperscaler runs and the table should say so. [Rule language and export schema](docs/egress-linter-plan.md).
 
-> **Linux without `sudo`:** grant the capture capabilities once and run as your normal user —
-> `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"`. Re-run it after every upgrade ([details](docs/REFERENCE.md#running-without-sudo-linux)).
+**Process attribution.** `ss`/`lsof` on every platform, PKTAP on macOS, and an optional eBPF kprobe on Linux (`ebpf` feature) that catches flows too short for polling. [Permissions](docs/REFERENCE.md#permissions).
 
-### See it decrypt TLS in 60 seconds
+**Threat detection.** C2 beaconing, port scans and DNS tunnelling run in the background. A critical alert freezes the flight recorder so the bundle exists before you look. JA4 fingerprints each TLS and QUIC handshake so you can pivot to every flow from the same client. [Security and forensics](docs/REFERENCE.md#security--forensics), [flight recorder](docs/REFERENCE.md#flight-recorder), [JA4](docs/REFERENCE.md#threat-hunting-with-ja4).
 
-The fastest way to understand what NetWatch is — watch it read the plaintext of a TLS 1.3 session *you* control:
+**Sandboxed.** After setup, NetWatch drops privileges and confines itself to a Landlock allow-list on Linux. It parses hostile traffic and cannot read your SSH keys.
 
-```bash
-sudo netwatch                                              # 1. launch, then open the Packets tab (4)
-SSLKEYLOGFILE=/tmp/sslkeylog.txt curl https://example.com  # 2. any client that exports its keys
-#                                                            3. filter the Packets tab with:  decrypted:true
-```
+## The tabs
 
-The decrypted application data renders inline. A keylog miss never breaks capture — that record just stays opaque. (`SSLKEYLOGFILE` is the same mechanism Wireshark uses; it only works for traffic *you* control, never third-party or malware traffic.)
+| # | Tab | Shows |
+|---|-----|-------|
+| 1 | Dashboard | Latency tiles, mirrored throughput, the link carrying it, connections rolled up per process |
+| 2 | Connections | Every socket with process, PID, state, GeoIP, RTT, retransmits |
+| 3 | Interfaces | Addresses, MTU, rates, errors, drops |
+| 4 | Packets | Live decode, TLS 1.3 decryption, JA4, stream tracking, display filters, PCAP export |
+| 5 | Stats | Protocol breakdown and handshake-timing histogram |
+| 6 | Topology | Machine, gateway, DNS, top hosts, traceroute |
+| 7 | Timeline | Connections by TCP state, with alerts |
+| 8 | Processes | Bandwidth per process |
+| 9 | Diagnose | Issue, cause, fix, verified close. `report.md` from the same objects |
+| 0 | Egress | Learned destinations, promoted policy, drift |
 
-<p align="center">
-  <img src="docs/media/demo-forensics.gif" alt="NetWatch decrypting a live TLS 1.3 session — the plaintext HTTP exchange decoded in the Packets tab" width="800">
-</p>
+[Every keybinding](docs/REFERENCE.md#keyboard-controls), [display filters](docs/REFERENCE.md#display-filters), [decoders](docs/REFERENCE.md#deep-packet-inspection), [themes](docs/REFERENCE.md#themes), [configuration](docs/REFERENCE.md#configuration).
 
-<p align="center">
-  <em>Reading the plaintext out of a live <strong>TLS 1.3</strong> session — decrypted right in the terminal. No proxy, no man-in-the-middle.</em>
-</p>
+## Three views, one capture
 
-### See it catch egress drift in 60 seconds
+`V` cycles between them without a restart; the collectors keep running.
 
-<p align="center">
-  <img src="docs/media/demo-egress.gif" alt="NetWatch learning what curl talks to, promoting that baseline to an egress policy, and then flagging a new destination as drift" width="820">
-</p>
+**Full** is the ten tabs above.
 
-<p align="center">
-  <em>Observe → promote → warn. The baseline becomes a policy with one keypress; the next new destination arrives as <strong>drift</strong>.</em>
-</p>
+**Lite** (`--lite`) fits 80x24: throughput, gateway/DNS/internet reachability, top talkers, six keys. For an SSH session to a Pi or a tmux split.
 
-The loop from the demo above, in three commands:
+**Dense** (`--view dense`) is the hero image. It needs 130x44 and grows into anything larger. Throughput is braille at two samples per cell, coloured by height so a spike reads before you check the axis. The connection table hoists the selected row's detail, including kernel `cwnd`, `ssthresh`, `mss` and `rwnd`, into the top of its own box. `1` to `4` zoom a box to the whole screen. [Dense and Lite](docs/DESIGN-0.30.md#8-dense-and-lite).
 
-```bash
-sudo netwatch                  # 1. launch and open the Egress tab (0). Leave it a minute
-                               #    while it learns; each process grows a list of destinations
-                               #    with hostnames, autonomous systems and ports
-                               # 2. put the cursor on a process and press Enter — its observed
-                               #    baseline becomes a rule in egress-policy.toml
-curl https://example.org       # 3. same program, somewhere it has never been
-```
-
-The new destination lands with a `✗ drift` verdict and an alert. Nothing was blocked — the point is that you were *told*.
-
-The verdicts are deliberately not a binary:
+## Docs
 
 | | |
 |---|---|
-| `✓ sni` / `✓ ip` | Matched a declared hostname or address — precise |
-| `~ asn` | Matched only by autonomous system — that admits *everything that AS operates*, which for a hyperscaler is effectively unbounded |
-| `? ech` | Encrypted ClientHello: the name is hidden by design, so this is "cannot judge", not "bad" |
-| `✗ drift` | Outside the allowlist |
-| `— no rule` | This program was never declared — nothing was checked |
-| `✗ undeclared` | No rule, under `strict = true` — the policy claims to be complete, so the *absence* is the finding |
-
-Rules accept exact hostnames, `*.wildcards`, autonomous systems, CIDR blocks (`10.0.0.0/8`), and ports. `strict = true` is what turns the linter from "tell me when my declared software misbehaves" into "tell me when something I never declared starts talking" — which is the shape an actual compromise has.
-
-## What you get
-
-Ten tabs, switched with `1`–`9` and `0`:
-
-| # | Tab | What it shows |
-|---|-----|---------------|
-| 1 | **Dashboard** | Latency and loss tiles, a mirrored throughput graph, the interface carrying it, and connections rolled up per process. Useful in 5 seconds. |
-| 2 | **Connections** | Every socket with its process + PID, protocol, state, GeoIP, RTT, retransmit counts, and age. |
-| 3 | **Interfaces** | Per-interface IPv4/IPv6, MAC, MTU, RX/TX, errors, drops. |
-| 4 | **Packets** | Live capture with real L7 decode, TLS 1.3 decryption, JA4, per-flow stream tracking, filters, PCAP export. |
-| 5 | **Stats** | Protocol breakdown by bytes + TCP handshake-timing histogram. |
-| 6 | **Topology** | ASCII map of machine → gateway → DNS → top hosts, with traceroute. |
-| 7 | **Timeline** | Connection timeline color-coded by TCP state; security alerts land here. |
-| 8 | **Processes** | Per-process bandwidth ranking with live RX/TX and connection counts. |
-| 9 | **Diagnose** | What is wrong, why, and what to do about it. Baseline-driven detection over a 25-rule catalogue, ranked causes with the checks that discriminated them, key-bound reversible fixes, and a `report.md` / `report.json` generated from the same objects the screen renders. *(An opt-in AI narrative appears here as commentary — never as a source of facts.)* |
-| 0 | **Egress** | Learns what each process talks to (hostname/AS/port), promotes that baseline to a policy with one keypress, then warns on drift. Observe-only, never blocks. |
-
-The Packets tab is where the forensics live — deep protocol decoding, live TLS 1.3 decryption, JA4 threat-hunting, Wireshark-style display filters, and incident capture. **[See the full feature reference →](docs/REFERENCE.md)**
-
-### Lite view
-
-Ten tabs is an operator's instrument. When the question is just *"what's using my network, and is my connection OK?"* — one machine, an SSH session to a Pi, a tmux split — there's `--lite`:
-
-```bash
-netwatch --lite     # one screen, fits 80×24
-```
-
-<p align="center">
-  <img src="docs/media/demo-lite.gif" alt="NetWatch Lite: one 80×24 screen showing live throughput charts, gateway/DNS/internet reachability, and top talkers by process and host — expanding a connection in place and filtering it live" width="820">
-</p>
-
-<p align="center">
-  <em>One screen, six keys. Live throughput, reachability, and who's talking — expand any row in place, filter as you type.</em>
-</p>
-
-Everything on a single screen: live throughput charts, gateway/DNS/internet reachability, and the top talkers by process and host. Six keys — `q` quit, `p` pause, `/` filter, `↵` expand a talker, `L` back to the full view, `?` help.
-
-Press `L` from either view to switch. Both share the same collectors, so escalating from "something looks off" to the full ten-tab forensics view costs one keypress — no restart, no lost history, capture still running.
-
-### Dense view
-
-The other direction: when you have a big terminal and want *everything* at once, `--view dense` fills it with four boxes and no chrome — no header bar, no menu bar, no status bar. Identity, sort state, page range and every keybind live inside the box borders, so every row carries data. It needs 130×44 as a floor and **grows into whatever you give it**: wider means more history in the plots and room for full hostnames, taller means more interfaces and more connections.
-
-```bash
-netwatch --view dense     # four boxes, needs 130×44
-```
-
-<p align="center">
-  <img src="docs/media/demo-dense.gif" alt="NetWatch Dense: four boxes filling the terminal — a mirrored braille throughput graph with download growing up from the time axis and upload growing down from it, per-interface rates with 60-second sparklines, four-hop latency budgets, and a connection table whose selected row's detail is hoisted into the top of the same box carrying kernel cwnd / ssthresh / mss / rwnd" width="900">
-</p>
-
-The signature element is the **mirrored dual graph**: download grows up from a centre time axis, upload grows down from the same axis. Traffic symmetry becomes a shape you recognise without reading a number — a download burst is a cliff above the line, a backup job is a cliff below it. Both halves are braille at two samples per character cell, and every cell is coloured by its **height in the graph** rather than by which series it belongs to, so you see a spike's severity before you measure it against the axis.
-
-Throughput ramps cool→bright because high bandwidth is *busy*, not *bad* — a saturated link during a backup is working. Only bounded values where high genuinely is bad — link saturation, latency budget per hop — get the green→amber→red treatment, and their meters colour by position along the bar, so the red zone is visible before you reach it.
-
-Below the graph: per-interface rates with 60-second sparklines, four-hop latency budgets (gateway, DNS, internet, and the slowest peer you're actually talking to), and the connection table with the selected row's detail hoisted into the top of the same box — no new screen, no back button. The detail row carries kernel TCP state — `cwnd`, `ssthresh`, `mss`, `rwnd` — read straight from the kernel: `inet_diag` over netlink on Linux, the `net.inet.tcp.pcblist64` sysctl on macOS. The two kernels disagree about units (Linux counts segments, BSD counts bytes), so macOS values are normalised against the MSS and the column means the same thing on both. Windows reads `--` until `GetPerTcpConnectionEStats` is wired up.
-
-`V` cycles `full → lite → dense`, or set it once under **Settings → View**. Below 130×44 it falls back to the same 80×24 grid Lite targets — which fills its area too — and it never scrolls sideways.
-
-## Deeper dives
-
-| Guide | What's in it |
-|-------|--------------|
-| **[Feature reference](docs/REFERENCE.md)** | Every keybinding, the display-filter language, protocol decoder list, themes, and config options. |
-| **[Configuration](docs/REFERENCE.md#configuration)** | The config file's location and every key in it, with defaults — including `graph_style` / `graph_fade` for the btop-style braille charts. |
-| **[TLS 1.3 decryption](docs/REFERENCE.md#tls-13-decryption)** | How `SSLKEYLOGFILE` decryption works, supported cipher suites, and what it can and can't read. |
-| **[Threat hunting with JA4](docs/REFERENCE.md#threat-hunting-with-ja4)** | Fingerprinting clients and pivoting across flows. |
-| **[Security &amp; the Landlock sandbox](docs/REFERENCE.md#security--forensics)** | The threat model, capability dropping, and the filesystem allow-list. |
-| **[Egress policy linting](docs/egress-linter-plan.md)** | The observe → promote → warn model, the rule language, `strict` mode, and the NDJSON export schema. |
-| **[Flight Recorder](docs/REFERENCE.md#flight-recorder)** | Arming, freezing, and the contents of an incident bundle. |
-| **[AI Insights](docs/INSIGHTS.md)** | Optional local/cloud LLM commentary, rendered inside the Diagnose tab (off by default). |
-
-## How it works
-
-```
-Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders
-                                            ↓
-                          Per-flow stream tracking · Handshake timing
-                          TLS 1.3 decryption · JA4 · Threat detection
-```
-
-| Collector | macOS | Linux |
-|-----------|-------|-------|
-| Connections | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
-| Packets | libpcap (BPF) | libpcap |
-| Process attribution | PKTAP | `lsof`/`ss` polling, with optional eBPF kprobe overlay |
-
-Everything degrades gracefully: features that need elevated privileges show a clear message and fall back, never crash. Full architecture notes live in [WIKI.md](docs/WIKI.md).
+| [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions, security |
+| [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
+| [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |
+| [Egress linting](docs/egress-linter-plan.md) | Observe, promote, warn |
+| [AI Insights](docs/INSIGHTS.md) | Optional LLM commentary inside Diagnose, off by default |
+| [Prometheus export](docs/observability-export.md) | Exposed metrics and scrape config |
+| [Changelog](CHANGELOG.md) | Every release |
 
 ## Related
 
-**Siblings:** [SysWatch](https://github.com/matthart1983/syswatch) (system) and [DiskWatch](https://github.com/matthart1983/diskwatch) (disk) — same chrome, different surface. **[ESSH](https://github.com/matthart1983/essh)** — a pure-Rust SSH client with the same TUI aesthetic; connects where NetWatch observes.
-
-**[NetWatch Cloud](https://www.netwatchlabs.com)** — hosted fleet monitoring for the servers you run NetWatch against. A tiny Rust agent on each Linux host, a real-time dashboard, and email + Slack alerts on latency, packet loss, or hosts going offline. **Free while we grow.** The [agent](https://github.com/matthart1983/netwatch-agent), [SDK](https://github.com/matthart1983/netwatch-sdk), and [dashboard](https://github.com/matthart1983/netwatch-dashboard) are MIT; the hosted backend is proprietary.
+[SysWatch](https://github.com/matthart1983/syswatch) and [DiskWatch](https://github.com/matthart1983/diskwatch) share the chrome. [ESSH](https://github.com/matthart1983/essh) is a Rust SSH client with the same look. [NetWatch Cloud](https://www.netwatchlabs.com) is hosted fleet monitoring built on the MIT [agent](https://github.com/matthart1983/netwatch-agent), [SDK](https://github.com/matthart1983/netwatch-sdk) and [dashboard](https://github.com/matthart1983/netwatch-dashboard).
 
 ## Thanks
 
-**Packagers.** NetWatch is in [homebrew-core](https://formulae.brew.sh/formula/netwatch), [nixpkgs](https://search.nixos.org/packages?query=netwatch), the [AUR](https://aur.archlinux.org/packages/netwatch-tui) and the [Scoop](https://scoop.sh) main bucket — and I packaged none of it. Every one of those was done by someone who found the tool useful, did the work unasked, and has kept it current since. The Scoop entry has usually tracked a release within hours of the tag.
+I packaged none of this. Dominiquini and kemelzaidan maintain [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) and [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR, tomasrivera the [nixpkgs package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix), [scillidan](https://github.com/scillidan) the [Scoop entry](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), and the Homebrew maintainers took the formula into core. File packaging problems with them and netwatch bugs here.
 
-| | |
-|---|---|
-| **Dominiquini** | [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) on the AUR, since March 2026 |
-| **kemelzaidan** | [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR |
-| **tomasrivera** | [`netwatch` in nixpkgs](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix) |
-| **[scillidan](https://github.com/scillidan)** | [`netwatch` in the Scoop main bucket](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), since v0.15.3 |
-| **Homebrew maintainers** | for taking the formula into core, and the bot that has tracked every release since |
-
-Packaging is thankless work that only gets noticed when it breaks. If you install NetWatch through one of these, you have them to thank for it, not me.
-
-**Contributors.** [@lamchau](https://github.com/lamchau), [@fdncred](https://github.com/fdncred) and [@PeteE](https://github.com/PeteE) have sent patches. Thank you — a pull request from a stranger is the best thing that happens to a project like this.
-
-And to everyone who has opened an issue with a real repro, argued with a design decision, or told me the output was wrong on their terminal: that is the feedback loop this is built on.
+[@lamchau](https://github.com/lamchau), [@fdncred](https://github.com/fdncred) and [@PeteE](https://github.com/PeteE) sent patches. Everyone who opened an issue with a repro or argued with a design decision is the reason the output is right on more terminals than mine.
 
 ## Contributing
 
-Questions, ideas, and bug reports are welcome in [GitHub Discussions](https://github.com/matthart1983/netwatch/discussions) and [Issues](https://github.com/matthart1983/netwatch/issues). See [CONTRIBUTING.md](CONTRIBUTING.md) for coding conventions and [WIKI.md](docs/WIKI.md) for the architecture guide.
+[Discussions](https://github.com/matthart1983/netwatch/discussions), [issues](https://github.com/matthart1983/netwatch/issues), [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
