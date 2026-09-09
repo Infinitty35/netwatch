@@ -6,6 +6,9 @@ pub mod macos;
 /// from `main` before anything touches libpcap.
 #[cfg(target_os = "windows")]
 pub mod npcap;
+/// Friendly-name -> Npcap device matching. Platform-neutral so the matching
+/// is tested everywhere; only the Windows lookups that feed it are gated.
+pub mod npcap_device;
 #[cfg(target_os = "macos")]
 pub mod pktap;
 /// Kernel-derived process identity — every platform, including the fallback
@@ -76,7 +79,10 @@ pub fn default_route_interface() -> Option<String> {
     #[cfg(target_os = "macos")]
     return macos::default_route_interface();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    return windows::default_route_interface();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     None
 }
 

@@ -269,3 +269,43 @@ fn collect_mtu_map() -> HashMap<String, u32> {
 
     map
 }
+
+/// Friendly adapter name -> interface GUID, from `Get-NetAdapter`. The GUID is
+/// what Npcap puts in its device name, so this is the one reliable bridge from
+/// the names ipconfig shows to the device pcap opens (issue #51). Empty when
+/// PowerShell is unavailable; the caller falls back to matching by address.
+pub fn adapter_guids() -> HashMap<String, String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid | ConvertTo-Json -Compress",
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            super::npcap_device::parse_adapter_guids(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => HashMap::new(),
+    }
+}
+
+/// Friendly name of the adapter carrying the lowest-metric IPv4 default
+/// route. `InterfaceAlias` is the same name ipconfig and Get-NetAdapter use.
+pub fn default_route_interface() -> Option<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue \
+             | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } \
+             | Select-Object -First 1).InterfaceAlias",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let alias = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!alias.is_empty()).then_some(alias)
+}

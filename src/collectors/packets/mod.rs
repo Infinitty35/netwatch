@@ -1335,10 +1335,22 @@ impl PacketCollector {
         let dns = self.dns_cache.clone();
         let stats = Arc::clone(&self.stats);
         stats.reset();
-        let iface = resolve_device_name(interface);
+        let interface = interface.to_string();
         let bpf = bpf_filter.map(|s| s.to_string());
 
         self.handle = Some(thread::spawn(move || {
+            // Resolved on the capture thread: on Windows this shells out to
+            // PowerShell, which must not stall the key handler.
+            let iface = match resolve_device_name(&interface) {
+                Ok(name) => name,
+                Err(msg) => {
+                    tracing::error!(target: "netwatch::capture", interface = %interface, error = %msg, "device resolution failed");
+                    *crate::app::safe_lock(&error, "packets::capture_resolve_error") = Some(msg);
+                    capturing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
             // Try with promiscuous mode first, fall back to non-promiscuous
             // (some interfaces like loopback don't support promisc on macOS)
             let cap = pcap::Capture::from_device(iface.as_str())
@@ -2721,41 +2733,57 @@ pub use pcap_export::export_pcap;
 mod filter;
 pub use filter::{matches_packet, parse_filter, FilterExpr};
 
-/// On Windows, pcap needs the `\Device\NPF_{GUID}` name rather than the
-/// friendly name (e.g. "Ethernet" or "Wi-Fi") that ipconfig reports.
-/// This maps friendly names to the pcap device name by matching descriptions.
-/// On non-Windows platforms this is a no-op.
-fn resolve_device_name(friendly: &str) -> String {
+/// The device name pcap opens for a user-facing interface name.
+///
+/// On Windows pcap needs `\Device\NPF_{GUID}`, not the friendly name ipconfig
+/// reports ("Ethernet", "vEthernet (WSL)"). The matching lives in
+/// `platform::npcap_device` — by the adapter's GUID from `Get-NetAdapter`, then
+/// by its IPv4 address, never by description substring (issue #51). Elsewhere
+/// the name is already the device name.
+fn resolve_device_name(friendly: &str) -> Result<String, String> {
     #[cfg(not(target_os = "windows"))]
     {
-        friendly.to_string()
+        Ok(friendly.to_string())
     }
 
     #[cfg(target_os = "windows")]
     {
-        // If it already looks like an NPF path, use as-is.
+        use crate::platform::npcap_device::{guid_for, match_npcap_device, PcapDevice};
+
         if friendly.starts_with("\\Device\\") || friendly.starts_with("\\\\") {
-            return friendly.to_string();
+            return Ok(friendly.to_string());
         }
 
-        let devices = match pcap::Device::list() {
-            Ok(d) => d,
-            Err(_) => return friendly.to_string(),
-        };
+        let devices: Vec<PcapDevice> = pcap::Device::list()
+            .map_err(|e| format!("Npcap adapter list failed: {e}"))?
+            .into_iter()
+            .map(|d| PcapDevice {
+                name: d.name,
+                desc: d.desc,
+                addrs: d.addresses.into_iter().map(|a| a.addr).collect(),
+            })
+            .collect();
 
-        let friendly_lower = friendly.to_lowercase();
-
-        // Match against the device description (which contains the friendly name).
-        for dev in &devices {
-            if let Some(ref desc) = dev.desc {
-                if desc.to_lowercase().contains(&friendly_lower) {
-                    return dev.name.clone();
-                }
-            }
+        let guid = guid_for(&crate::platform::windows::adapter_guids(), friendly);
+        if let Some(name) = match_npcap_device(friendly, guid.as_deref(), None, &devices) {
+            return Ok(name);
         }
 
-        // Fallback: return original and let pcap produce its own error.
-        friendly.to_string()
+        // No PowerShell, or the GUID matched no Npcap device: try the address
+        // ipconfig reports for this adapter.
+        let ipv4 = crate::platform::collect_interface_info()
+            .ok()
+            .and_then(|info| {
+                info.into_iter()
+                    .find(|i| i.name.eq_ignore_ascii_case(friendly))
+                    .and_then(|i| i.ipv4)
+            });
+        match_npcap_device(friendly, None, ipv4.as_deref(), &devices).ok_or_else(|| {
+            format!(
+                "No Npcap adapter matches '{friendly}' ({} listed) — is Npcap bound to it?",
+                devices.len()
+            )
+        })
     }
 }
 
