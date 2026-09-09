@@ -4,6 +4,27 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.30.4] - 2026-09-09
+
+### Fixed
+- **Windows: capture opened the wrong adapter, or none, on Hyper-V hosts**
+  ([#51](https://github.com/matthart1983/netwatch/issues/51)). The friendly
+  name ipconfig shows was matched as a *substring of Npcap's description*,
+  which is the driver's name, not the adapter's. "Ethernet" therefore landed on
+  the first "Hyper-V Virtual Ethernet Adapter" Npcap listed — the WSL switch,
+  which sees nothing but mDNS — and "vEthernet (WSL)" matched nothing and was
+  handed to Npcap verbatim, failing with "The system cannot find the file
+  specified". Adapters are now matched by interface GUID from `Get-NetAdapter`,
+  which is what Npcap's `\Device\NPF_{GUID}` name carries, with the adapter's
+  IPv4 address as the fallback where PowerShell is unavailable. A name that
+  matches no adapter says so instead of surfacing the raw open error. The
+  lookup runs on the capture thread, so PowerShell start-up no longer sits in
+  the key handler.
+- **Windows: the default capture interface honours the default route.** The
+  route-based pick from #43 only existed on Linux and macOS; Windows fell
+  through to the first UP adapter with an IPv4, which on a Hyper-V host is
+  often `vEthernet (Default Switch)`.
+
 ## [0.30.3] - 2026-09-08
 
 ### Added
