@@ -1,0 +1,395 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Netwatch gap assessment and roadmap</title><style>body{margin:0;background:#fff;color:#202020;font:17px/1.6 Georgia,serif}main{max-width:1000px;margin:54px auto;padding:0 32px 70px}h1,h2,h3,th{font-family:system-ui,sans-serif;line-height:1.25}h1{font-size:36px;margin:0 0 32px}h2{font-size:25px;margin-top:48px;border-bottom:1px solid #bbb;padding-bottom:10px}h3{font-size:20px;margin-top:32px}p{max-width:86ch}a{color:#244c68;text-underline-offset:3px}table{border-collapse:collapse;width:100%;font:14px/1.5 system-ui,sans-serif;margin:24px 0;display:block;overflow-x:auto}th,td{padding:11px 12px;text-align:left;vertical-align:top;border-bottom:1px solid #ccc}th{background:#eee}tr:nth-child(even){background:#fafafa}code{font-size:.87em;overflow-wrap:anywhere}.footnote{font-size:14px;overflow-wrap:anywhere}.footnote li{margin:12px 0}@media print{main{margin:0;padding:0}body{font-size:11pt}h1{font-size:26pt}h2{font-size:18pt}h3{font-size:14pt}table{font-size:9pt;display:table}tr,h2,h3{break-inside:avoid}a{color:inherit}@page{size:A4;margin:18mm}}</style></head><body><main><h1 id="netwatch-gap-assessment-and-roadmap">Netwatch gap assessment and roadmap</h1>
+<p>Netwatch’s strongest opportunity is to become the terminal tool that turns a network symptom into an attributable, explainable incident, then produces evidence another engineer can use. The current product already contains much of that workflow. Its next investment should concentrate on measurement credibility, safe recovery, and incident handoff before adding more screens or protocol breadth.</p>
+<p>The immediate priorities are worker sandbox coverage, remediation correctness, and honest diagnostic availability. The next product milestone should combine guided diagnosis, a shared incident timeline, and reproducible reports. Egress change review is the strongest adjacent experiment; fleet incident collaboration is a conditional commercial extension.</p>
+<h2 id="scope-and-confidence">Scope and confidence</h2>
+<p>The assessment covers the local Netwatch TUI repository at commit <code>9b4597e</code>, version <strong>0.30.4</strong>, inspected on 10 September 2026. It considers the supplied local design handover for 0.29.2 as historical context, current source and documentation as implementation evidence, and public primary sources as competitive context. The recommended audience is developers, Linux operators, and homelab users, with small engineering teams as a possible commercial expansion. Staffing, adoption, retention, and revenue data were unavailable; proposed dates and commercial demand are planning hypotheses.<sup id="fnref:1"><a class="footnote-ref" href="#fn:1">1</a></sup><sup id="fnref:2"><a class="footnote-ref" href="#fn:2">2</a></sup></p>
+<p>Library validation completed with <strong>958 passing tests, zero failures, and three ignored tests</strong> using <code>cargo test --offline --lib --quiet</code>. Three local-socket tests initially failed under the execution sandbox and passed when rerun outside it. This validates the existing Linux library suite, not privileged capture behaviour, macOS/Windows runtime parity, performance under load, or production security. Findings below distinguish directly observed code paths from risks requiring reproduction.</p>
+<p>The cloud service, separate agent, SDK, and dashboard were not audited. Public cloud statements are treated as vendor claims. Public issue-page retrieval did not expose a usable complete issue inventory; no demand ranking or issue-frequency estimate is inferred from it. Older web copies of Netwatch’s README lag the local checkout, so local code governs capability conclusions.</p>
+<h2 id="current-strengths-and-strategic-focus">Current strengths and strategic focus</h2>
+<p>Netwatch has a substantial base: ten terminal tabs, Lite and Dense views, packet inspection, process attribution, diagnostic baselines and issue lifecycles, TLS/QUIC work, egress profiling, incident capture, a headless mode, remote publishing, and aggregate Prometheus export. The roadmap should build on these assets. In particular, “add a daemon,” “add alerts,” “add egress baselines,” and “add incident export” would duplicate existing work.<sup id="fnref2:1"><a class="footnote-ref" href="#fn:1">1</a></sup><sup id="fnref:3"><a class="footnote-ref" href="#fn:3">3</a></sup></p>
+<p>The strongest design choice is the deterministic Diagnose engine. Findings have evidence, candidate causes, suppression, remediation steps, and verification conditions. The older handover explicitly proposed this structure, and the current repository implements it. That makes a new design overhaul less valuable than closing the distance between a rule’s advertised availability, its actual measurements, and its incident report.<sup id="fnref2:2"><a class="footnote-ref" href="#fn:2">2</a></sup><sup id="fnref:4"><a class="footnote-ref" href="#fn:4">4</a></sup></p>
+<p>Three user jobs should define the product:</p>
+<table>
+<thead>
+<tr>
+<th>User job</th>
+<th>Existing foundation</th>
+<th>Next useful outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>“Why is this application slow?”</td>
+<td>Process attribution, socket metrics, health probes, Diagnose</td>
+<td>Explain the likely failing layer, show missing checks, and link the finding to relevant flows</td>
+</tr>
+<tr>
+<td>“What changed when the problem started?”</td>
+<td>Timeline, baselines, topology, egress history</td>
+<td>Align route, resolver, interface, application, and policy changes on one incident timeline</td>
+</tr>
+<tr>
+<td>“Can someone else verify this?”</td>
+<td>Flight recorder, PCAP, Markdown/JSON reports</td>
+<td>Export a privacy-conscious, versioned evidence package and reopen it offline</td>
+</tr>
+</tbody>
+</table>
+<p>Recommended positioning: <strong>“Diagnose network problems from the terminal, with process-level evidence and a shareable incident report.”</strong> This is a product direction, not a claim that competitors cannot do parts of it. The opportunity lies in reducing the work between observation and explanation.</p>
+<h2 id="competitive-landscape">Competitive landscape</h2>
+<p>The relevant competitive set spans several jobs rather than one category. Official product documentation supports the capabilities below; the implications are analytical judgments. No performance or price comparisons are asserted without comparable measurements.</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Documented strength</th>
+<th>Roadmap implication for Netwatch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bandwhich</td>
+<td>Terminal bandwidth attribution using packet observation and OS process information</td>
+<td>Process names and throughput are necessary foundations; they are insufficient differentiation alone.<sup id="fnref:5"><a class="footnote-ref" href="#fn:5">5</a></sup></td>
+</tr>
+<tr>
+<td>Trippy</td>
+<td>Ping/traceroute analysis; TCP/UDP/ICMP, IPv4/IPv6, ECMP strategies, MPLS information, ASN lookup</td>
+<td>Provide useful path-change evidence and export to deeper tracing workflows; avoid rebuilding every tracing feature.<sup id="fnref:6"><a class="footnote-ref" href="#fn:6">6</a></sup></td>
+</tr>
+<tr>
+<td>Sniffnet</td>
+<td>Cross-platform graphical traffic monitoring, program identification, PCAP import/export, notifications, filtering</td>
+<td>Ease of installation and clear first-run output matter. Offline review is an established user expectation.<sup id="fnref:7"><a class="footnote-ref" href="#fn:7">7</a></sup></td>
+</tr>
+<tr>
+<td>Wireshark/TShark</td>
+<td>Detailed captured-packet analysis and extensive filtering; separate privileged capture through dumpcap</td>
+<td>Make PCAP handoff excellent. Use privilege separation as an architectural reference, and expand decoders when a supported incident needs them.<sup id="fnref:8"><a class="footnote-ref" href="#fn:8">8</a></sup><sup id="fnref2:9"><a class="footnote-ref" href="#fn:9">9</a></sup></td>
+</tr>
+<tr>
+<td>Cilium Hubble</td>
+<td>Cluster flow inspection, service maps, flow export, TLS configuration</td>
+<td>Container identity is useful; entering full Kubernetes network observability creates a much larger scope.<sup id="fnref:10"><a class="footnote-ref" href="#fn:10">10</a></sup></td>
+</tr>
+<tr>
+<td>OpenSnitch</td>
+<td>Linux interactive application firewall</td>
+<td>Preserve Netwatch’s observe-and-review use case. Enforcement requires a separate product and safety decision.<sup id="fnref:11"><a class="footnote-ref" href="#fn:11">11</a></sup></td>
+</tr>
+<tr>
+<td>NetWatch Cloud</td>
+<td>Publicly describes an agent/ingest/dashboard fleet workflow, JSON export, and free access while growing</td>
+<td>Explore shared incidents and historical evidence within the existing ecosystem. Do not assume public fleet claims establish code parity or commercial demand.<sup id="fnref2:12"><a class="footnote-ref" href="#fn:12">12</a></sup></td>
+</tr>
+</tbody>
+</table>
+<p>The competitive evidence supports focus on incident workflow, but does not establish market size or willingness to pay. A terminal-first product can serve operators well without competing feature-for-feature with packet laboratories, application firewalls, and cluster platforms simultaneously.</p>
+<h2 id="prioritised-gaps">Prioritised gaps</h2>
+<h3 id="1-worker-sandbox-coverage-needs-immediate-verification-and-correction">1. Worker sandbox coverage needs immediate verification and correction</h3>
+<p><strong>Observed:</strong> <code>App::new()</code> starts packet capture; <code>PacketCollector::start_capture()</code> spawns the worker. The TUI and daemon apply Landlock after constructing the application. The inspected ruleset calls <code>restrict_self()</code> without requesting thread synchronisation. The kernel documents that, without synchronisation, restrictions apply to the calling thread and its future children, not existing sibling threads. Thus the startup worker is outside the confinement established later by this call.<sup id="fnref:13"><a class="footnote-ref" href="#fn:13">13</a></sup><sup id="fnref:14"><a class="footnote-ref" href="#fn:14">14</a></sup></p>
+<p>This is a high-confidence architectural finding, not a demonstrated exploit. It matters because capture workers process untrusted traffic, and the README makes a broad filesystem-isolation claim. Existing-thread coverage cannot be inferred from a successful sandbox report on the application thread. Capture restart may also create workers under a different inherited restriction set.</p>
+<p><strong>Recommendation:</strong> establish an explicit worker startup barrier: acquire necessary resources, enforce the intended restrictions inside each worker or before its creation, then begin parsing. Evaluate a small privileged capture helper as the longer-term boundary. Modern thread synchronisation may help on supporting kernels, but older supported kernels still need a working design. Wireshark’s dumpcap separation offers a relevant precedent.<sup id="fnref:9"><a class="footnote-ref" href="#fn:9">9</a></sup></p>
+<p><strong>Release gate:</strong> integration checks must exercise denied file access from the actual capture/parser worker, keylog worker, and relevant runtime workers, including initial launch and restart. Use temporary test files representing disallowed resources; do not use real secrets. Report the effective protection by component. Review capability retention separately: best-effort mode deliberately retains <code>CAP_NET_RAW</code>, and the Linux backend does not impose network restrictions.<sup id="fnref2:13"><a class="footnote-ref" href="#fn:13">13</a></sup></p>
+<h3 id="2-remediation-guarantees-exceed-the-implementation">2. Remediation guarantees exceed the implementation</h3>
+<p><strong>Observed:</strong> the host implementation uses <code>std::fs::write</code> for the journal and edited files. Applying a change writes pending intent, writes the backup, writes the target, then flushes the applied journal state. A failure in the final flush returns an error after the target changed; the UI then reports “host unchanged.” Journal loading treats unreadable or invalid JSON as an empty journal. The daemon entry point does not invoke the reconciliation call used by the TUI.<sup id="fnref:15"><a class="footnote-ref" href="#fn:15">15</a></sup></p>
+<p>These are concrete failure paths. They do not demonstrate that a resolver change has been lost in normal operation. They do show that the current success/error vocabulary and recovery promise need tightening. Ordering writes alone is not proof of power-loss durability, and a partially completed operation needs a distinct outcome.</p>
+<p>The live action dispatcher implements resolver-file editing; other actions return an unsupported outcome. The cross-Unix process-liveness implementation checks <code>/proc/&lt;pid&gt;</code>, which does not provide a portable macOS liveness check. PID-only ownership also merits review for reuse. Resolver ownership and symlinks need explicit handling before treating direct file editing as generally applicable.<sup id="fnref2:15"><a class="footnote-ref" href="#fn:15">15</a></sup></p>
+<p><strong>Recommendation:</strong> prioritise trustworthy reporting and recovery over adding more automatic fixes. Introduce explicit unchanged/applied/partially-applied/recovery-required outcomes; durable journal replacement with appropriate synchronisation; corruption detection; operation ownership and locking; and reconciliation shared by every entry point. Use resolver-manager-specific adapters where supported and instructions elsewhere. Avoid naïvely replacing manager-owned symlinks.</p>
+<p><strong>Release gate:</strong> inject failures at every persistence boundary; test truncated journals, concurrent instances, PID reuse handling, external resolver edits, and restart through both TUI and daemon. Every state must preserve a recoverable backup or provide a precise recovery instruction. The interface must never claim the host is unchanged when an edit may have landed.</p>
+<h3 id="3-rule-availability-must-reflect-live-evidence">3. Rule availability must reflect live evidence</h3>
+<p><strong>Observed:</strong> the README says all 25 rules are active. The live observation constructor always sets <code>idle_rtt_ms</code> and <code>loaded_rtt_ms</code> to <code>None</code>. The local-bufferbloat detector returns without a finding unless both are present. Fixtures populate these values, so detector tests can pass without proving live availability.<sup id="fnref2:4"><a class="footnote-ref" href="#fn:4">4</a></sup><sup id="fnref:16"><a class="footnote-ref" href="#fn:16">16</a></sup></p>
+<p><strong>Recommendation:</strong> generate availability from actual runtime prerequisites. Distinguish “available,” “learning,” “missing permission,” “unsupported,” and “measurement not run.” Catalogue membership is not the same as live evaluation capability. Show these states in Diagnose and reports. Add an opt-in bounded loaded-latency test if users need local-bufferbloat diagnosis; document its traffic and duration before it runs.</p>
+<p><strong>Release gate:</strong> each advertised rule maps to a real collector, platform/privilege requirements, an end-to-end triggering scenario, and a recovery scenario. Missing input must produce “unknown/not measured,” never an implication of good health. Use evidence-support scores with their checks visible; do not present a weighted score as a calibrated probability.</p>
+<h3 id="4-attribution-needs-measurable-coverage-across-deployment-conditions">4. Attribution needs measurable coverage across deployment conditions</h3>
+<p>The 0.29.2 handover reported severe unknown-process attribution. The current code includes a pre-sandbox process snapshot and eBPF fallback handling, so that historical failure must not be asserted as an unresolved current reproduction. However, attribution remains foundational to Processes, Connections, Egress, and any diagnosis naming an application.<sup id="fnref3:2"><a class="footnote-ref" href="#fn:2">2</a></sup><sup id="fnref:17"><a class="footnote-ref" href="#fn:17">17</a></sup></p>
+<p><strong>Recommendation:</strong> expose attribution method, age, known/unknown flow share, and reason for degradation. Test short-lived TCP/UDP over IPv4/IPv6, existing connections at startup, restart, missing eBPF capability, PID churn, and network namespaces. Start container work with cgroup/container identity on Linux; add orchestration metadata only if pilot users need it. A search of the inspected attribution and policy paths did not establish container-aware identity; this is a bounded gap assessment, not a claim about the separate SDK or agent.</p>
+<p>Windows kernel TCP metrics currently return no data in the inspected collector, and macOS/Windows sandbox backends report unavailable. Platform support should therefore be presented as a capability matrix rather than equivalent depth. A narrow, dependable Windows experience is preferable to unsupported fields that resemble missing traffic.<sup id="fnref2:17"><a class="footnote-ref" href="#fn:17">17</a></sup></p>
+<h3 id="5-incident-capture-needs-a-safe-sharing-and-replay-contract">5. Incident capture needs a safe sharing and replay contract</h3>
+<p>The flight recorder already has bounded retention, a manifest, snapshots, a Markdown summary, and PCAP export. Diagnose separately exports Markdown and JSON. The inspected incident export writes captured packets and descriptive snapshots directly; it does not expose a redaction policy in that path. This is an improvement to existing export, not a proposal to invent incident bundles.<sup id="fnref:18"><a class="footnote-ref" href="#fn:18">18</a></sup></p>
+<p><strong>Recommendation:</strong> define a shared incident identifier, event timestamps, schema version, collector provenance, capture-loss/coverage information, and a manifest linking diagnosis to packet evidence. Offer a summary-only sharing profile by default for handoff, with explicit selection of sensitive raw evidence. Preserve the original capture separately when fidelity matters. Payload redaction is more complex than removing visible hostnames, so do not label a PCAP safe after superficial field masking.</p>
+<p>Add reopening of an incident package before general-purpose PCAP replay. Diagnosis often depends on kernel/process/probe observations that a PCAP cannot reconstruct. A reopened package should reproduce saved findings; recomputation under a newer engine should be a separate, version-labelled operation. General PCAP import can then provide the subset of diagnosis supported by packets alone.</p>
+<p><strong>Release gate:</strong> exported evidence is understandable on another machine; redacted output contains no seeded sensitive test values; file permissions are deliberate; truncation is visible; the package opens without network access; and schema compatibility is tested.</p>
+<h3 id="6-egress-can-become-a-development-change-review-workflow">6. Egress can become a development change-review workflow</h3>
+<p>Existing policy supports process rules, hostname/IP/ASN destinations, ports, and strict handling of undeclared processes. Destination matching accepts a hostname, ASN, or IP match after the port condition. Broad ASN allowance can therefore authorise more than the named service alone. The product already exposes matching granularity; retain this honesty.<sup id="fnref:19"><a class="footnote-ref" href="#fn:19">19</a></sup></p>
+<p>The opportunity is to answer “what new destinations did this build or task introduce?” This can help developers reviewing dependency changes, installation scripts, or automated workloads. It remains a hypothesis until used in real reviews. A process name alone may conflate distinct executables or multiple tasks sharing a runtime, so stronger executable/workload identity is a prerequisite.</p>
+<p><strong>Recommendation:</strong> add bounded sessions, before/after policy diff, destination evidence, approved exceptions with expiry, and a machine-readable result for CI. Separate “no observed change” from “complete observation”; short runs and encrypted naming can limit coverage. Retain observation semantics. Do not claim this prevents exfiltration or proves a program safe.</p>
+<p><strong>Release gate:</strong> five pilot projects use it in actual change reviews, can explain flagged destinations, and can distinguish expected updates from actionable drift. Stronger identity and stable exports precede any fail-on-drift CI mode.</p>
+<h3 id="7-release-assurance-should-cover-behaviour-beyond-library-correctness">7. Release assurance should cover behaviour beyond library correctness</h3>
+<p>The repository already has three-OS CI with formatting, Clippy, release builds, and tests. That is a meaningful strength. The inspected workflow inventory does not include dedicated fuzzing, sustained capture benchmarks, or dependency-audit jobs. Large coordinating modules—about 5,000 lines in <code>app.rs</code> and 3,900 in the packet collector—also raise the cost of changing startup, collection, and UI behaviour together.<sup id="fnref:20"><a class="footnote-ref" href="#fn:20">20</a></sup></p>
+<p><strong>Recommendation:</strong> add representative malformed-packet fuzzing, bounded-memory/soak checks, and live capture/attribution scenarios on a small supported platform matrix. Publish CPU, RSS, packet loss, and UI responsiveness for named hardware and traffic profiles. Capture statistics already exist; surface their effect on diagnostic confidence instead of adding another competing counter.<sup id="fnref2:18"><a class="footnote-ref" href="#fn:18">18</a></sup><sup id="fnref2:20"><a class="footnote-ref" href="#fn:20">20</a></sup></p>
+<p>Extract runtime lifecycle and incident assembly from UI orchestration as enabling work for headless diagnosis and replay. Preserve existing collector logic initially. A rewrite would consume the same capacity needed to validate real behaviour.</p>
+<h3 id="8-documentation-and-onboarding-need-one-capability-model">8. Documentation and onboarding need one capability model</h3>
+<p>The current README places optional AI commentary in Diagnose, while <code>docs/INSIGHTS.md</code> still instructs users to open an Insights tab numbered 8. The rule-coverage discrepancy is another example of documentation describing a broader experience than the live path guarantees.<sup id="fnref3:1"><a class="footnote-ref" href="#fn:1">1</a></sup><sup id="fnref2:16"><a class="footnote-ref" href="#fn:16">16</a></sup><sup id="fnref:21"><a class="footnote-ref" href="#fn:21">21</a></sup></p>
+<p><strong>Recommendation:</strong> create a capability summary at first run and in a proposed <code>doctor</code> command: selected interface, capture status, attribution backend, probe availability, effective sandbox, and relevant external lookups. Derive help and capability documentation from shared definitions where practical. Keep Dense and Lite; improve task navigation and error explanations before another broad visual redesign.</p>
+<p>AI should remain optional commentary, visibly separate from measured evidence and authorised actions. Network-derived text is untrusted input; any future AI expansion needs tests for misleading instructions in observed data and explicit disclosure of what is sent to the configured service. No automatic execution based on model narrative is recommended.</p>
+<h2 id="roadmap-and-delivery-gates">Roadmap and delivery gates</h2>
+<p>The schedule assumes approximately one experienced full-time maintainer, with access to platform testers and intermittent security review. Estimates include meaningful validation but are not commitments. Phases are sequential; later scope should move if the trust work reveals broader changes. Priority is ordinal: <strong>P0</strong> protects existing promises, <strong>P1</strong> completes the primary workflow, and <strong>P2</strong> tests expansion.</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Indicative window</th>
+<th>Deliverables</th>
+<th>Exit gate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A: Trust and recovery</td>
+<td>Weeks 1–4</td>
+<td>Worker confinement; truthful remediation outcomes; shared startup reconciliation; rule availability; capability documentation</td>
+<td>Worker-level isolation checks pass; persistence-failure cases report truthfully; every rule declares real prerequisites</td>
+</tr>
+<tr>
+<td>B: Complete diagnosis</td>
+<td>Weeks 5–9</td>
+<td>Guided diagnostic session; observation provenance; attribution coverage; bounded headless diagnosis; targeted active tests</td>
+<td>Representative failures produce supported explanations, known missing checks, and verified recovery</td>
+</tr>
+<tr>
+<td>C: Evidence handoff</td>
+<td>Weeks 10–13</td>
+<td>Shared incident schema; correlated timeline; sharing profiles; offline package reopening; focused runtime extraction</td>
+<td>A second engineer can understand and reopen an incident without the original host</td>
+</tr>
+<tr>
+<td>D: Egress pilot</td>
+<td>Weeks 14–18</td>
+<td>Workload identity; bounded sessions; policy diff; stable JSON; reviewed exceptions</td>
+<td>Five real projects complete change reviews and justify continued use</td>
+</tr>
+<tr>
+<td>E: Fleet discovery</td>
+<td>After phase C; build after demand gate</td>
+<td>Customer interviews and prototype of shared incidents, history, ownership, and annotations</td>
+<td>Repeated multi-host incidents plus at least three explicit paid-pilot commitments before substantial service expansion</td>
+</tr>
+</tbody>
+</table>
+<h3 id="first-backlog">First backlog</h3>
+<p>Effort bands are approximate engineer effort: S = 1–3 days, M = 4–8 days, L = 2–4 weeks. They overlap with phase work and should not be added as a promised delivery total.</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Priority</th>
+<th>Work</th>
+<th>Effort</th>
+<th>Dependency / acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NW-R01</td>
+<td>P0</td>
+<td>Map worker startup and enforce confinement at the real boundary</td>
+<td>L</td>
+<td>Isolated worker tests cover launch and restart; effective status is accurate</td>
+</tr>
+<tr>
+<td>NW-R02</td>
+<td>P0</td>
+<td>Correct partial-apply and journal-corruption outcomes</td>
+<td>M</td>
+<td>No false “unchanged”; recoverable failure state exposed</td>
+</tr>
+<tr>
+<td>NW-R03</td>
+<td>P0</td>
+<td>Durable journal, concurrent ownership, common reconciliation</td>
+<td>L</td>
+<td>R02; injected failures and TUI/daemon restarts behave consistently</td>
+</tr>
+<tr>
+<td>NW-R04</td>
+<td>P0</td>
+<td>Runtime diagnostic availability and README correction</td>
+<td>S–M</td>
+<td>All 25 catalogue entries trace to prerequisites; dormant bufferbloat shown correctly</td>
+</tr>
+<tr>
+<td>NW-R05</td>
+<td>P1</td>
+<td>Capability/doctor output and platform matrix</td>
+<td>M</td>
+<td>R01/R04; unsupported states distinguishable from healthy readings</td>
+</tr>
+<tr>
+<td>NW-R06</td>
+<td>P1</td>
+<td>Attribution coverage and lifecycle integration corpus</td>
+<td>L</td>
+<td>R01; short-lived and startup flows measured against known generators</td>
+</tr>
+<tr>
+<td>NW-R07</td>
+<td>P1</td>
+<td>Incident schema and common report assembly</td>
+<td>M</td>
+<td>Versioning, provenance, capture completeness, deterministic saved output</td>
+</tr>
+<tr>
+<td>NW-R08</td>
+<td>P1</td>
+<td>Bounded headless diagnostic session and JSON output</td>
+<td>M</td>
+<td>R04/R07; finite duration, documented exit statuses, missing-input semantics</td>
+</tr>
+<tr>
+<td>NW-R09</td>
+<td>P1</td>
+<td>Sharing profiles and offline package reopening</td>
+<td>L</td>
+<td>R07; sensitive-value fixtures and cross-machine round trip</td>
+</tr>
+<tr>
+<td>NW-R10</td>
+<td>P1</td>
+<td>Guided symptom flow and correlated incident timeline</td>
+<td>L</td>
+<td>R07; measurable reduction in time to supported explanation</td>
+</tr>
+<tr>
+<td>NW-R11</td>
+<td>P1</td>
+<td>Parser fuzzing and published performance profiles</td>
+<td>M–L</td>
+<td>Resource budgets, malformed traffic, and capture loss visible</td>
+</tr>
+<tr>
+<td>NW-R12</td>
+<td>P2</td>
+<td>Workload egress diff pilot</td>
+<td>L</td>
+<td>R06/R08; real review usage, explicit unknown coverage, useful exceptions</td>
+</tr>
+</tbody>
+</table>
+<p>Proposed CLI concepts such as <code>netwatch doctor</code>, <code>netwatch diagnose --duration 60s --json</code>, and <code>netwatch incident open &lt;bundle&gt;</code> are <strong>future interface sketches</strong>, not existing commands. Settle exact syntax after the shared runtime and schema are designed.</p>
+<h2 id="validation-programme-and-success-measures">Validation programme and success measures</h2>
+<p>Build a compact labelled scenario corpus around slow/unreachable DNS, gateway failure, external service refusal, packet loss, path changes, IPv6 failure, missing privileges, and short-lived connections. Add local bufferbloat only with a real live measurement path. Pair each fault with recovery and a benign lookalike. Examples include ICMP silence with successful application connectivity and a changed CDN destination that is expected.</p>
+<p>Use independent observations to establish ground truth. A fixture proving the engine emits the expected rule is useful, but an integration scenario must establish that the real collector supplies the needed measurement. Distinguish probable cause from proven cause; on incomplete evidence, success may be an explicit next check.</p>
+<p>Proposed initial targets are management gates, not current measured results:</p>
+<table>
+<thead>
+<tr>
+<th>Measure</th>
+<th>Initial target</th>
+<th>Interpretation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Capability disclosure</td>
+<td>100% of supported collector states represented</td>
+<td>No silent substitution of missing data with health</td>
+</tr>
+<tr>
+<td>Diagnostic corpus</td>
+<td>At least 20 fault/recovery/benign scenarios</td>
+<td>Coverage quality matters more than raw count</td>
+</tr>
+<tr>
+<td>Supported explanation</td>
+<td>At least 90% of labelled supported scenarios</td>
+<td>Include uncertain/unsupported cases separately; do not hide them in denominator</td>
+</tr>
+<tr>
+<td>Attribution</td>
+<td>At least 95% of eligible flows in controlled supported scenarios</td>
+<td>Publish by backend, protocol, lifetime, and privilege; report byte coverage separately</td>
+</tr>
+<tr>
+<td>Handoff usability</td>
+<td>Four of five pilot engineers understand a seeded incident within five minutes</td>
+<td>A small usability gate, not population-level evidence</td>
+</tr>
+<tr>
+<td>Resource behaviour</td>
+<td>Establish baseline, then investigate regressions above 10% on fixed profiles</td>
+<td>Declare machine, rates, duration, capture settings, and noise</td>
+</tr>
+<tr>
+<td>Recovery safety</td>
+<td>All injected persistence failures give accurate, recoverable states</td>
+<td>A release gate, not a probability claim</td>
+</tr>
+</tbody>
+</table>
+<p>Start with eight to twelve interviews across developers, Linux operators, and homelab users. Ask for the last actual network incident, the tools used, time spent gathering evidence, and what had to be shared. Have participants perform a task with Netwatch, not rank a feature wishlist. Record whether they return for a second incident before treating first-run enthusiasm as retention.</p>
+<h2 id="commercial-opportunities-and-explicit-deferrals">Commercial opportunities and explicit deferrals</h2>
+<p>The closest commercial extension is shared incident history: teams pay for retaining evidence, comparing hosts, coordinating ownership, and producing reports across incidents. This follows naturally from a capable free local tool. It should be validated against actual repeated incidents before adding substantial backend scope. Cloud pricing and unit economics require separate evidence: storage per incident, ingest rate, retention, support burden, and willingness to pay.</p>
+<p>The public cloud site currently describes free access while growing and advertises fleet monitoring. Those statements do not validate sustainable pricing or production scale. Avoid copying its comparison table into sales material as independent benchmarking. The local TUI remote publisher samples snapshots every 15 seconds; the cloud page describes one-second resolution. These may be different product paths, so document boundaries rather than asserting a contradiction across repositories.<sup id="fnref2:3"><a class="footnote-ref" href="#fn:3">3</a></sup><sup id="fnref:12"><a class="footnote-ref" href="#fn:12">12</a></sup></p>
+<p>Defer full Kubernetes observability, automatic firewall enforcement, an autonomous AI remediation agent, broad new protocol coverage, and decorative terminal graphics. Container identity, useful PCAP handoff, and explainable egress review can deliver value without those commitments. Revisit protocol depth when repeated incidents cannot be explained with existing evidence; revisit fleet expansion when users need cross-host correlation that local reports cannot provide.</p>
+<p>The near-term investment decision is to fund phases A–C as a coherent product improvement, run the egress pilot after identity and exports are dependable, and make fleet expansion contingent on demonstrated demand. This preserves Netwatch’s existing strengths while making its central promise reviewable and trustworthy.</p>
+<h2 id="sources">Sources</h2>
+<p>Local citations refer to the inspected checkout, version 0.30.4 at <code>9b4597e</code>; public code links use that commit for reproducibility. Web sources were accessed 10 September 2026. Undated documentation is identified as such; vendor capabilities are not independently benchmarked.</p>
+<div class="footnote">
+<hr />
+<ol>
+<li id="fn:1">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/README.md">README</a> and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/Cargo.toml">Cargo manifest</a>. Local checkout, 0.30.4. Product scope, version, tabs, claims.&#160;<a class="footnote-backref" href="#fnref:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref3:1" title="Jump back to footnote 1 in the text">&#8617;</a></p>
+</li>
+<li id="fn:2">
+<p>Netwatch next handover, <code>HANDOVER.md</code> and <code>review/REVIEW.md</code>, 3 September 2026, version 0.29.2. Local files in <code>/home/matt/Downloads/netwatch-next-handover/netwatch-next/</code>; no public URL supplied. Historical design and observations, not current bug reproduction.&#160;<a class="footnote-backref" href="#fnref:2" title="Jump back to footnote 2 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:2" title="Jump back to footnote 2 in the text">&#8617;</a><a class="footnote-backref" href="#fnref3:2" title="Jump back to footnote 2 in the text">&#8617;</a></p>
+</li>
+<li id="fn:3">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/docs/observability-export.md">observability export</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/remote/mod.rs">remote publisher</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/main.rs">main entry point</a>. Local checkout. Existing daemon, metrics, queue and publication cadence.&#160;<a class="footnote-backref" href="#fnref:3" title="Jump back to footnote 3 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:3" title="Jump back to footnote 3 in the text">&#8617;</a></p>
+</li>
+<li id="fn:4">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/engine.rs">diagnostic engine</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/rules.rs">rules</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/issue.rs">issue model</a>. Local checkout. Existing deterministic issue workflow.&#160;<a class="footnote-backref" href="#fnref:4" title="Jump back to footnote 4 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:4" title="Jump back to footnote 4 in the text">&#8617;</a></p>
+</li>
+<li id="fn:5">
+<p>imsnif/bandwhich, <a href="https://github.com/imsnif/bandwhich">official repository README</a>. Undated living documentation. Attribution and bandwidth-monitoring scope.&#160;<a class="footnote-backref" href="#fnref:5" title="Jump back to footnote 5 in the text">&#8617;</a></p>
+</li>
+<li id="fn:6">
+<p>Trippy, <a href="https://trippy.rs/">official product documentation</a>. Undated living documentation. Tracing protocols, ECMP, MPLS, ASN, NAT.&#160;<a class="footnote-backref" href="#fnref:6" title="Jump back to footnote 6 in the text">&#8617;</a></p>
+</li>
+<li id="fn:7">
+<p>GyulyVGC/Sniffnet, <a href="https://github.com/GyulyVGC/sniffnet">official repository README</a>. Undated living documentation. Program identification, notifications, capture import/export.&#160;<a class="footnote-backref" href="#fnref:7" title="Jump back to footnote 7 in the text">&#8617;</a></p>
+</li>
+<li id="fn:8">
+<p>Wireshark, <a href="https://www.wireshark.org/docs/wsug_html_chunked/ChapterWork.html">Working With Captured Packets</a>. Undated current User’s Guide. Packet-analysis workflow and display filters.&#160;<a class="footnote-backref" href="#fnref:8" title="Jump back to footnote 8 in the text">&#8617;</a></p>
+</li>
+<li id="fn:9">
+<p>Wireshark, <a href="https://www.wireshark.org/docs/wsdg_html_chunked/ChWorksCapturePackets.html">Capturing packets</a> and <a href="https://wiki.wireshark.org/CaptureSetup/CapturePrivileges">Capture Privileges</a>. Living official documentation. Privileged capture isolation through dumpcap.&#160;<a class="footnote-backref" href="#fnref:9" title="Jump back to footnote 9 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:9" title="Jump back to footnote 9 in the text">&#8617;</a></p>
+</li>
+<li id="fn:10">
+<p>Cilium, <a href="https://docs.cilium.io/en/stable/observability/hubble/">Network Observability with Hubble</a>. Retrieved documentation labelled 1.20.1. Cluster inspection, service map, exporter, TLS topics.&#160;<a class="footnote-backref" href="#fnref:10" title="Jump back to footnote 10 in the text">&#8617;</a></p>
+</li>
+<li id="fn:11">
+<p>evilsocket/OpenSnitch, <a href="https://github.com/evilsocket/opensnitch">official repository</a>. Undated living documentation. Linux interactive application firewall scope.&#160;<a class="footnote-backref" href="#fnref:11" title="Jump back to footnote 11 in the text">&#8617;</a></p>
+</li>
+<li id="fn:12">
+<p>NetWatch Labs, <a href="https://www.netwatchlabs.com/cloud">Cloud</a>. Undated vendor page. Public fleet workflow, free-while-growing statement, export and resolution claims; service not audited.&#160;<a class="footnote-backref" href="#fnref:12" title="Jump back to footnote 12 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:12" title="Jump back to footnote 12 in the text">&#8617;</a></p>
+</li>
+<li id="fn:13">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L710">application startup</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/collectors/packets/mod.rs#L1320">capture worker</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/sandbox/linux.rs">Linux sandbox</a>. Local checkout. Startup order, worker creation, restriction API and retained capabilities.&#160;<a class="footnote-backref" href="#fnref:13" title="Jump back to footnote 13 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:13" title="Jump back to footnote 13 in the text">&#8617;</a></p>
+</li>
+<li id="fn:14">
+<p>Mickaël Salaün / Linux kernel project, <a href="https://www.kernel.org/doc/html/latest/userspace-api/landlock.html">Landlock: unprivileged access control</a>, retrieved page dated August 2026. Thread inheritance and explicit TSYNC requirements. Local <code>landlock-0.4.7</code> crate source also inspected for default restriction flags.&#160;<a class="footnote-backref" href="#fnref:14" title="Jump back to footnote 14 in the text">&#8617;</a></p>
+</li>
+<li id="fn:15">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/remediation.rs#L128">remediation journal</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L4908">action dispatcher</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L1703">TUI startup</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L1943">daemon startup</a>. Local checkout. Write ordering, error reporting, liveness and reconciliation differences.&#160;<a class="footnote-backref" href="#fnref:15" title="Jump back to footnote 15 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:15" title="Jump back to footnote 15 in the text">&#8617;</a></p>
+</li>
+<li id="fn:16">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/live.rs#L160">live observations</a> and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/diagnose/detectors.rs#L1619">bufferbloat detector</a>. Local checkout. Missing loaded/idle RTT inputs and early return.&#160;<a class="footnote-backref" href="#fnref:16" title="Jump back to footnote 16 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:16" title="Jump back to footnote 16 in the text">&#8617;</a></p>
+</li>
+<li id="fn:17">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L750">attribution initialisation</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/collectors/tcp_info.rs">TCP information collector</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/sandbox/mod.rs">sandbox platform dispatch</a>. Local checkout. Current mitigations and platform boundaries.&#160;<a class="footnote-backref" href="#fnref:17" title="Jump back to footnote 17 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:17" title="Jump back to footnote 17 in the text">&#8617;</a></p>
+</li>
+<li id="fn:18">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/collectors/incident.rs#L240">incident recorder</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/app.rs#L4951">diagnostic report export</a>, and <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/collectors/packets/mod.rs#L1428">capture statistics</a>. Local checkout. Existing evidence retention, export paths and capture health.&#160;<a class="footnote-backref" href="#fnref:18" title="Jump back to footnote 18 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:18" title="Jump back to footnote 18 in the text">&#8617;</a></p>
+</li>
+<li id="fn:19">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/src/collectors/egress/policy.rs">egress policy implementation</a>. Local checkout. Identity model, matching semantics, strict mode.&#160;<a class="footnote-backref" href="#fnref:19" title="Jump back to footnote 19 in the text">&#8617;</a></p>
+</li>
+<li id="fn:20">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/.github/workflows/ci.yml">CI workflow</a>, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/.github/workflows/release.yml">release workflow</a>, and local source inventory. Validation command and result recorded in this report’s scope; no performance measurements collected.&#160;<a class="footnote-backref" href="#fnref:20" title="Jump back to footnote 20 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:20" title="Jump back to footnote 20 in the text">&#8617;</a></p>
+</li>
+<li id="fn:21">
+<p>Netwatch, <a href="https://github.com/matthart1983/netwatch/blob/9b4597e/docs/INSIGHTS.md">AI Insights documentation</a>. Local checkout. Stale tab instructions and opt-in external commentary.&#160;<a class="footnote-backref" href="#fnref:21" title="Jump back to footnote 21 in the text">&#8617;</a></p>
+</li>
+</ol>
+</div></main></body></html>

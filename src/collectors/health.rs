@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
-use std::thread;
 
 // One sample per probe — i.e. one per `HEALTH_PROBE_TICKS` refresh ticks —
 // retained for `HISTORY_WINDOW_SECS`. This was a bare 60, which at a 5-tick
@@ -13,6 +12,7 @@ const RTT_HISTORY_MAX: usize = crate::app::probe_history_len(1000);
 
 #[derive(Clone)]
 pub struct HealthStatus {
+    pub completed: ProbeTimes,
     pub gateway_rtt_ms: Option<f64>,
     pub gateway_loss_pct: f64,
     pub dns_rtt_ms: Option<f64>,
@@ -37,6 +37,27 @@ pub struct HealthStatus {
     pub dns_cross_history: VecDeque<bool>,
     /// The latest STUN mapping probe. Runs every [`STUN_EVERY`] cycles.
     pub nat: Option<NatProbe>,
+}
+
+/// Completion times belong to measurements, not the UI refresh cadence.
+#[derive(Clone, Debug, Default)]
+pub struct ProbeTimes {
+    /// Completion timestamps aligned with each RTT history, oldest first.
+    pub gateway_history: VecDeque<std::time::Instant>,
+    pub dns_history: VecDeque<std::time::Instant>,
+    pub internet_history: VecDeque<std::time::Instant>,
+    pub gateway: Option<std::time::Instant>,
+    pub dns: Option<std::time::Instant>,
+    pub internet: Option<std::time::Instant>,
+    pub nat: Option<std::time::Instant>,
+    pub gateway_target: Option<String>,
+    pub dns_target: Option<String>,
+}
+
+impl ProbeTimes {
+    pub fn fresh(at: Option<std::time::Instant>, max_secs: u64) -> bool {
+        at.is_some_and(|at| at.elapsed() <= std::time::Duration::from_secs(max_secs))
+    }
 }
 
 /// Reply flags for one DNS probe cycle.
@@ -123,6 +144,7 @@ impl HealthProber {
     pub fn new() -> Self {
         Self {
             snapshot: Arc::new(RwLock::new(Arc::new(HealthStatus {
+                completed: Default::default(),
                 gateway_rtt_ms: None,
                 gateway_loss_pct: 100.0,
                 dns_rtt_ms: None,
@@ -158,20 +180,29 @@ impl HealthProber {
         let gw = gateway.map(|s| s.to_string());
         let dns = dns_server.map(|s| s.to_string());
         let cycle = self.cycles.fetch_add(1, Ordering::SeqCst);
-        thread::spawn(move || {
+        crate::sandbox::worker::spawn("health", move || {
             // Each probe block builds a new HealthStatus off the latest
             // published snapshot, then swaps it in. The deep-clone is cheap:
             // `HealthStatus` contains at most ~60 history entries per series.
             if let Some(gw) = gw.as_deref() {
                 let (rtt, loss) = run_gateway_probe(gw);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_gw")).clone();
+                if next.completed.gateway_target.as_deref() != Some(gw) {
+                    next.gateway_rtt_history.clear();
+                    next.completed.gateway_history.clear();
+                }
                 next.gateway_rtt_ms = rtt;
                 next.gateway_loss_pct = loss;
+                let completed = std::time::Instant::now();
+                next.completed.gateway_history.push_back(completed);
                 next.gateway_rtt_history.push_back(rtt);
                 if next.gateway_rtt_history.len() > RTT_HISTORY_MAX {
                     next.gateway_rtt_history.pop_front();
+                    next.completed.gateway_history.pop_front();
                 }
                 next.gateway_rtt_history.make_contiguous();
+                next.completed.gateway = Some(completed);
+                next.completed.gateway_target = Some(gw.to_string());
                 *safe_write(&snapshot, "health::probe::publish_gw") = Arc::new(next);
             }
             if let Some(dns) = dns.as_deref() {
@@ -183,15 +214,24 @@ impl HealthProber {
                 // and the sandbox has dropped CAP_NET_RAW, even though UDP
                 // queries to port 53 work fine.
                 let (rtt, loss, flags) = run_dns_query(dns);
+                let completed = std::time::Instant::now();
                 // Same cycle, same resolver: what does it say a public name
                 // resolves to, against a reference that validates?
                 let cross = run_dns_cross_check(dns);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_dns")).clone();
+                if next.completed.dns_target.as_deref() != Some(dns) {
+                    next.dns_rtt_history.clear();
+                    next.completed.dns_history.clear();
+                    next.dns_probe_history.clear();
+                    next.dns_cross_history.clear();
+                }
                 next.dns_rtt_ms = rtt;
                 next.dns_loss_pct = loss;
+                next.completed.dns_history.push_back(completed);
                 next.dns_rtt_history.push_back(rtt);
                 if next.dns_rtt_history.len() > RTT_HISTORY_MAX {
                     next.dns_rtt_history.pop_front();
+                    next.completed.dns_history.pop_front();
                 }
                 next.dns_rtt_history.make_contiguous();
                 next.dns_probe_history.push_back(flags);
@@ -206,12 +246,15 @@ impl HealthProber {
                     }
                 }
                 next.dns_cross = cross;
+                next.completed.dns = Some(completed);
+                next.completed.dns_target = Some(dns.to_string());
                 *safe_write(&snapshot, "health::probe::publish_dns") = Arc::new(next);
             }
             if cycle.is_multiple_of(STUN_EVERY) {
                 if let Some(nat) = run_stun_probe() {
                     let mut next = (**safe_read(&snapshot, "health::probe::read_nat")).clone();
                     next.nat = Some(nat);
+                    next.completed.nat = Some(std::time::Instant::now());
                     *safe_write(&snapshot, "health::probe::publish_nat") = Arc::new(next);
                 }
             }
@@ -223,11 +266,15 @@ impl HealthProber {
                 let mut next = (**safe_read(&snapshot, "health::probe::read_inet")).clone();
                 next.internet_rtt_ms = rtt;
                 next.internet_loss_pct = loss;
+                let completed = std::time::Instant::now();
+                next.completed.internet_history.push_back(completed);
                 next.internet_rtt_history.push_back(rtt);
                 if next.internet_rtt_history.len() > RTT_HISTORY_MAX {
                     next.internet_rtt_history.pop_front();
+                    next.completed.internet_history.pop_front();
                 }
                 next.internet_rtt_history.make_contiguous();
+                next.completed.internet = Some(completed);
                 *safe_write(&snapshot, "health::probe::publish_inet") = Arc::new(next);
             }
             busy.store(false, Ordering::SeqCst);

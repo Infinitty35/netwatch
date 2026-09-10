@@ -56,8 +56,12 @@ metrics endpoint to the internet deliberately).
 
 ## Hardening notes for operators
 
-- Run with the sandbox on (default). `--sandbox-strict` refuses to start if it
-  can't be enforced.
+- Worker entry points now apply Linux filesystem policy before processing;
+  capture prepares its device before policy entry. Strict startup rejects required
+  entry failures. Writable grants use dedicated application paths, and configured
+  inputs receive exact file grants. Network access remains unrestricted. Privileged
+  capture/restart acceptance and some shutdown guarantees remain pending. See the
+  [exact scope](docs/REFERENCE.md#landlock-sandbox-linux).
 - Treat TLS keylog files and exported incident bundles as secrets — they can
   contain decrypted traffic.
 - `netwatch daemon` metrics bind to `127.0.0.1` by default; keep it that way

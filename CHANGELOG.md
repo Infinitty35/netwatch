@@ -4,6 +4,52 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-09-11
+
+### Fixed
+- RTT timeline tracks and spike events use recorded probe completion times.
+  Missing or expired RTT readings show only the horizontal baseline, matching
+  throughput. Subsecond refresh intervals no longer stretch the time scale.
+- Diagnose no longer treats missing verification data as recovery or an empty
+  issue list as proof of health. Stale observations are excluded; cached samples
+  cannot complete a recovery hold or repeatedly train health baselines.
+- Diagnostic reports retain closed findings and include runtime input coverage.
+  Seven catalogued rules without Diagnose integration are now explicitly planned.
+- Remediation failures after a target write now carry a recovery-required outcome
+  with the operation and backup, instead of claiming the host is unchanged.
+  Partial writes and unreadable recovery targets are not treated as successful
+  recovery. UI details and Markdown/JSON reports preserve the outcome.
+- Invalid, unsupported or unreadable journals are preserved and block subsequent
+  writes, including shutdown persistence. Journal persistence failures are visible
+  and block additional mutations. A second edit cannot overwrite an unresolved
+  target's backup.
+
+### Changed
+- Linux worker entry points enforce a pinned filesystem ruleset before processing;
+  strict entry failures block work and fail startup. Selected capability removals
+  are verified, capture readiness is separate from start requests, and managed
+  worker joins share a shutdown deadline. Privileged capture/restart validation
+  remains pending.
+- Exports now use the platform cache directory's `netwatch/exports` subtree.
+  Shared temporary and whole-working-directory grants are removed; configured
+  keylog/GeoIP inputs receive exact file grants. Replacement files require restart.
+- SDK eBPF attribution is temporarily disabled under enabled sandbox policy;
+  socket polling remains available. Settings reports worker policy entry results.
+- Application preparation is separate from explicit worker startup. GeoIP,
+  WHOIS, reverse-DNS and Insights constructors now require `start()` to process
+  requests. Capture resource setup is separate from packet processing. Worker
+  enforcement and remaining dependency/shutdown limitations are documented in
+  the runtime lifecycle inventory. Library callers must also migrate
+  `EventHandler::new` and `ConnTracker::new` to the explicit `start` APIs.
+- Corrected sandbox documentation to describe calling-thread enforcement, existing
+  dependency worker limitations, narrowed path grants and capability verification. Added a
+  platform capability matrix and updated Insights setup, navigation and data handling.
+- Live automatic resolver changes are temporarily unavailable pending durable
+  recovery and supported resolver adapters. Diagnose provides manual steps;
+  demo remediation remains simulated. Existing journals still receive conservative
+  recovery attempts on TUI startup. Durable transactions, cross-process locking,
+  and daemon startup reconciliation remain follow-up work.
+
 ## [0.30.4] - 2026-09-09
 
 ### Fixed

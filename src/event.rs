@@ -20,7 +20,7 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
-    pub fn new(tick_rate_ms: u64) -> Self {
+    pub fn start(tick_rate_ms: u64) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let tick_rate_ms = Arc::new(AtomicU64::new(tick_rate_ms.clamp(100, 5000)));
         let tick_rate_thread = Arc::clone(&tick_rate_ms);
@@ -28,27 +28,29 @@ impl EventHandler {
         // Use a dedicated OS thread instead of tokio::spawn, since
         // crossterm::event::poll() is a blocking call that would tie up
         // a tokio worker thread permanently.
-        std::thread::spawn(move || loop {
-            // Re-read the tick rate each iteration so the settings popup
-            // can change refresh_rate_ms at runtime and have it take
-            // effect on the next poll without a restart.
-            let dur = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed));
-            if event::poll(dur).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if tx.send(AppEvent::Key(key)).is_err() {
-                            return;
+        crate::sandbox::worker::spawn("terminal", move || {
+            while !crate::sandbox::worker::stopping() {
+                // Re-read the tick rate each iteration so the settings popup
+                // can change refresh_rate_ms at runtime and have it take
+                // effect on the next poll without a restart.
+                let dur = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed));
+                if event::poll(dur).unwrap_or(false) {
+                    match event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if tx.send(AppEvent::Key(key)).is_err() {
+                                return;
+                            }
                         }
-                    }
-                    Ok(Event::Mouse(mouse)) => {
-                        if tx.send(AppEvent::Mouse(mouse)).is_err() {
-                            return;
+                        Ok(Event::Mouse(mouse)) => {
+                            if tx.send(AppEvent::Mouse(mouse)).is_err() {
+                                return;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                } else if tx.send(AppEvent::Tick).is_err() {
+                    return;
                 }
-            } else if tx.send(AppEvent::Tick).is_err() {
-                return;
             }
         });
 

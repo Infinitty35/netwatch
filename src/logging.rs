@@ -35,6 +35,21 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// alternate screen (and the daemon has no alternate screen), so a one-line
 /// warning won't corrupt the display.
 pub fn init() -> Option<WorkerGuard> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let worker = crate::sandbox::worker::spawn("logging", move || {
+        let _ = tx.send(init_inner());
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .ok()
+        .flatten();
+    if worker.is_finished() {
+        let _ = worker.join();
+    }
+    result
+}
+
+fn init_inner() -> Option<WorkerGuard> {
     let log_dir = log_dir()?;
     if std::fs::create_dir_all(&log_dir).is_err() {
         return None;

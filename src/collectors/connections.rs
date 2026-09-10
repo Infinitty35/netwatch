@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::Instant;
 
 /// Where the (pid, process_name) on a Connection came from.
@@ -283,7 +282,17 @@ impl ConnectionCollector {
         self
     }
 
-    /// Attach the pre-sandbox `/proc` attribution snapshot. Set in `App::new`
+    #[cfg(target_os = "macos")]
+    pub fn attach_pktap(&mut self, pktap: Arc<PktapAttributor>) {
+        self.pktap = Some(pktap);
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub fn attach_ebpf(&mut self, ebpf: Arc<crate::ebpf::conn_tracker::EbpfAttributor>) {
+        self.ebpf = Some(ebpf);
+    }
+
+    /// Attach the pre-sandbox `/proc` attribution snapshot. Set in `App::prepare`
     /// before `sandbox::apply` so pre-existing connections stay attributable
     /// even after Landlock blocks live `/proc/<pid>/fd` reads.
     #[cfg(target_os = "linux")]
@@ -309,7 +318,7 @@ impl ConnectionCollector {
         let ebpf = self.ebpf.clone();
         #[cfg(target_os = "linux")]
         let proc_snapshot = self.proc_snapshot.clone();
-        thread::spawn(move || {
+        crate::sandbox::worker::spawn("connections", move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
             #[cfg(target_os = "linux")]

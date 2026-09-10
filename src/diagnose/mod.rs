@@ -20,6 +20,7 @@
 //! disagree. See [`issue`] for why no rendered number is ever stored.
 
 pub mod baseline;
+pub mod coverage;
 pub mod demo;
 pub mod detectors;
 pub mod engine;

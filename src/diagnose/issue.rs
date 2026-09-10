@@ -439,6 +439,28 @@ pub enum Applied {
     No { reason: String },
     /// Applied and then reverted (by the user, on quit, or by reconciliation).
     Reverted { at: String, reason: String },
+    /// A write was attempted but its completion or recording failed.
+    RecoveryRequired {
+        operation_id: String,
+        reason: String,
+        backup: String,
+    },
+}
+
+impl Applied {
+    /// Shared wording for persistent UI details, status, and reports.
+    pub fn recovery_summary(&self) -> Option<String> {
+        match self {
+            Self::RecoveryRequired {
+                operation_id,
+                reason,
+                backup,
+            } => Some(format!(
+                "recovery required · {operation_id}: {reason}; backup: {backup}"
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

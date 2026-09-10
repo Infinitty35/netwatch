@@ -31,7 +31,6 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Linktype reported by libpcap on macOS for live PKTAP capture.
@@ -125,7 +124,7 @@ impl PktapAttributor {
 pub struct PktapHandle {
     pub attributor: Arc<PktapAttributor>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<crate::sandbox::worker::WorkerHandle>,
     /// Non-fatal startup error message (e.g. "permission denied"), surfaced
     /// to the UI so we can show users why attribution upgraded or didn't.
     pub startup_error: Arc<Mutex<Option<String>>>,
@@ -164,10 +163,9 @@ pub fn spawn() -> PktapHandle {
     let thread_stop = Arc::clone(&stop);
     let thread_err = Arc::clone(&startup_error);
 
-    let join = thread::Builder::new()
-        .name("pktap-attributor".into())
-        .spawn(move || run(thread_attr, thread_stop, thread_err))
-        .ok();
+    let join = Some(crate::sandbox::worker::spawn("pktap", move || {
+        run(thread_attr, thread_stop, thread_err)
+    }));
 
     PktapHandle {
         attributor,

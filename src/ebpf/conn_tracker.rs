@@ -113,7 +113,14 @@ impl ConnTracker {
     /// return a tracker. On non-Linux or when the BPF object is missing
     /// returns the `EbpfError` from the SDK so the caller can surface it
     /// to the UI.
-    pub fn new() -> Result<Self, EbpfError> {
+    pub fn start() -> Result<Self, EbpfError> {
+        if !matches!(
+            crate::sandbox::worker::mode(),
+            crate::sandbox::Mode::Disabled
+        ) {
+            return Err(EbpfError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                "eBPF disabled: SDK reader has no pre-processing confinement hook; using socket polling")));
+        }
         let (source, rx) = EventSource::new()?;
         let attributor = EbpfAttributor::new();
         let stop = Arc::new(AtomicBool::new(false));
@@ -196,10 +203,10 @@ mod live_tests {
     /// real assertion.
     #[test]
     fn v6_connect_lands_in_attribution_cache() {
-        let tracker = match ConnTracker::new() {
+        let tracker = match ConnTracker::start() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("ConnTracker::new failed ({e}); skipping — needs root/CAP_BPF");
+                eprintln!("ConnTracker::start failed ({e}); skipping — needs root/CAP_BPF");
                 return;
             }
         };
@@ -241,10 +248,10 @@ mod live_tests {
     fn udp_v6_connect_lands_in_attribution_cache() {
         use std::net::UdpSocket;
 
-        let tracker = match ConnTracker::new() {
+        let tracker = match ConnTracker::start() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("ConnTracker::new failed ({e}); skipping — needs root/CAP_BPF");
+                eprintln!("ConnTracker::start failed ({e}); skipping — needs root/CAP_BPF");
                 return;
             }
         };

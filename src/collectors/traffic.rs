@@ -2,7 +2,6 @@ use crate::platform::{self, InterfaceStats};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::Instant;
 
 // One sample per refresh tick, retained for `HISTORY_WINDOW_SECS` so this
@@ -35,6 +34,8 @@ struct TrafficState {
     prev_time: Instant,
 }
 
+type TimedInterfaces = (Arc<Vec<InterfaceTraffic>>, Option<Instant>);
+
 pub struct TrafficCollector {
     state: Arc<Mutex<TrafficState>>,
     /// Most recent interface snapshot, shared via Arc so reads are O(1)
@@ -42,7 +43,7 @@ pub struct TrafficCollector {
     /// `update()` swaps in a fresh Arc each tick; readers hold their own
     /// reference until they drop it. Avoids the deep-clone hot path that
     /// previously dominated allocator pressure on Linux (issue #27).
-    snapshot: Arc<RwLock<Arc<Vec<InterfaceTraffic>>>>,
+    snapshot: Arc<RwLock<TimedInterfaces>>,
     busy: Arc<AtomicBool>,
 }
 
@@ -60,7 +61,7 @@ impl TrafficCollector {
                 prev_stats: stats,
                 prev_time: Instant::now(),
             })),
-            snapshot: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            snapshot: Arc::new(RwLock::new((Arc::new(Vec::new()), None))),
             busy: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -71,15 +72,19 @@ impl TrafficCollector {
     /// collector itself, so this call is a single atomic refcount bump
     /// regardless of interface count.
     pub fn interfaces(&self) -> Arc<Vec<InterfaceTraffic>> {
-        Arc::clone(&self.snapshot.read().unwrap())
+        Arc::clone(&self.snapshot.read().unwrap().0)
+    }
+
+    pub fn timed_snapshot(&self) -> (Arc<Vec<InterfaceTraffic>>, Option<Instant>) {
+        self.snapshot.read().unwrap().clone()
     }
 
     pub fn interface_count(&self) -> usize {
-        self.snapshot.read().unwrap().len()
+        self.snapshot.read().unwrap().0.len()
     }
 
     pub fn interface_at(&self, index: usize) -> Option<InterfaceTraffic> {
-        self.snapshot.read().unwrap().get(index).cloned()
+        self.snapshot.read().unwrap().0.get(index).cloned()
     }
 
     pub fn update(&self) {
@@ -95,7 +100,7 @@ impl TrafficCollector {
         let snapshot = Arc::clone(&self.snapshot);
         let busy = Arc::clone(&self.busy);
 
-        thread::spawn(move || {
+        crate::sandbox::worker::spawn("traffic", move || {
             let now = Instant::now();
             // Snapshot prev state without holding the state lock for the whole
             // collection: prev_stats is moderate (one entry per interface),
@@ -109,7 +114,8 @@ impl TrafficCollector {
                 }
                 (state.prev_stats.clone(), state.prev_time)
             };
-            let prev_interfaces: Arc<Vec<InterfaceTraffic>> = Arc::clone(&snapshot.read().unwrap());
+            let prev_interfaces: Arc<Vec<InterfaceTraffic>> =
+                Arc::clone(&snapshot.read().unwrap().0);
 
             let elapsed = now.duration_since(prev_time).as_secs_f64();
             let current = match platform::collect_interface_stats() {
@@ -172,7 +178,7 @@ impl TrafficCollector {
             // record prev_stats / prev_time. Readers transitioning across
             // these two writes see either the old snapshot with old prev_*,
             // or the new snapshot with new prev_* — never a torn pair.
-            *snapshot.write().unwrap() = Arc::new(updated);
+            *snapshot.write().unwrap() = (Arc::new(updated), Some(now));
             let mut state = state.lock().unwrap();
             state.prev_stats = current;
             state.prev_time = now;
@@ -198,7 +204,7 @@ mod tests {
         // Seed the snapshot with a known payload so we're not asserting on
         // an empty Vec (which Arc dedupes via the empty-allocation special
         // case and would pass trivially).
-        *collector.snapshot.write().unwrap() = Arc::new(vec![InterfaceTraffic {
+        collector.snapshot.write().unwrap().0 = Arc::new(vec![InterfaceTraffic {
             name: "test0".into(),
             rx_rate: 0.0,
             tx_rate: 0.0,

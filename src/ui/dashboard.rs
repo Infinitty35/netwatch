@@ -1232,33 +1232,43 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
         .map(|(rx, tx)| rx + tx)
         .collect();
 
-    // The two feeds run at different cadences: traffic advances once per
-    // refresh tick, health once per probe. Each track declares its own
-    // seconds-per-sample and is resampled onto the panel's grid, so a column
-    // is the same moment on every row — which is the only thing that makes
-    // reading down the stack mean anything.
-    let tick_secs = (app.user_config.refresh_rate_ms / 1000).max(1);
-    let probe_secs = tick_secs * crate::app::HEALTH_PROBE_TICKS as u64;
-
-    // Throughput is a magnitude, the two latencies are bounded values — the
-    // colour vocabulary the design reserves for each.
-    let tracks: [(&str, Vec<u64>, u64, Color); 3] = [
-        ("throughput", throughput, tick_secs, t.rx_rate),
+    let tick_ms = app.user_config.refresh_rate_ms.max(1);
+    let probe_ms = tick_ms * crate::app::HEALTH_PROBE_TICKS as u64;
+    let window_ms = slots as u64 * tick_ms;
+    let now = std::time::Instant::now();
+    let tracks = [
+        (
+            "throughput",
+            crate::graph::resample_to_window(&throughput, tick_ms, window_ms, slots),
+            t.rx_rate,
+        ),
         (
             "dns rtt",
-            rtt_history_to_u64(hs.dns_rtt_history.as_slices().0),
-            probe_secs,
+            timed_rtt_track(
+                &hs.dns_rtt_history,
+                &hs.completed.dns_history,
+                now,
+                probe_ms,
+                window_ms,
+                slots,
+            ),
             t.status_warn,
         ),
         (
             "gateway rtt",
-            rtt_history_to_u64(hs.gateway_rtt_history.as_slices().0),
-            probe_secs,
+            timed_rtt_track(
+                &hs.gateway_rtt_history,
+                &hs.completed.gateway_history,
+                now,
+                probe_ms,
+                window_ms,
+                slots,
+            ),
             t.status_warn,
         ),
     ];
 
-    for (i, (label, raw, secs_per_sample, color)) in tracks.into_iter().enumerate() {
+    for (i, (label, data, color)) in tracks.into_iter().enumerate() {
         let y = inner.y + i as u16;
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1275,7 +1285,6 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
         // One sample per slot on the panel's shared grid. The time base is
         // common; the *scale* deliberately is not — these are different units,
         // and a shared maximum would flatten every track but throughput.
-        let data = crate::graph::resample_to_window(&raw, secs_per_sample, window_secs, slots);
         // A ceiling one outlier cannot own — see `graph::robust_max`. With a
         // raw max, a single rtt excursion scaled every other sample to the
         // floor and the track read as a dead flat line.
@@ -1649,6 +1658,59 @@ fn rtt_history_to_u64(history: &[Option<f64>]) -> Vec<u64> {
         .collect()
 }
 
+/// Hold an observed RTT until the next result, for at most one probe period.
+/// Completion times keep old spikes fixed on the axis between probe updates.
+/// Missing/invalid replies and expired readings leave gaps, not zero RTTs.
+fn timed_rtt_track(
+    values: &std::collections::VecDeque<Option<f64>>,
+    times: &std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+    hold_ms: u64,
+    window_ms: u64,
+    slots: usize,
+) -> Vec<u64> {
+    let mut out = vec![0; slots];
+    if slots == 0 || window_ms == 0 || values.len() != times.len() {
+        return out;
+    }
+    let window = std::time::Duration::from_millis(window_ms);
+    let hold = std::time::Duration::from_millis(hold_ms);
+    for (i, (&at, value)) in times.iter().zip(values).enumerate() {
+        let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+            continue;
+        };
+        let Some(age) = now.checked_duration_since(at) else {
+            continue;
+        };
+        let end = times
+            .get(i + 1)
+            .copied()
+            .unwrap_or(now)
+            .min(at + hold)
+            .min(now);
+        let end_age = now.saturating_duration_since(end);
+        if end_age >= window {
+            continue;
+        }
+        let to_slot = |age: std::time::Duration| {
+            ((window.as_nanos() - age.min(window).as_nanos()) * slots as u128 / window.as_nanos())
+                .min((slots - 1) as u128) as usize
+        };
+        let first = to_slot(age);
+        // Half-open intervals: a timeout must not inherit the previous RTT.
+        let last = if end == now {
+            slots - 1
+        } else {
+            to_slot(end_age + std::time::Duration::from_nanos(1))
+        };
+        let value = (value * 1000.0).round().max(1.0) as u64;
+        for cell in out.iter_mut().take(last + 1).skip(first) {
+            *cell = (*cell).max(value);
+        }
+    }
+    out
+}
+
 fn rtt_history_to_loss(history: &[Option<f64>]) -> Vec<u64> {
     history
         .iter()
@@ -1726,6 +1788,50 @@ mod tests {
             hosts: hosts.len(),
             conns,
         }
+    }
+
+    #[test]
+    fn rtt_timeline_uses_real_times_and_expires_old_readings() {
+        use std::{
+            collections::VecDeque,
+            time::{Duration, Instant},
+        };
+        let now = Instant::now();
+        let times = VecDeque::from([now - Duration::from_secs(8), now - Duration::from_secs(2)]);
+        let values = VecDeque::from([Some(0.5), Some(2.0)]);
+        let data = timed_rtt_track(&values, &times, now, 3000, 10000, 10);
+        assert_eq!(data, vec![0, 0, 500, 500, 500, 0, 0, 0, 2000, 2000]);
+        let later = timed_rtt_track(
+            &values,
+            &times,
+            now + Duration::from_secs(2),
+            3000,
+            10000,
+            10,
+        );
+        assert_eq!(later, vec![500, 500, 500, 0, 0, 0, 2000, 2000, 2000, 0]);
+    }
+
+    #[test]
+    fn rtt_timeline_keeps_timeout_gaps_and_subsecond_positions() {
+        use std::{
+            collections::VecDeque,
+            time::{Duration, Instant},
+        };
+        let now = Instant::now();
+        let times = VecDeque::from([
+            now - Duration::from_millis(750),
+            now - Duration::from_millis(250),
+        ]);
+        let values = VecDeque::from([Some(0.125), None]);
+        assert_eq!(
+            timed_rtt_track(&values, &times, now, 1000, 1000, 4),
+            vec![0, 125, 125, 0]
+        );
+        assert_eq!(
+            timed_rtt_track(&values, &VecDeque::new(), now, 1000, 1000, 4),
+            vec![0; 4]
+        );
     }
 
     #[test]

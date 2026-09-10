@@ -19,7 +19,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use crate::app::safe_lock;
@@ -152,16 +151,32 @@ impl MetricsExporter {
         };
         tracing::info!(target: "netwatch::metrics", addr = %self.addr, "metrics endpoint listening (/metrics, /healthz)");
 
+        if let Err(error) = listener.set_nonblocking(true) {
+            tracing::warn!(%error, "metrics listener nonblocking setup failed");
+            return;
+        }
         let snapshot = self.snapshot.clone();
         let collectors_ok = self.collectors_ok.clone();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
+        crate::sandbox::worker::spawn("metrics-listener", move || {
+            while !crate::sandbox::worker::stopping() {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "metrics accept failed");
+                        break;
+                    }
+                };
                 let snapshot = snapshot.clone();
                 let collectors_ok = collectors_ok.clone();
                 // One short-lived thread per connection so a slow client can't
                 // block scrapes; connections are closed after a single request.
-                thread::spawn(move || handle_conn(stream, &snapshot, &collectors_ok));
+                crate::sandbox::worker::spawn("metrics-client", move || {
+                    handle_conn(stream, &snapshot, &collectors_ok)
+                });
             }
         });
     }

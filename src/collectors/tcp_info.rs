@@ -123,7 +123,7 @@ pub fn normalize_endpoint(s: &str) -> String {
 /// Same `Arc<RwLock<Arc<…>>>` shape as [`crate::collectors::traffic`]: readers
 /// clone the inner `Arc` in O(1) and never block on an in-flight dump.
 pub struct TcpInfoCollector {
-    snapshot: Arc<RwLock<Arc<FlowMap>>>,
+    snapshot: Arc<RwLock<(Arc<FlowMap>, Option<std::time::Instant>)>>,
     busy: Arc<AtomicBool>,
 }
 
@@ -136,7 +136,7 @@ impl Default for TcpInfoCollector {
 impl TcpInfoCollector {
     pub fn new() -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+            snapshot: Arc::new(RwLock::new((Arc::new(HashMap::new()), None))),
             busy: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -152,17 +152,22 @@ impl TcpInfoCollector {
         }
         let snapshot = Arc::clone(&self.snapshot);
         let busy = Arc::clone(&self.busy);
-        std::thread::spawn(move || {
-            let map = collect().unwrap_or_default();
+        crate::sandbox::worker::spawn("tcp-info", move || {
+            let collected = collect();
+            let completed = collected.as_ref().ok().map(|_| std::time::Instant::now());
             if let Ok(mut w) = snapshot.write() {
-                *w = Arc::new(map);
+                *w = (Arc::new(collected.unwrap_or_default()), completed);
             }
             busy.store(false, Ordering::SeqCst);
         });
     }
 
     pub fn snapshot(&self) -> Arc<FlowMap> {
-        Arc::clone(&self.snapshot.read().unwrap())
+        Arc::clone(&self.snapshot.read().unwrap().0)
+    }
+
+    pub fn timed_snapshot(&self) -> (Arc<FlowMap>, Option<std::time::Instant>) {
+        self.snapshot.read().unwrap().clone()
     }
 
     pub fn get(&self, local: &str, remote: &str) -> Option<TcpInfo> {

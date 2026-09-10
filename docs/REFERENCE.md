@@ -3,7 +3,7 @@
 The complete reference for NetWatch: every keybinding, the display-filter language, the
 protocol decoders, TLS decryption, JA4 hunting, the sandbox, the Flight Recorder, themes,
 and configuration. For a quick start, see the [README](../README.md); for architecture and
-maintenance notes, see [WIKI.md](../WIKI.md).
+maintenance notes, see [WIKI.md](WIKI.md).
 
 - [Deep Packet Inspection](#deep-packet-inspection)
   - [Protocol decoders](#protocol-decoders)
@@ -230,27 +230,43 @@ Edit the file by hand freely; it reloads on startup.
 
 ### Landlock sandbox (Linux)
 
-Once pcap, PKTAP, and the eBPF kprobe finish setup, NetWatch hands back its elevated
-capabilities and locks itself into a Landlock-enforced filesystem allow-list — so a
-memory-safety bug in DPI parsing of hostile capture traffic **can't read SSH keys or
-exfiltrate browser profiles** (and, under `--sandbox-strict`, can't open a new raw socket
-either — see the capability note below).
+Linux worker entry points apply a prepared Landlock filesystem policy before
+processing input. Capture opens/configures its device first and marks itself ready
+after policy entry. Main applies policy after resource startup. Rules pin opened
+filesystem objects, so later pathname replacement cannot widen an existing grant.
 
 ```bash
-netwatch                     # best-effort sandbox (default)
-netwatch --sandbox-strict    # refuse to start if Landlock can't enforce
-netwatch --no-sandbox        # escape hatch for debugging
+netwatch                     # best-effort; reports unavailable protection
+netwatch --sandbox-strict     # reject unverified required startup entries
+netwatch --no-sandbox         # explicitly disable Netwatch policy
 ```
 
-- **Capabilities dropped post-init:** `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN` in every mode. `CAP_NET_RAW` is **kept in the default (best-effort) mode** — pcap needs it to re-open capture handles when you toggle capture (`c`), cycle interface (`i`), or arm the Flight Recorder — and is dropped **only under `--sandbox-strict`**. The existing pcap fd and kprobe stay live regardless; in strict mode the process additionally can't acquire a *new* raw socket.
-- **Filesystem read allow-list** (kernel-enforced): system dirs plus a deliberately *enumerated* set of `/etc/*` files for NSS/TLS/time — so even a sudo'd NetWatch can't read `/etc/shadow` or `/etc/sudoers`. Everything else returns `EACCES`, including other users' homes and SSH keys.
-- **Write allow-list:** `~/.cache/netwatch/`, the startup working dir (PCAP exports), `/tmp`, `/run/user/<uid>`, `/dev/null`.
-- **Applied post-init, not from process start:** the sandbox engages *after* pcap, PKTAP, and the eBPF kprobe finish opening their privileged fds (a brief startup window). It bounds what a later DPI-parsing bug can reach; it is not a from-`main()` confinement of the setup phase itself.
-- **Verify at runtime:** the Settings overlay (`,`) shows the live enforcement state, e.g. `best-effort: Landlock ABI Vx, 3 caps dropped`.
+- **Capabilities:** selected BPF/admin capability removals are verified in effective,
+  permitted and inheritable sets. Strict also drops `CAP_NET_RAW`; best-effort
+  retains it for capture reopening. Effective retained capabilities are recorded.
+  This is not a claim that every elevated capability is removed.
+- **Writable paths:** owned private config/cache/state directories, dedicated
+  `netwatch/exports` and `netwatch/scratch` cache subdirectories, and `/dev/null`.
+  There is no whole-CWD, shared `/tmp` or `/run/user` write grant. Directories are
+  prepared before restrictions; broad roots and symlink directory targets fail
+  preparation. Exports normally land in `~/.cache/netwatch/exports` on Linux.
+- **Inputs:** configured GeoIP and keylog files receive exact read grants; system
+  executable/library and resolver paths remain readable. Missing or replaced
+  keylog/database files require restarting Netwatch. Rotation does not expand the
+  policy to a parent directory.
+- **SDK source:** eBPF attribution is disabled under enabled sandbox policy until
+  its SDK reader has an enforcement hook. Socket polling remains available.
+- **Strict mode:** preflight/required worker entry failures stop startup with a
+  nonzero exit. After the main thread drops raw-socket authority, capture restart
+  may fail; it never retries unsandboxed. macOS/Windows have no backend and reject
+  strict startup. Best-effort reports degradation on those platforms.
+- **Network:** no network restrictions are installed. Settings reports policy-entry
+  results, not an independent proof that the entire process is exploit-proof.
 
-Network restriction is intentionally not enabled (it would break GeoIP fallback, `--remote`
-streaming, and WHOIS). macOS/Windows sandboxing is not on the roadmap — the threat model is
-production-capture-specific, and that audience is overwhelmingly Linux.
+Linux denial tests exercise actual lookup/Insights/keylog workers and keylog restart.
+Privileged capture/restart and macOS/Windows runtime validation remain release checks.
+Some detached workers still lack bounded shutdown; see the
+[runtime inventory](runtime-lifecycle.md) and [capability matrix](CAPABILITIES.md).
 
 ---
 
@@ -464,7 +480,7 @@ to start.
 |-----|---------|--------|--------------|
 | `theme` | `"dark"` | `dark` `terminal` `ocean` `solarized` `dracula` `nord` `sky` `paper` | Color theme. `terminal` is also accepted as `system` or `ansi`. See [Themes](#themes). |
 | `view` | `"full"` | `full` `lite` `dense` | Which view starts. `--view` overrides it for one run; an unknown name falls back to `full`. |
-| `default_tab` | `"dashboard"` | `dashboard` `connections` `interfaces` `packets` `stats` `topology` `timeline` `processes` `insights` | Tab shown on launch in the full view. |
+| `default_tab` | `"dashboard"` | `dashboard` `connections` `interfaces` `packets` `stats` `topology` `timeline` `processes` `diagnose` `insights` | `insights` is a legacy alias for Diagnose. `egress` is not currently accepted as a startup-tab value. Tab shown on launch in the full view. |
 | `graph_style` | `"dots"` | `dots` `bars` | Chart rendering for every sparkline in the app. `dots` is the braille area plot: two samples per cell column and four times the vertical resolution, so a sparkline carries twice the history in the same width. `bars` is solid blocks, for terminals whose font has no braille coverage — there the area plot renders as empty boxes. |
 | `graph_fade` | `true` | `true` `false` | The magnitude gradient: every cell is coloured by how high it sits — dim at the baseline, the series colour in the middle, lightened at the peak. It is what makes a filled area read as depth rather than as a block. Under the `terminal` theme it steps from each series colour to its bright palette variant instead of blending, so no colour is invented. |
 | `groups_start_collapsed` | `true` | `true` `false` | Whether the grouped tables (Connections, Egress) open folded. Folded answers "what is on this machine" in one glance; `false` is closer to the old flat tables. |
@@ -541,28 +557,35 @@ port_scan_window_secs = 30          # detection window
 
 ## AI Insights
 
-*(opt-in, off by default.)* Feed a snapshot — protocol mix, top talkers, DNS queries,
-connection states, health, expert warnings — to an LLM every 15 seconds and get a
-plain-language paragraph on top of what the Diagnose tab has already established.
+Insights is opt-in commentary inside **Diagnose (`9`)**, below the findings.
+It sends a network snapshot to the configured Ollama-compatible `/api/chat`
+endpoint. Requests are rate-limited with a 15-second interval and a 30-second
+request timeout; analysis requires a nonempty retained packet snapshot, not
+necessarily new traffic during that interval.
 
-It renders inside Diagnose, under the findings, labelled as commentary. That placement is
-deliberate: detection, cause ranking and remediation are deterministic and run without a
-model, and the narrative is never allowed to be the source of a fact. Everything it could
-mention is on the screen above it, computed from evidence.
+Detection, cause ranking and remediation run without a model. Commentary can be
+wrong and is not mechanically checked against the deterministic findings. The
+snapshot contains packet-derived summaries, addresses, names and health metrics;
+it is not a serialized list of Diagnose issues.
 
-Enable via Settings (`,`) → AI Insights. Supports local [Ollama](https://ollama.com)
-(default), a remote Ollama host, or Ollama **cloud models** — no API keys in NetWatch. See
-[INSIGHTS.md](INSIGHTS.md) for setup.
+Enable via Settings (`,`) → AI Insights. `local` resolves to
+`http://localhost:11434`; a configured remote URL sends data to that host. A local
+endpoint alone does not guarantee local inference if its server forwards requests.
+See [INSIGHTS.md](INSIGHTS.md) for setup, data disclosure and troubleshooting.
 
 ---
 
 ## How it works
 
+The intervals below assume the default one-second tick. Platform support is not
+feature parity; see the [capability matrix](CAPABILITIES.md), including Windows,
+and the [Diagnose input matrix](diagnostic-coverage.md).
+
 | Collector | Interval | macOS | Linux |
 |-----------|:--------:|-------|-------|
 | Interface stats | 1s | `netstat -ib` | `/sys/class/net/*/statistics` |
 | Connections | 2s | `lsof` + PKTAP | `/proc/net/tcp` + eBPF kprobe |
-| Health probes | 5s | native ICMP | native ICMP |
+| Health probes | Every 5 ticks | Gateway/internet ICMP, DNS queries | Gateway/internet ICMP, DNS queries |
 | Packets | Real-time | libpcap (BPF) | libpcap |
 | GeoIP | On-demand | MaxMind .mmdb / ip-api.com | MaxMind .mmdb / ip-api.com |
 
@@ -573,4 +596,4 @@ Raw bytes → Ethernet → IPv4/IPv6/ARP → TCP/UDP/ICMP → L7 decoders
                           TLS 1.3 decryption · JA4 · Expert info
 ```
 
-For the module-level source map and runtime architecture, see [WIKI.md](../WIKI.md).
+For the module-level source map and runtime architecture, see [WIKI.md](WIKI.md).

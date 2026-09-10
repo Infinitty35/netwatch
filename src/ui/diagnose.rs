@@ -109,7 +109,11 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
         capability: app.diagnose.capability,
         ai,
         endpoint: app.user_config.insights_endpoint.clone(),
-        status: app.diagnose.status.as_deref(),
+        status: app
+            .diagnose
+            .journal
+            .blocked_reason()
+            .or(app.diagnose.status.as_deref()),
         demo_banner: app.diagnose.demo.as_ref().map(|d| d.banner()),
     };
     // The header's verdict row is suppressed here: this tab *is* the verdict,
@@ -187,7 +191,9 @@ fn has_applicable_step(issue: &Issue, cap: Capability) -> bool {
             && s.available(cap)
             && !matches!(
                 s.applied,
-                Some(Applied::Yes { .. }) | Some(Applied::No { .. })
+                Some(Applied::Yes { .. })
+                    | Some(Applied::No { .. })
+                    | Some(Applied::RecoveryRequired { .. })
             )
     })
 }
@@ -246,7 +252,7 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
         ],
         // Not a health claim. A host that hasn't learned its network yet says
         // so, rather than rendering the reassuring green it hasn't earned.
-        Verdict::Learning { detail } => vec![
+        Verdict::Learning { detail } | Verdict::Incomplete { detail } => vec![
             Span::styled("◌ ", Style::default().fg(t.text_muted)),
             Span::styled(
                 format!("no issues detected · {detail}"),
@@ -312,7 +318,7 @@ fn render_engine_strip(f: &mut Frame, view: &View, area: Rect) {
                 Style::default().fg(t.text_inverse).bg(t.status_warn).bold(),
             ),
             Span::styled(
-                format!("  ruleset {}", rules::catalogue_label()),
+                format!("  ruleset {}", view.engine.coverage().label()),
                 Style::default().fg(t.text_muted),
             ),
         ]);
@@ -347,7 +353,7 @@ fn render_engine_strip(f: &mut Frame, view: &View, area: Rect) {
         Style::default().fg(t.text_muted),
     ));
     spans.push(Span::styled(
-        rules::catalogue_label(),
+        view.engine.coverage().label(),
         Style::default().fg(t.text_secondary),
     ));
 
@@ -541,7 +547,7 @@ fn render_explainer(f: &mut Frame, view: &View, area: Rect) {
     ]));
 
     let block = widgets::Panel::new("watching for")
-        .meta(rules::catalogue_label())
+        .meta(view.engine.coverage().label())
         .fit(area.width)
         .block(t);
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -901,6 +907,12 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
                     ),
                     Style::default().fg(t.status_warn),
                 ))),
+                Some(outcome @ Applied::RecoveryRequired { .. }) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", outcome.recovery_summary().unwrap()),
+                        Style::default().fg(t.status_warn),
+                    )))
+                }
                 Some(Applied::No { reason }) => lines.push(Line::from(Span::styled(
                     format!("  not applied · {reason}"),
                     Style::default().fg(t.text_muted),
@@ -1050,6 +1062,7 @@ fn section(t: &Theme, label: &str) -> Line<'static> {
 fn render_report_preview(f: &mut Frame, view: &View, area: Rect) {
     let t = view.theme;
     let report = crate::diagnose::report::Report {
+        coverage: view.engine.coverage().clone(),
         generated_at: String::new(),
         window_start: String::new(),
         window_end: String::new(),
@@ -1101,6 +1114,12 @@ fn render_status(f: &mut Frame, view: &View, status: &str, area: Rect) {
     let lower = status.to_lowercase();
     let (glyph, color) = if lower.contains("failed") || lower.contains("error") {
         ("✕", t.status_error)
+    } else if lower.contains("recovery")
+        || lower.contains("blocked")
+        || lower.contains("not applied")
+        || lower.contains("unavailable")
+    {
+        ("!", t.status_warn)
     } else {
         ("✓", t.status_good)
     };
@@ -1226,7 +1245,7 @@ mod tests {
         assert!(s.contains("baselines"), "{s}");
         assert!(s.contains("ruleset"), "{s}");
         assert!(
-            s.contains("all active"),
+            s.contains("rule inputs available"),
             "coverage must be stated honestly:\n{s}"
         );
     }
@@ -1520,6 +1539,40 @@ mod tests {
             }
         }
         assert!(has_applicable_step(&reverted, Capability::Root));
+    }
+
+    #[test]
+    fn recovery_required_step_cannot_be_applied_again() {
+        let (engine, _) = fixture::run();
+        let mut issue = engine
+            .primary()
+            .into_iter()
+            .find(|i| i.remediation.iter().any(|s| s.kind == StepKind::Apply))
+            .unwrap()
+            .clone();
+        for step in &mut issue.remediation {
+            if step.kind == StepKind::Apply {
+                step.applied = Some(Applied::RecoveryRequired {
+                    operation_id: "op-1".into(),
+                    reason: "partial write".into(),
+                    backup: "/backup".into(),
+                });
+            }
+        }
+        assert!(!has_applicable_step(&issue, Capability::Root));
+    }
+
+    #[test]
+    fn recovery_status_does_not_display_a_success_checkmark() {
+        let screen = draw(150, 44, |view| {
+            view.status = Some("recovery required; host changes blocked")
+        });
+        let line = screen
+            .lines()
+            .find(|l| l.contains("host changes blocked"))
+            .unwrap();
+        assert!(!line.contains('✓'), "{line}");
+        assert!(line.contains('!'), "{line}");
     }
 
     /// The tab uses the screen it is given. Panels stay content-sized, so

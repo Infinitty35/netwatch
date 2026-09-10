@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleStatus {
-    /// netwatch has the inputs and evaluates this rule every tick.
+    /// Detector implemented; runtime coverage determines whether inputs exist.
     Active,
     /// In the catalogue, not yet wired to a data source. Cannot open an issue.
     /// The `&'static str` says what input is missing.
@@ -221,7 +221,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::Medium,
         trigger: "more than 5 syn timeouts or connect resets per minute",
         suppresses: &[],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("connect-failure detector not wired into Diagnose"),
     },
     Rule {
         id: "tcp.timewait_exhaustion",
@@ -230,7 +230,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::Medium,
         trigger: "time-wait sockets exceed 60% of the ephemeral port range",
         suppresses: &[],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("TIME_WAIT detector not wired into Diagnose"),
     },
     // ------------------------------------------------- mtu / nat / v6 / cap
     Rule {
@@ -240,7 +240,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::High,
         trigger: "large DF probes fail while small probes pass",
         suppresses: &["tcp.retrans_burst"],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("PMTU probe detector not wired into Diagnose"),
     },
     Rule {
         id: "nat.symmetric",
@@ -258,7 +258,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::Medium,
         trigger: "a v6 default route exists but v6 probes fail while v4 works",
         suppresses: &[],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("dual-stack comparison not wired into Diagnose"),
     },
     Rule {
         id: "captive.portal",
@@ -268,7 +268,7 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "the http 204 probe is redirected",
         // A portal breaks DNS and TCP in ways that are its fault, not theirs.
         suppresses: &["dns.hijack_suspect", "tcp.connect_failures", "dns.failing"],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("captive portal test not wired into Diagnose"),
     },
     // -------------------------------------------------------------- egress
     Rule {
@@ -278,7 +278,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::Info,
         trigger: "a destination outside the learned egress baseline",
         suppresses: &[],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("egress findings remain in the Egress tab"),
     },
     Rule {
         id: "egress.policy_violation",
@@ -287,7 +287,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::High,
         trigger: "a flow denied by the loaded egress policy",
         suppresses: &["egress.drift"],
-        status: RuleStatus::Active,
+        status: RuleStatus::Planned("egress policy findings remain in the Egress tab"),
     },
 ];
 
@@ -516,8 +516,8 @@ mod tests {
             label.starts_with(&format!("{} rules", CATALOGUE.len())),
             "{label}"
         );
-        assert_eq!(active_count(), CATALOGUE.len(), "{label}");
-        assert!(label.ends_with("all active"), "{label}");
+        assert_eq!(active_count(), 18, "{label}");
+        assert!(label.ends_with("7 planned"), "{label}");
     }
 
     #[test]

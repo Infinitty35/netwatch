@@ -102,6 +102,14 @@ impl Default for Settings {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ObservationTimes {
+    pub interface: Option<std::time::Instant>,
+    pub health: crate::collectors::health::ProbeTimes,
+    pub sockets: Option<std::time::Instant>,
+    pub path: Option<std::time::Instant>,
+}
+
 pub struct Engine {
     issues: Vec<Issue>,
     /// `Detection::key()` → issue id, so a condition maps to the same issue
@@ -113,6 +121,8 @@ pub struct Engine {
     clock: Box<dyn Clock>,
     settings: Settings,
     seq: u32,
+    coverage: super::coverage::Coverage,
+    verification_samples: HashMap<IssueId, (std::time::Instant, std::time::Instant)>,
 }
 
 impl Engine {
@@ -124,6 +134,8 @@ impl Engine {
             clock,
             settings: Settings::default(),
             seq: 0,
+            coverage: Default::default(),
+            verification_samples: HashMap::new(),
         }
     }
 
@@ -134,6 +146,10 @@ impl Engine {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    pub fn coverage(&self) -> &super::coverage::Coverage {
+        &self.coverage
     }
 
     pub fn issues(&self) -> &[Issue] {
@@ -161,20 +177,92 @@ impl Engine {
     /// condition has cleared are moved toward auto-close, and the suppression
     /// graph is recomputed.
     pub fn observe(&mut self, obs: &Observations, base: &BaselineStore) {
+        self.observe_inner(obs, base, None);
+    }
+
+    pub fn observe_live(
+        &mut self,
+        obs: &Observations,
+        base: &BaselineStore,
+        times: &ObservationTimes,
+    ) {
+        use crate::collectors::health::ProbeTimes;
+        let mut observed = obs.clone();
+        if !ProbeTimes::fresh(times.interface, 15) {
+            observed.iface = None;
+        }
+        if !ProbeTimes::fresh(times.health.dns, 30) {
+            observed.dns = None;
+        }
+        if !ProbeTimes::fresh(times.health.gateway, 30) {
+            observed.gateway = None;
+        }
+        if !ProbeTimes::fresh(times.health.internet, 30) {
+            if let Some(gateway) = &mut observed.gateway {
+                gateway.internet_reachable = None;
+            }
+        }
+        if !ProbeTimes::fresh(times.health.nat, 300) {
+            observed.nat = None;
+        }
+        if !ProbeTimes::fresh(times.sockets, 30) {
+            observed.sockets.clear();
+        }
+        if !ProbeTimes::fresh(times.path, 120) {
+            observed.paths.clear();
+        }
+        self.observe_inner(&observed, base, Some(times));
+        self.coverage.mark_stale_probes(&times.health);
+        for row in &mut self.coverage.rules {
+            if row.status == super::coverage::Availability::Unsupported {
+                continue;
+            }
+            let sample = if row.rule.starts_with("path.") {
+                Some((times.path, 120))
+            } else if row.rule.starts_with("tcp.") && row.rule != "tcp.bufferbloat_local" {
+                Some((times.sockets, 30))
+            } else if row.rule.starts_with("link.")
+                || row.rule.starts_with("iface.")
+                || row.rule.starts_with("wifi.")
+            {
+                Some((times.interface, 15))
+            } else {
+                None
+            };
+            if let Some((Some(at), max_age)) = sample {
+                if !ProbeTimes::fresh(Some(at), max_age) {
+                    row.status = super::coverage::Availability::Stale;
+                    row.reason = format!(
+                        "collector snapshot older than {max_age}s; excluded from evaluation"
+                    );
+                }
+            }
+        }
+    }
+
+    fn observe_inner(
+        &mut self,
+        obs: &Observations,
+        base: &BaselineStore,
+        times: Option<&ObservationTimes>,
+    ) {
+        self.coverage = super::coverage::Coverage::from_observations(obs, base);
         let now = self.clock.now();
-        let detections = detectors::detect(obs, base, &self.settings.thresholds);
+        let detections: Vec<_> = detectors::detect(obs, base, &self.settings.thresholds)
+            .into_iter()
+            .filter(|d| {
+                self.coverage.rules.iter().any(|r| {
+                    r.rule == d.rule && r.status == super::coverage::Availability::Available
+                })
+            })
+            .collect();
         let seen: Vec<String> = detections.iter().map(|d| d.key()).collect();
 
         for d in detections {
             self.merge(d, now);
         }
 
-        let mut values = metric_values(obs);
-        // σ-denominated verify conditions ("back within 3σ of baseline") need
-        // the baselines to evaluate, so they are derived here rather than in
-        // the pure observation mapping.
-        add_sigma_metrics(&mut values, obs, base);
-        self.age_unseen(&seen, &values, now);
+        self.age_unseen(&seen, obs, base, now, times);
 
         rules::apply_suppression(&mut self.issues);
         self.sort();
@@ -226,6 +314,7 @@ impl Engine {
                 merge_remediation(&mut issue.remediation, d.remediation);
                 issue.rank_causes();
                 self.verifying_since.remove(&id);
+                self.verification_samples.remove(&id);
                 return;
             }
             self.by_key.remove(&key);
@@ -267,7 +356,14 @@ impl Engine {
     /// checked against live metrics; once it has held for `hold_secs` the
     /// issue auto-closes. Until then it stays open — a metric dipping under
     /// the threshold for one sample is not a fix.
-    fn age_unseen(&mut self, seen: &[String], values: &HashMap<String, f64>, now: DateTime<Local>) {
+    fn age_unseen(
+        &mut self,
+        seen: &[String],
+        obs: &Observations,
+        base: &BaselineStore,
+        now: DateTime<Local>,
+        times: Option<&ObservationTimes>,
+    ) {
         let mut closed: Vec<IssueId> = Vec::new();
         for issue in self.issues.iter_mut() {
             if !issue.state.is_open() {
@@ -278,21 +374,101 @@ impl Engine {
                 continue;
             }
 
-            let holding = match values.get(&issue.verify.metric) {
+            let mut scoped = obs.clone();
+            match &issue.subject {
+                super::issue::Subject::Resolver { addr } => {
+                    scoped.dns = scoped.dns.filter(|d| &d.resolver == addr || issue.remediation.iter().any(|step| {
+                        matches!((&step.action, &step.applied),
+                            (Some(super::issue::Action::SetResolver { addr: replacement }), Some(super::issue::Applied::Yes { .. }))
+                            if replacement == &d.resolver)
+                    }))
+                }
+                super::issue::Subject::Path { target } => {
+                    scoped.paths.retain(|p| &p.target == target)
+                }
+                super::issue::Subject::Socket { local, remote } => scoped
+                    .sockets
+                    .retain(|s| &s.local == local && &s.remote == remote),
+                super::issue::Subject::Iface { name } => {
+                    scoped.iface = scoped.iface.filter(|i| &i.name == name)
+                }
+                _ => {}
+            }
+            let mut values = metric_values(&scoped);
+            add_sigma_metrics(&mut values, &scoped, base);
+            let holding = self.coverage.rules.iter().any(|r| {
+                r.rule == issue.rule && r.status == super::coverage::Availability::Available
+            }) && match values.get(&issue.verify.metric) {
                 Some(v) => issue.verify.holds(*v),
-                // No reading for the metric. The condition that opened the
-                // issue is gone, which is itself evidence it cleared, but we
-                // still make it serve the hold window before closing.
-                None => true,
+                // Missing evidence is not recovery; reset the hold timer.
+                None => false,
             };
 
             if !holding {
                 self.verifying_since.remove(&issue.id);
+                self.verification_samples.remove(&issue.id);
                 continue;
             }
 
+            let mut live_held = None;
+            if let Some(times) = times {
+                let sample = if issue.rule.starts_with("dns.") {
+                    Some(times.health.dns)
+                } else if issue.rule.starts_with("gateway.") {
+                    Some(times.health.gateway)
+                } else if issue.rule.starts_with("nat.") {
+                    Some(times.health.nat)
+                } else if issue.rule.starts_with("link.")
+                    || issue.rule.starts_with("iface.")
+                    || issue.rule.starts_with("wifi.")
+                {
+                    Some(times.interface)
+                } else if issue.rule.starts_with("path.") {
+                    Some(times.path)
+                } else if issue.rule.starts_with("tcp.") && issue.rule != "tcp.bufferbloat_local" {
+                    Some(times.sockets)
+                } else {
+                    None
+                };
+                if let Some(sample) = sample {
+                    let Some(sample) = sample else {
+                        self.verifying_since.remove(&issue.id);
+                        self.verification_samples.remove(&issue.id);
+                        continue;
+                    };
+                    let max_gap = if issue.rule.starts_with("nat.") {
+                        300
+                    } else if issue.rule.starts_with("path.") {
+                        120
+                    } else if issue.rule.starts_with("link.")
+                        || issue.rule.starts_with("iface.")
+                        || issue.rule.starts_with("wifi.")
+                    {
+                        15
+                    } else {
+                        30
+                    };
+                    match self.verification_samples.get_mut(&issue.id) {
+                        Some((start, last)) => {
+                            if sample <= *last {
+                                continue;
+                            }
+                            if sample.duration_since(*last).as_secs() > max_gap {
+                                *start = sample;
+                            }
+                            *last = sample;
+                            live_held = Some(sample.duration_since(*start).as_secs());
+                        }
+                        None => {
+                            self.verification_samples
+                                .insert(issue.id.clone(), (sample, sample));
+                            live_held = Some(0);
+                        }
+                    }
+                }
+            }
             let started = *self.verifying_since.entry(issue.id.clone()).or_insert(now);
-            let held = (now - started).num_seconds().max(0) as u64;
+            let held = live_held.unwrap_or_else(|| (now - started).num_seconds().max(0) as u64);
             if held >= issue.verify.hold_secs {
                 issue.state = IssueState::AutoClosed { at: format_ts(now) };
                 closed.push(issue.id.clone());
@@ -300,6 +476,7 @@ impl Engine {
         }
         for id in closed {
             self.verifying_since.remove(&id);
+            self.verification_samples.remove(&id);
         }
     }
 
@@ -335,6 +512,9 @@ impl Engine {
             .collect();
         self.issues.retain(|i| !doomed.contains(&i.id));
         self.by_key.retain(|_, id| !doomed.contains(id));
+        self.verifying_since.retain(|id, _| !doomed.contains(id));
+        self.verification_samples
+            .retain(|id, _| !doomed.contains(id));
     }
 
     // ------------------------------------------------------ user actions
@@ -408,18 +588,25 @@ impl Engine {
             if base.switched_network() && !readiness.is_ready() {
                 return Verdict::Learning {
                     detail: format!(
-                        "new network ({}) — {}",
+                        "new network ({}) — {} · {}",
                         base.fingerprint().label(),
-                        readiness.label()
+                        readiness.label(),
+                        self.coverage.label()
                     ),
                 };
             }
             if !readiness.is_ready() {
                 return Verdict::Learning {
-                    detail: format!("baselines {}", readiness.label()),
+                    detail: format!(
+                        "baselines {} · {}",
+                        readiness.label(),
+                        self.coverage.label()
+                    ),
                 };
             }
-            return Verdict::Clear;
+            return Verdict::Incomplete {
+                detail: self.coverage.label(),
+            };
         }
 
         let worst = visible
@@ -460,7 +647,12 @@ pub enum Verdict {
     Clear,
     /// Nothing is open, but netwatch doesn't yet have the baselines to say so
     /// with confidence.
-    Learning { detail: String },
+    Learning {
+        detail: String,
+    },
+    Incomplete {
+        detail: String,
+    },
     Issues {
         severity: Severity,
         count: usize,
@@ -474,7 +666,9 @@ impl Verdict {
     pub fn line(&self) -> String {
         match self {
             Verdict::Clear => "no issues · baselines ready".to_string(),
-            Verdict::Learning { detail } => format!("no issues · {detail}"),
+            Verdict::Learning { detail } | Verdict::Incomplete { detail } => {
+                format!("no visible findings · {detail}")
+            }
             Verdict::Issues {
                 count, headline, ..
             } => {
@@ -504,6 +698,7 @@ impl Verdict {
         match self {
             Verdict::Clear => "nominal",
             Verdict::Learning { .. } => "learning",
+            Verdict::Incomplete { .. } => "limited",
             Verdict::Issues { count, .. } => {
                 if *count == 1 {
                     "1 issue"
@@ -635,6 +830,36 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
     }
     if let (Some(idle), Some(loaded)) = (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
         m.insert("tcp.loaded_rtt_delta".to_string(), loaded - idle);
+    }
+    for path in &obs.paths {
+        if let Some(previous) = &path.previous {
+            if !previous.is_empty()
+                && previous.len() == path.hops.len()
+                && previous
+                    .iter()
+                    .chain(&path.hops)
+                    .all(|h| !h.silent && h.ip.is_some())
+            {
+                m.insert(
+                    "path.hop_changes".into(),
+                    if detectors::first_hop_change(previous, &path.hops).is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                );
+            }
+        }
+        // Conservative: all responding hops must meet the recovery condition.
+        if let Some(loss) = path
+            .hops
+            .iter()
+            .filter(|h| !h.silent)
+            .map(|h| h.loss_pct)
+            .max_by(|a, b| a.total_cmp(b))
+        {
+            m.insert("path.hop_loss".into(), loss);
+        }
     }
     // Socket metrics are per-subject; the worst socket stands for the metric,
     // so an issue can't close while any socket still shows the condition.
@@ -894,7 +1119,7 @@ mod tests {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
         let empty = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
         assert_eq!(e.verdict(&empty).chip(), "learning");
-        assert_eq!(e.verdict(&base()).chip(), "nominal");
+        assert_eq!(e.verdict(&base()).chip(), "limited");
 
         let theme = crate::theme::by_name("default");
         assert_ne!(
@@ -902,13 +1127,154 @@ mod tests {
             theme.status_good,
             "learning must not render as health"
         );
-        assert_eq!(e.verdict(&base()).color(&theme), theme.status_good);
+        assert_ne!(e.verdict(&base()).color(&theme), theme.status_good);
+    }
+
+    #[test]
+    fn disappearing_measurement_does_not_close_issue_and_resets_recovery() {
+        let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        engine.observe(&obs(40.0), &base);
+        let id = engine.primary()[0].id.clone();
+        engine.observe(&obs(1.0), &base);
+        clock.advance_secs(40);
+        engine.observe(&Observations::default(), &base);
+        clock.advance_secs(600);
+        engine.observe(&Observations::default(), &base);
+        assert!(engine.get(&id).unwrap().state.is_open());
+        engine.observe(&obs(1.0), &base);
+        clock.advance_secs(40);
+        engine.observe(&obs(1.0), &base);
+        assert!(engine.get(&id).unwrap().state.is_open());
+        clock.advance_secs(21);
+        engine.observe(&obs(1.0), &base);
+        assert!(!engine.get(&id).unwrap().state.is_open());
+    }
+
+    #[test]
+    fn another_resolvers_results_cannot_verify_original_issue() {
+        let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        engine.observe(&obs(40.0), &base);
+        let id = engine.primary()[0].id.clone();
+        let mut replacement = obs(1.0);
+        replacement.dns.as_mut().unwrap().resolver = "203.0.113.1".into();
+        engine.observe(&replacement, &base);
+        clock.advance_secs(600);
+        engine.observe(&replacement, &base);
+        assert!(engine.get(&id).unwrap().state.is_open());
+    }
+
+    #[test]
+    fn stale_probe_cannot_open_or_close_an_issue() {
+        let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        let times = ObservationTimes {
+            health: crate::collectors::health::ProbeTimes {
+                dns: Some(std::time::Instant::now() - std::time::Duration::from_secs(31)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        engine.observe_live(&obs(40.0), &base, &times);
+        assert_eq!(engine.open_count(), 0);
+        assert_eq!(
+            engine
+                .coverage()
+                .rules
+                .iter()
+                .find(|r| r.rule == "dns.slow_resolver")
+                .unwrap()
+                .status,
+            super::super::coverage::Availability::Stale
+        );
+        engine.observe(&obs(40.0), &base);
+        let id = engine.primary()[0].id.clone();
+        engine.observe_live(&obs(1.0), &base, &times);
+        clock.advance_secs(600);
+        engine.observe_live(&obs(1.0), &base, &times);
+        assert!(engine.get(&id).unwrap().state.is_open());
+    }
+
+    #[test]
+    fn cached_probe_does_not_complete_verification_without_a_new_result() {
+        let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        engine.observe(&obs(40.0), &base);
+        let id = engine.primary()[0].id.clone();
+        let mut times = ObservationTimes {
+            health: crate::collectors::health::ProbeTimes {
+                dns: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        engine.observe_live(&obs(1.0), &base, &times);
+        clock.advance_secs(90);
+        engine.observe_live(&obs(1.0), &base, &times);
+        assert!(engine.get(&id).unwrap().state.is_open());
+        times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_nanos(1));
+        engine.observe_live(&obs(1.0), &base, &times);
+        assert!(
+            engine.get(&id).unwrap().state.is_open(),
+            "wall clock jumps cannot satisfy a hold"
+        );
+        for _ in 0..3 {
+            times.health.dns = Some(times.health.dns.unwrap() + std::time::Duration::from_secs(20));
+            engine.observe_live(&obs(1.0), &base, &times);
+        }
+        assert!(!engine.get(&id).unwrap().state.is_open());
+    }
+
+    #[test]
+    fn missing_gateway_corroboration_does_not_open_a_finding() {
+        let (mut engine, _) = engine_at("2026-09-03 06:48:10");
+        let mut observations = Observations {
+            gateway: Some(super::super::detectors::GatewayObs {
+                addr: Some("192.0.2.1".into()),
+                rtt_ms: None,
+                loss_pct: 100.0,
+                internet_reachable: None,
+                arp_ok: false,
+                icmp_ok: false,
+            }),
+            ..Default::default()
+        };
+        engine.observe(&observations, &base());
+        assert_eq!(engine.open_count(), 0);
+        observations.gateway.as_mut().unwrap().internet_reachable = Some(false);
+        engine.observe(&observations, &base());
+        assert!(engine
+            .issues()
+            .iter()
+            .any(|i| i.rule == "gateway.unreachable"));
+    }
+
+    #[test]
+    fn a_gap_between_probe_completions_restarts_recovery() {
+        let (mut engine, _) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        engine.observe(&obs(40.0), &base);
+        let id = engine.primary()[0].id.clone();
+        let mut times = ObservationTimes::default();
+        let start = std::time::Instant::now();
+        for seconds in [0, 20, 80, 100, 120] {
+            times.health.dns = Some(start + std::time::Duration::from_secs(seconds));
+            engine.observe_live(&obs(1.0), &base, &times);
+            assert!(engine.get(&id).unwrap().state.is_open());
+        }
+        times.health.dns = Some(start + std::time::Duration::from_secs(140));
+        engine.observe_live(&obs(1.0), &base, &times);
+        assert!(!engine.get(&id).unwrap().state.is_open());
     }
 
     #[test]
     fn a_clear_verdict_is_one_quiet_line() {
         let (e, _clock) = engine_at("2026-09-03 06:48:10");
-        assert_eq!(e.verdict(&base()).line(), "no issues · baselines ready");
+        assert_eq!(
+            e.verdict(&base()).line(),
+            "no visible findings · coverage not recorded"
+        );
     }
 
     #[test]

@@ -232,10 +232,8 @@ impl KeylogStore {
 pub fn spawn_keylog_watcher(path: PathBuf, store: Arc<KeylogStore>) -> WatcherHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
-    let handle = thread::Builder::new()
-        .name("netwatch-keylog-watcher".into())
-        .spawn(move || keylog_loop(path, store, stop_for_thread))
-        .expect("failed to spawn keylog watcher thread");
+    let handle =
+        crate::sandbox::worker::spawn("keylog", move || keylog_loop(path, store, stop_for_thread));
     WatcherHandle {
         stop,
         join: Some(handle),
@@ -246,7 +244,7 @@ pub fn spawn_keylog_watcher(path: PathBuf, store: Arc<KeylogStore>) -> WatcherHa
 /// thread to stop and joins it.
 pub struct WatcherHandle {
     stop: Arc<AtomicBool>,
-    join: Option<thread::JoinHandle<()>>,
+    join: Option<crate::sandbox::worker::WorkerHandle>,
 }
 
 impl Drop for WatcherHandle {

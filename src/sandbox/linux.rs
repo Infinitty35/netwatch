@@ -13,14 +13,13 @@ use super::{Mode, Report};
 
 use caps::{CapSet, Capability};
 use landlock::{
-    path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
+    Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, ABI,
 };
 use std::path::{Path, PathBuf};
 
-/// Highest Landlock ABI we know how to target. ABI V4 (Linux 6.4+)
-/// brings TCP bind/connect restrictions; the crate degrades cleanly to
-/// V3 / V2 / V1 on older kernels.
+/// Highest requested ABI. Only filesystem access types are handled here;
+/// compatibility is best-effort on kernels supporting fewer access types.
 const TARGET_ABI: ABI = ABI::V4;
 
 /// Capabilities dropped in every mode that runs `drop_caps`. These are
@@ -50,14 +49,33 @@ pub fn apply(mode: Mode, paths: &SandboxPaths, report: &mut Report) {
     report.mode.effective = Some(mode.label());
 
     drop_caps(mode, report);
+    match caps::read(None, CapSet::Effective) {
+        Ok(caps) => {
+            report.platform.caps_retained = caps.iter().map(|c| format!("{c:?}")).collect();
+            report.platform.caps_retained.sort();
+        }
+        Err(error) => report
+            .mode
+            .warnings
+            .push(format!("retained capabilities unknown: {error}")),
+    }
 
-    let read_only = collect_read_only(paths);
-    let read_write = collect_read_write(paths);
-
-    if let Err(e) = apply_landlock(&read_only, &read_write, report) {
-        let msg = format!("Landlock not applied: {e}");
-        tracing::warn!(target: "netwatch::sandbox", error = %e, "Landlock not applied");
-        report.mode.warnings.push(msg);
+    let result = if let Some(prepared) = super::worker::prepared_ruleset() {
+        match prepared {
+            Ok(ruleset) => ruleset
+                .try_clone()
+                .map_err(|e| e.to_string())
+                .and_then(|r| enforce(r, report)),
+            Err(error) => Err(error.clone()),
+        }
+    } else {
+        prepare_ruleset(paths).and_then(|r| enforce(r, report))
+    };
+    if let Err(error) = result {
+        report
+            .mode
+            .warnings
+            .push(format!("Landlock not applied: {error}"));
     }
 
     if matches!(mode, Mode::Strict) && report.platform.landlock_abi == 0 {
@@ -80,14 +98,27 @@ fn drop_caps(mode: Mode, report: &mut Report) {
         // (unprivileged) path is silently fine.
         let permitted_before = caps::has_cap(None, CapSet::Permitted, *cap).unwrap_or(false);
 
-        // Effective + Permitted + Inheritable — full hand-back. Skip
-        // Bounding because dropping from there requires CAP_SETPCAP and
-        // failing silently is better than aborting startup.
-        let _ = caps::drop(None, CapSet::Effective, *cap);
-        let _ = caps::drop(None, CapSet::Inheritable, *cap);
-        let _ = caps::drop(None, CapSet::Permitted, *cap);
-
-        if permitted_before {
+        let mut verified = true;
+        for set in [CapSet::Effective, CapSet::Inheritable, CapSet::Permitted] {
+            if let Err(error) = caps::drop(None, set, *cap) {
+                verified = false;
+                report
+                    .mode
+                    .warnings
+                    .push(format!("{} {set:?} drop failed: {error}", cap_name(*cap)));
+            }
+            match caps::has_cap(None, set, *cap) {
+                Ok(false) => {}
+                other => {
+                    verified = false;
+                    report.mode.warnings.push(format!(
+                        "{} {set:?} removal unverified: {other:?}",
+                        cap_name(*cap)
+                    ));
+                }
+            }
+        }
+        if verified && permitted_before {
             report
                 .platform
                 .caps_dropped
@@ -109,12 +140,9 @@ fn cap_name(cap: Capability) -> &'static str {
 /// Paths we need to be able to read once restricted. Order doesn't
 /// matter; missing paths are silently skipped.
 ///
-/// The allow-list is intentionally broad on system dirs (`/proc`, `/sys`,
-/// `/usr`, `/etc`, `/bin`, `/sbin`, `/lib`) — those contain no per-user
-/// secrets and are needed by every subprocess (`ss`, `lsof`, `ip`,
-/// `traceroute`, `whois`) that inherits the Landlock policy. The
-/// confidentiality benefit comes from omitting `/home`, `/root`,
-/// `/var/lib/*`, mail spools, browser profiles, etc.
+/// System executable/library paths are broad; /etc uses an explicit list.
+/// Configured database/keylog parents and read/write grants can widen access
+/// to sensitive files. These rules apply only to confined threads.
 fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
@@ -137,8 +165,8 @@ fn collect_read_only(paths: &SandboxPaths) -> Vec<PathBuf> {
         // System resolver + service-name files. getaddrinfo() walks NSS
         // modules from /usr/lib/x86_64-linux-gnu/libnss_*.so plus
         // /etc/{passwd,group,nsswitch.conf}. Narrow list (instead of
-        // allow-all /etc) is deliberate so a sudo'd netwatch can't read
-        // /etc/shadow or /etc/sudoers through the sandbox.
+        // allow-all /etc) limits access for confined threads, unless a
+        // broader grant such as startup CWD also permits those files.
         "/etc/resolv.conf",
         "/etc/hosts",
         "/etc/services",
@@ -203,15 +231,12 @@ fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
         out.push(p.clone());
     }
     if let Some(p) = &paths.cwd {
-        // PCAP exports and Flight Recorder bundles land in CWD by
-        // default. Locked at startup — see SandboxPaths::from_config.
+        // Legacy field name: this is the dedicated exports directory.
         out.push(p.clone());
     }
-    // `/tmp` and per-user `/run/user/<uid>` — common scratch dirs for
-    // temp files, shared-memory backing, and the like.
-    out.push(PathBuf::from("/tmp"));
-    if let Some(uid_dir) = runtime_user_dir() {
-        out.push(uid_dir);
+    // No shared /tmp grant: use the prepared application scratch directory.
+    if let Some(cache) = &paths.cache_dir {
+        out.push(cache.join("scratch"));
     }
     // `/dev/null` is needed for various stdlib paths (e.g., NSS
     // canary opens).
@@ -220,33 +245,91 @@ fn collect_read_write(paths: &SandboxPaths) -> Vec<PathBuf> {
     out
 }
 
-fn runtime_user_dir() -> Option<PathBuf> {
-    let uid = unsafe { nix::libc::getuid() };
-    let candidate = PathBuf::from(format!("/run/user/{uid}"));
-    candidate.exists().then_some(candidate)
+/// Build once before workers start; kernel rules pin the opened filesystem
+/// objects, so later symlink replacement cannot widen a worker's grants.
+pub(super) fn prepare_ruleset(paths: &SandboxPaths) -> Result<landlock::RulesetCreated, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(TARGET_ABI))
+        .map_err(|e| e.to_string())?
+        .create()
+        .map_err(|e| e.to_string())?;
+    for (paths_to_open, write) in [
+        (collect_read_only(paths), false),
+        (collect_read_write(paths), true),
+    ] {
+        for path in paths_to_open {
+            let configured_file = [
+                &paths.geoip_db_dir,
+                &paths.geoip_asn_db_dir,
+                &paths.keylog_dir,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|p| *p == path);
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(nix::libc::O_PATH | if write { nix::libc::O_NOFOLLOW } else { 0 });
+            let file = match options.open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !write => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
+            let meta = file.metadata().map_err(|e| e.to_string())?;
+            if configured_file && !meta.is_file() {
+                return Err(format!("expected file grant: {}", path.display()));
+            }
+            if write && path != Path::new("/dev/null") {
+                if !meta.is_dir()
+                    || meta.uid() != unsafe { nix::libc::geteuid() }
+                    || meta.mode() & 0o077 != 0
+                {
+                    return Err(format!(
+                        "directory must be owned and private: {}",
+                        path.display()
+                    ));
+                }
+                for broad in [
+                    Some(PathBuf::from("/")),
+                    Some(PathBuf::from("/tmp")),
+                    dirs::home_dir(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Ok(other) = std::fs::metadata(broad) {
+                        if meta.dev() == other.dev() && meta.ino() == other.ino() {
+                            return Err("broad directory grant rejected".into());
+                        }
+                    }
+                }
+            }
+            let mut access = if write {
+                AccessFs::from_all(TARGET_ABI)
+            } else {
+                AccessFs::from_read(TARGET_ABI)
+            };
+            if !meta.is_dir() {
+                access &= AccessFs::ReadFile
+                    | AccessFs::WriteFile
+                    | AccessFs::Execute
+                    | AccessFs::Truncate;
+            }
+            if configured_file {
+                access = AccessFs::ReadFile.into();
+            }
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(file, access))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(ruleset)
 }
 
-fn apply_landlock(
-    read_only: &[PathBuf],
-    read_write: &[PathBuf],
-    report: &mut Report,
-) -> Result<(), landlock::RulesetError> {
-    // BestEffort lets the crate downgrade ABI features (e.g., V4
-    // network access types) on older kernels without erroring.
-    let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(AccessFs::from_all(TARGET_ABI))?;
-
-    let read_rules =
-        path_beneath_rules(filter_existing(read_only), AccessFs::from_read(TARGET_ABI));
-    let write_rules =
-        path_beneath_rules(filter_existing(read_write), AccessFs::from_all(TARGET_ABI));
-
-    let status = ruleset
-        .create()?
-        .add_rules(read_rules)?
-        .add_rules(write_rules)?
-        .restrict_self()?;
+fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(), String> {
+    let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
 
     // Record the effective ABI for the Settings overlay. `landlock`
     // exposes the effective ABI inside `LandlockStatus::Available`.
@@ -274,15 +357,6 @@ fn apply_landlock(
     Ok(())
 }
 
-/// Yield only paths that actually exist. PathFd::new opens the path
-/// via O_PATH and fails on ENOENT; pre-filtering is cheaper than
-/// catching that inside path_beneath_rules.
-fn filter_existing<'a>(paths: &'a [PathBuf]) -> impl Iterator<Item = &'a Path> + 'a {
-    paths
-        .iter()
-        .filter_map(|p| if p.exists() { Some(p.as_path()) } else { None })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,10 +370,10 @@ mod tests {
     }
 
     #[test]
-    fn collect_read_write_includes_tmp() {
+    fn collect_read_write_excludes_shared_tmp() {
         let paths = SandboxPaths::default();
         let rw = collect_read_write(&paths);
-        assert!(rw.iter().any(|p| p == Path::new("/tmp")));
+        assert!(!rw.iter().any(|p| p == Path::new("/tmp")));
     }
 
     #[test]

@@ -26,11 +26,11 @@ use std::time::{Duration, Instant};
 fn main() {
     // 1. Attach the BPF programs (needs root). Fail loudly here — unlike the
     //    unit test, a skip would defeat the point of a smoke.
-    let tracker = match ConnTracker::new() {
+    let tracker = match ConnTracker::start() {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
-                "FAIL: ConnTracker::new failed ({e}) — run under sudo (needs CAP_BPF/CAP_PERFMON)"
+                "FAIL: ConnTracker::start failed ({e}) — run under sudo (needs CAP_BPF/CAP_PERFMON)"
             );
             std::process::exit(2);
         }

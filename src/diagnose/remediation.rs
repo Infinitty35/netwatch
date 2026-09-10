@@ -10,7 +10,7 @@
 //! than one that never offered to.
 //!
 //! So the order is: **journal first, mutate second.** Before touching a file,
-//! [`Journal::record`] writes an entry naming the target, the backup, and the
+//! [`Journal::apply_file_edit`] writes an entry naming the target, the backup, and the
 //! value we are about to install. On startup [`Journal::reconcile`] reads that
 //! file back, and anything still open belongs to a process that did not exit
 //! cleanly — it is reverted before the UI is drawn, and reported.
@@ -157,6 +157,8 @@ impl Host for RealHost {
 pub struct Journal {
     path: PathBuf,
     entries: Vec<JournalEntry>,
+    /// A failed load or persistence operation blocks subsequent writes.
+    blocked: Option<String>,
 }
 
 impl Journal {
@@ -164,6 +166,7 @@ impl Journal {
         Self {
             path,
             entries: Vec::new(),
+            blocked: None,
         }
     }
 
@@ -185,22 +188,51 @@ impl Journal {
     }
 
     pub fn load<H: Host>(path: PathBuf, host: &H) -> Self {
-        let entries = host
-            .read(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<JournalEntry>>(&t).ok())
-            .unwrap_or_default();
-        Self { path, entries }
+        let mut journal = Self::new(path);
+        match host.read(&journal.path) {
+            Ok(text) => match serde_json::from_str::<Vec<JournalEntry>>(&text) {
+                Ok(entries) => journal.entries = entries,
+                Err(e) => journal.blocked = Some(format!(
+                    "invalid or unsupported journal {}: {e}; original preserved; host changes blocked",
+                    journal.path.display()
+                )),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => journal.blocked = Some(format!(
+                "cannot read journal {}: {e}; host changes blocked", journal.path.display()
+            )),
+        }
+        journal
     }
 
-    fn flush<H: Host>(&self, host: &mut H) -> std::io::Result<()> {
+    pub fn blocked_reason(&self) -> Option<&str> {
+        self.blocked.as_deref()
+    }
+
+    fn ensure_writable(&self) -> std::io::Result<()> {
+        match &self.blocked {
+            Some(reason) => Err(std::io::Error::other(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn flush<H: Host>(&mut self, host: &mut H) -> std::io::Result<()> {
+        self.ensure_writable()?;
         let text = serde_json::to_string_pretty(&self.entries)?;
-        host.write(&self.path, &text)
+        if let Err(e) = host.write(&self.path, &text) {
+            self.blocked = Some(format!(
+                "cannot persist journal {}: {e}; recovery review required; further host changes blocked",
+                self.path.display()
+            ));
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Apply a file-edit remediation: journal the intent, back the file up,
-    /// then write. If any step fails the caller is told and the host is left
-    /// as it was.
+    /// then write. Errors are returned only before the target write is attempted.
+    /// Any subsequent failure is recorded as recovery-required, even if a
+    /// failed write may have left only part of the intended contents.
     ///
     /// Returns the [`Applied`] record to attach to the [`Step`], carrying the
     /// before/after values the report prints.
@@ -215,7 +247,17 @@ impl Journal {
         new_contents: &str,
         summarise: impl Fn(&str) -> String,
     ) -> std::io::Result<Applied> {
-        let before = host.read(target).unwrap_or_default();
+        self.ensure_writable()?;
+        if self
+            .entries
+            .iter()
+            .any(|e| e.target.as_deref() == Some(target) && e.state != EntryState::Reverted)
+        {
+            return Err(std::io::Error::other(
+                "target has an existing change; review recovery before applying again",
+            ));
+        }
+        let before = host.read(target)?;
         let backup = backup_path(target, host.pid());
 
         // 1. Journal the intent *first*. A crash between here and the write
@@ -239,11 +281,15 @@ impl Journal {
 
         // 2. Back up, then write.
         host.write(&backup, &before)?;
-        host.write(target, new_contents)?;
+        if let Err(e) = host.write(target, new_contents) {
+            return Ok(self.recovery_required(idx, "target write", &e));
+        }
 
         // 3. Confirm.
         self.entries[idx].state = EntryState::Applied;
-        self.flush(host)?;
+        if let Err(e) = self.flush(host) {
+            return Ok(self.recovery_required(idx, "completion journal write", &e));
+        }
 
         Ok(Applied::Yes {
             at: self.entries[idx].applied_at.clone(),
@@ -252,15 +298,34 @@ impl Journal {
         })
     }
 
+    fn recovery_required(&self, idx: usize, stage: &str, error: &std::io::Error) -> Applied {
+        let entry = &self.entries[idx];
+        Applied::RecoveryRequired {
+            operation_id: entry.id.clone(),
+            reason: format!("{stage} failed: {error}; target may have changed"),
+            backup: entry
+                .backup
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Mark an issue's changes permanent — they survive quit and are never
     /// reconciled away.
     pub fn make_permanent<H: Host>(&mut self, host: &mut H, issue_id: &str) -> std::io::Result<()> {
+        self.ensure_writable()?;
+        let previous = self.entries.clone();
         for e in self.entries.iter_mut() {
             if e.issue_id == issue_id && e.state == EntryState::Applied {
                 e.permanent = true;
             }
         }
-        self.flush(host)
+        if let Err(e) = self.flush(host) {
+            self.entries = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Put one entry back. Refuses when the target no longer contains what we
@@ -273,7 +338,13 @@ impl Journal {
             return Ok(());
         };
 
-        let current = host.read(&target).unwrap_or_default();
+        let current = host.read(&target).map_err(|e| {
+            format!(
+                "could not read {}: {e}; recovery required; backup: {}",
+                target.display(),
+                backup.display()
+            )
+        })?;
         if let Some(installed) = &entry.installed {
             if entry.state == EntryState::Applied && &current != installed {
                 let msg = format!(
@@ -287,8 +358,18 @@ impl Journal {
             }
             // Pending entries whose write never landed need no revert.
             if entry.state == EntryState::Pending && &current != installed {
-                self.entries[idx].state = EntryState::Reverted;
-                return Ok(());
+                // A differing target may be a partial write. Only a
+                // readable backup matching the current file proves no
+                // restoration is needed.
+                if host.read(&backup).is_ok_and(|original| original == current) {
+                    self.entries[idx].state = EntryState::Reverted;
+                    return Ok(());
+                }
+                return Err(format!(
+                    "unconfirmed write to {}; recovery required; backup: {}",
+                    target.display(),
+                    backup.display()
+                ));
             }
         }
 
@@ -339,6 +420,10 @@ impl Journal {
         pred: impl Fn(&JournalEntry) -> bool,
     ) -> Reconciliation {
         let mut out = Reconciliation::default();
+        if let Some(reason) = &self.blocked {
+            out.abandoned.push(reason.clone());
+            return out;
+        }
         let targets: Vec<usize> = self
             .entries
             .iter()
@@ -348,6 +433,7 @@ impl Journal {
             .map(|(i, _)| i)
             .collect();
 
+        let changed = !targets.is_empty();
         for idx in targets {
             let desc = describe(&self.entries[idx]);
             match self.revert_entry(host, idx) {
@@ -355,10 +441,14 @@ impl Journal {
                 Err(msg) => out.abandoned.push(msg),
             }
         }
-        // Best-effort: a journal we can't rewrite still reverted the host
-        // correctly, and the next pass will simply try the same entries again
-        // and find them already restored.
-        let _ = self.flush(host);
+        if changed {
+            if let Err(e) = self.flush(host) {
+                out.abandoned.push(format!(
+                    "recovery completion could not be recorded: {e}; journal: {}",
+                    self.path.display()
+                ));
+            }
+        }
         out
     }
 }
@@ -425,6 +515,10 @@ mod tests {
         alive: HashSet<u32>,
         pid: u32,
         clock: u32,
+        writes: usize,
+        fail_write: Option<usize>,
+        partial_write: bool,
+        unreadable: HashSet<PathBuf>,
     }
 
     impl FakeHost {
@@ -439,12 +533,26 @@ mod tests {
 
     impl Host for FakeHost {
         fn read(&self, path: &Path) -> std::io::Result<String> {
+            if self.unreadable.contains(path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read denied",
+                ));
+            }
             self.files
                 .get(path)
                 .cloned()
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no file"))
         }
         fn write(&mut self, path: &Path, contents: &str) -> std::io::Result<()> {
+            self.writes += 1;
+            if self.fail_write == Some(self.writes) {
+                if self.partial_write {
+                    self.files
+                        .insert(path.to_path_buf(), contents.chars().take(7).collect());
+                }
+                return Err(std::io::Error::other("injected write failure"));
+            }
             self.files.insert(path.to_path_buf(), contents.to_string());
             Ok(())
         }
@@ -581,7 +689,11 @@ mod tests {
         host.alive.insert(200);
         let mut j2 = Journal::load(journal_path(), &host);
         let recon = j2.reconcile(&mut host);
-        assert!(recon.abandoned.is_empty(), "{recon:?}");
+        assert_eq!(
+            recon.abandoned.len(),
+            1,
+            "missing backup needs review: {recon:?}"
+        );
         assert_eq!(host.read(Path::new(TARGET)).unwrap(), RESOLV);
     }
 
@@ -684,6 +796,171 @@ mod tests {
             "second pass must be a no-op"
         );
         assert_eq!(host.read(Path::new(TARGET)).unwrap(), RESOLV);
+    }
+
+    fn try_apply(host: &mut FakeHost, journal: &mut Journal) -> std::io::Result<Applied> {
+        journal.apply_file_edit(
+            host,
+            "fault-test",
+            Action::SetResolver {
+                addr: "1.1.1.1".into(),
+            },
+            Path::new(TARGET),
+            &resolv_conf_with(RESOLV, "1.1.1.1"),
+            first_nameserver,
+        )
+    }
+
+    #[test]
+    fn faults_before_target_write_do_not_change_target() {
+        for stage in [1, 2] {
+            let mut host = FakeHost::new(100);
+            host.files.insert(TARGET.into(), RESOLV.into());
+            host.fail_write = Some(stage);
+            let mut journal = Journal::new(journal_path());
+            assert!(try_apply(&mut host, &mut journal).is_err());
+            assert_eq!(host.files[Path::new(TARGET)], RESOLV);
+        }
+    }
+
+    #[test]
+    fn target_write_and_completion_failures_record_recovery_required() {
+        for stage in [3, 4] {
+            for partial in [false, true] {
+                let mut host = FakeHost::new(100);
+                host.files.insert(TARGET.into(), RESOLV.into());
+                host.fail_write = Some(stage);
+                host.partial_write = partial;
+                let mut journal = Journal::new(journal_path());
+                let outcome = try_apply(&mut host, &mut journal).unwrap();
+                let Applied::RecoveryRequired {
+                    operation_id,
+                    backup,
+                    ..
+                } = &outcome
+                else {
+                    panic!("expected recovery required: {outcome:?}");
+                };
+                assert_eq!(operation_id, "fault-test-1");
+                assert_eq!(host.files[Path::new(backup)], RESOLV);
+                assert!(outcome
+                    .recovery_summary()
+                    .unwrap()
+                    .contains("recovery required"));
+                if stage == 4 {
+                    assert_eq!(
+                        host.files[Path::new(TARGET)],
+                        resolv_conf_with(RESOLV, "1.1.1.1")
+                    );
+                    assert!(journal.blocked_reason().is_some());
+                }
+                let writes = host.writes;
+                assert!(try_apply(&mut host, &mut journal).is_err());
+                assert_eq!(host.writes, writes, "retry must preserve the backup");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_pending_write_is_not_reported_as_reverted_after_restart() {
+        let mut host = FakeHost::new(100);
+        host.files.insert(TARGET.into(), RESOLV.into());
+        host.fail_write = Some(3);
+        host.partial_write = true;
+        let mut journal = Journal::new(journal_path());
+        try_apply(&mut host, &mut journal).unwrap();
+        let partial = host.files[Path::new(TARGET)].clone();
+        host.alive.remove(&100);
+        host.pid = 200;
+        let mut restarted = Journal::load(journal_path(), &host);
+        let result = restarted.reconcile(&mut host);
+        assert!(result.reverted.is_empty());
+        assert_eq!(result.abandoned.len(), 1);
+        assert_eq!(host.files[Path::new(TARGET)], partial);
+        assert_eq!(restarted.entries()[0].state, EntryState::Pending);
+    }
+
+    #[test]
+    fn pending_write_with_unchanged_target_and_backup_is_resolved() {
+        let mut host = FakeHost::new(100);
+        host.files.insert(TARGET.into(), RESOLV.into());
+        host.fail_write = Some(3);
+        let mut journal = Journal::new(journal_path());
+        try_apply(&mut host, &mut journal).unwrap();
+        let result = journal.revert_session(&mut host);
+        assert_eq!(result.reverted.len(), 1);
+        assert!(result.abandoned.is_empty());
+        assert_eq!(host.files[Path::new(TARGET)], RESOLV);
+    }
+
+    #[test]
+    fn invalid_and_unsupported_journals_are_preserved_by_every_write_path() {
+        for original in ["[{truncated", r#"{"version":999,"entries":[]}"#] {
+            let mut host = FakeHost::new(100);
+            host.files.insert(journal_path(), original.into());
+            host.files.insert(TARGET.into(), RESOLV.into());
+            let mut journal = Journal::load(journal_path(), &host);
+            assert!(journal.blocked_reason().is_some());
+            assert!(try_apply(&mut host, &mut journal).is_err());
+            assert!(journal.make_permanent(&mut host, "fault-test").is_err());
+            assert!(!journal.reconcile(&mut host).abandoned.is_empty());
+            assert!(!journal.revert_session(&mut host).abandoned.is_empty());
+            assert_eq!(host.writes, 0);
+            assert_eq!(host.files[&journal_path()], original);
+        }
+    }
+
+    #[test]
+    fn missing_journal_is_distinct_from_unreadable_journal() {
+        let mut host = FakeHost::new(100);
+        assert!(Journal::load(journal_path(), &host)
+            .blocked_reason()
+            .is_none());
+        host.unreadable.insert(journal_path());
+        let mut journal = Journal::load(journal_path(), &host);
+        assert!(journal.blocked_reason().unwrap().contains("cannot read"));
+        assert!(try_apply(&mut host, &mut journal).is_err());
+        journal.revert_session(&mut host);
+        assert_eq!(host.writes, 0);
+    }
+
+    #[test]
+    fn missing_or_unreadable_target_is_never_replaced_with_empty_contents() {
+        let mut host = FakeHost::new(100);
+        let mut journal = Journal::new(journal_path());
+        assert!(try_apply(&mut host, &mut journal).is_err());
+        host.files.insert(TARGET.into(), RESOLV.into());
+        host.unreadable.insert(TARGET.into());
+        assert!(try_apply(&mut host, &mut journal).is_err());
+        assert_eq!(host.writes, 0);
+        assert!(journal.entries().is_empty());
+    }
+
+    #[test]
+    fn unreadable_target_during_recovery_remains_unresolved() {
+        let mut host = FakeHost::new(100);
+        host.files.insert(TARGET.into(), RESOLV.into());
+        let mut journal = Journal::new(journal_path());
+        try_apply(&mut host, &mut journal).unwrap();
+        host.unreadable.insert(TARGET.into());
+        let result = journal.revert_session(&mut host);
+        assert!(result.reverted.is_empty());
+        assert_eq!(result.abandoned.len(), 1);
+        assert_eq!(journal.entries()[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn recovery_flush_failure_is_visible_and_blocks_further_writes() {
+        let mut host = FakeHost::new(100);
+        host.files.insert(TARGET.into(), RESOLV.into());
+        let mut journal = Journal::new(journal_path());
+        try_apply(&mut host, &mut journal).unwrap();
+        host.fail_write = Some(host.writes + 2); // restore succeeds; journal fails
+        let result = journal.revert_session(&mut host);
+        assert_eq!(host.files[Path::new(TARGET)], RESOLV);
+        assert_eq!(result.reverted.len(), 1);
+        assert_eq!(result.abandoned.len(), 1);
+        assert!(journal.blocked_reason().is_some());
     }
 
     #[test]

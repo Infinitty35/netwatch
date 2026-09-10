@@ -259,10 +259,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // Landlock / cap-drop / Seatbelt actually applied so users can
     // confirm enforcement at runtime rather than trusting the README.
     lines.push(Line::raw(""));
-    let sandbox_summary = app.sandbox_report.summary();
-    let sandbox_color = if sandbox_summary == "disabled" {
+    let sandbox_summary = format!(
+        "{} · {}",
+        app.sandbox_report.summary(),
+        crate::sandbox::worker::summary()
+    );
+    let sandbox_color = if app.sandbox_report.mode.effective == Some("disabled") {
         app.theme.text_muted
-    } else if app.sandbox_report.mode.warnings.is_empty()
+    } else if crate::sandbox::worker::all_verified()
+        && app.sandbox_report.mode.warnings.is_empty()
         && (app.sandbox_report.platform.landlock_abi > 0
             || app.sandbox_report.platform.macos_seatbelt
             || app.sandbox_report.platform.windows_restricted
@@ -279,6 +284,23 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(sandbox_summary, Style::default().fg(sandbox_color)),
     ]));
+
+    for (name, state) in crate::sandbox::worker::snapshot()
+        .iter()
+        .filter(|(_, s)| {
+            s.error.is_some()
+                || s.report
+                    .as_ref()
+                    .is_some_and(|r| !r.mode.warnings.is_empty())
+        })
+        .take(3)
+    {
+        let reason = state
+            .error
+            .clone()
+            .unwrap_or_else(|| state.report.as_ref().unwrap().mode.warnings.join("; "));
+        lines.push(Line::raw(format!("  {name}: {reason}")));
+    }
 
     // Status message
     lines.push(Line::raw(""));

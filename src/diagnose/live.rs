@@ -37,8 +37,12 @@ pub const BASELINED_METRICS: &[(&str, &str)] = &[
 
 #[derive(Default)]
 pub struct LiveSampler {
+    interface_sample: Option<(Instant, IfaceObs)>,
+    pub completed: super::engine::ObservationTimes,
+    path_samples: HashMap<String, (Instant, PathObs)>,
     /// Socket key → (verdict, when it started). A verdict has to persist
     /// before it becomes an issue, and only this map knows for how long.
+    learned_samples: HashMap<String, Instant>,
     verdict_since: HashMap<String, (SocketVerdict, Instant)>,
     /// Interface name → the last 60 seconds of (errors, drops) deltas. Rules
     /// fire on the rate over that window, not on a lifetime counter (a NIC
@@ -122,21 +126,39 @@ impl LiveSampler {
     /// the store, and so the set of baselined metrics is inspectable — a
     /// metric learned under one name and verified under another would be a
     /// silent dead end, and [`BASELINED_METRICS`] is asserted against the rules.
-    pub fn readings(app: &App) -> Vec<(String, &'static str, f64)> {
+    pub fn readings(&mut self, app: &App) -> Vec<(String, &'static str, f64)> {
         let health = app.health_prober.status();
         let cfg = &app.config_collector.config;
         let mut out = Vec::new();
 
         if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), health.dns_rtt_ms) {
-            out.push((resolver, "dns.rtt_p50", rtt));
+            if health.completed.dns_target.as_ref() == Some(&resolver)
+                && self.fresh_reading("dns", health.completed.dns)
+            {
+                out.push((resolver, "dns.rtt_p50", rtt));
+            }
         }
         if let (Some(gw), Some(rtt)) = (cfg.gateway.clone(), health.gateway_rtt_ms) {
-            out.push((gw, "gateway.rtt", rtt));
+            if health.completed.gateway_target.as_ref() == Some(&gw)
+                && self.fresh_reading("gateway", health.completed.gateway)
+            {
+                out.push((gw, "gateway.rtt", rtt));
+            }
         }
         if let Some(rtt) = health.internet_rtt_ms {
-            out.push(("internet".to_string(), "path.rtt", rtt));
+            if self.fresh_reading("internet", health.completed.internet) {
+                out.push(("internet".to_string(), "path.rtt", rtt));
+            }
         }
         out
+    }
+
+    fn fresh_reading(&mut self, source: &str, completed: Option<Instant>) -> bool {
+        if !crate::collectors::health::ProbeTimes::fresh(completed, 30) {
+            return false;
+        }
+        let completed = completed.unwrap();
+        self.learned_samples.insert(source.into(), completed) != Some(completed)
     }
 
     /// The verdict this socket is currently carrying, if it has one.
@@ -160,6 +182,10 @@ impl LiveSampler {
     }
 
     pub fn sample(&mut self, app: &App, thresholds: &Thresholds) -> Observations {
+        self.completed = super::engine::ObservationTimes {
+            health: app.health_prober.status().completed.clone(),
+            ..Default::default()
+        };
         Observations {
             now: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             iface: self.iface(app),
@@ -179,7 +205,16 @@ impl LiveSampler {
     }
 
     fn iface(&mut self, app: &App) -> Option<IfaceObs> {
-        let interfaces = app.traffic.interfaces();
+        let (interfaces, completed) = app.traffic.timed_snapshot();
+        self.completed.interface = completed;
+        if !crate::collectors::health::ProbeTimes::fresh(completed, 15) {
+            return None;
+        }
+        if let Some((at, cached)) = &self.interface_sample {
+            if Some(*at) == completed && cached.name == app.capture_interface {
+                return Some(cached.clone());
+            }
+        }
         let t = interfaces
             .iter()
             .find(|i| i.name == app.capture_interface)?;
@@ -209,7 +244,7 @@ impl LiveSampler {
             }
         });
 
-        Some(IfaceObs {
+        let observed = IfaceObs {
             name: t.name.clone(),
             carrier: info.map(|i| i.is_up).unwrap_or(true),
             rx_errors: t.rx_errors,
@@ -226,7 +261,9 @@ impl LiveSampler {
             tx_retry_pct,
             rx_bps: t.rx_rate,
             tx_bps: t.tx_rate,
-        })
+        };
+        self.interface_sample = Some((completed.unwrap(), observed.clone()));
+        Some(observed)
     }
 
     fn paths(&mut self, app: &App) -> Vec<PathObs> {
@@ -234,8 +271,20 @@ impl LiveSampler {
             Ok(r) => r.clone(),
             Err(_) => return vec![],
         };
-        if result.target.is_empty() || result.hops.is_empty() {
+        self.completed.path = result.completed;
+        if result.target.is_empty()
+            || result.hops.is_empty()
+            || !crate::collectors::health::ProbeTimes::fresh(result.completed, 120)
+        {
             return vec![];
+        }
+
+        let completed = result.completed.unwrap();
+        self.completed.path = Some(completed);
+        if let Some((at, path)) = self.path_samples.get(&result.target) {
+            if *at == completed {
+                return vec![path.clone()];
+            }
         }
 
         let hops: Vec<HopObs> = result
@@ -261,17 +310,22 @@ impl LiveSampler {
             .collect();
 
         let previous = self.prev_path.insert(result.target.clone(), hops.clone());
-        vec![PathObs {
+        let path = PathObs {
             target: result.target.clone(),
             hops,
             previous,
-            traced_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        }]
+            traced_at: result.completed_at.clone(),
+        };
+        self.path_samples
+            .insert(result.target.clone(), (completed, path.clone()));
+        vec![path]
     }
 
     fn sockets(&mut self, app: &App, thresholds: &Thresholds) -> Vec<SocketObs> {
-        let flows = app.tcp_info.snapshot();
-        if flows.is_empty() {
+        let (flows, completed) = app.tcp_info.timed_snapshot();
+        self.completed.sockets = completed;
+        if flows.is_empty() || !crate::collectors::health::ProbeTimes::fresh(completed, 30) {
+            self.verdict_since.clear();
             return vec![];
         }
         let conns = app.connection_collector.connections();
@@ -330,14 +384,19 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     // fresh start that difference is a `critical` finding against a working
     // router. The history deques are the honest signal: they are empty until
     // a probe has actually published a result.
-    if health.gateway_rtt_history.is_empty() {
+    if health.gateway_rtt_history.is_empty()
+        || !crate::collectors::health::ProbeTimes::fresh(health.completed.gateway, 30)
+        || health.completed.gateway_target.as_ref() != Some(&addr)
+    {
         return None;
     }
     let icmp_ok = health.gateway_rtt_ms.is_some() && health.gateway_loss_pct < 100.0;
 
     // Corroborating evidence for a gateway verdict, on the same footing:
     // unknown until the internet probe has run at least once.
-    let internet_reachable = if health.internet_rtt_history.is_empty() {
+    let internet_reachable = if health.internet_rtt_history.is_empty()
+        || !crate::collectors::health::ProbeTimes::fresh(health.completed.internet, 30)
+    {
         None
     } else {
         Some(health.internet_rtt_ms.is_some() && health.internet_loss_pct < 100.0)
@@ -359,6 +418,12 @@ fn dns(app: &App) -> Option<DnsObs> {
     let cfg = &app.config_collector.config;
     let resolver = cfg.primary_dns()?;
     let health = app.health_prober.status();
+
+    if !crate::collectors::health::ProbeTimes::fresh(health.completed.dns, 30)
+        || health.completed.dns_target.as_ref() != Some(&resolver)
+    {
+        return None;
+    }
 
     let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
     // One sample per probe, so the window is samples × the probe interval —
@@ -408,7 +473,7 @@ fn dns(app: &App) -> Option<DnsObs> {
         rtt_p95_ms: percentile(&samples, 0.95),
         failure_rate_pct: health.dns_loss_pct,
         truncation_rate_pct,
-        queries: replies.max(samples.len() as u32),
+        queries: replies.max(health.dns_rtt_history.len() as u32),
         failed: health
             .dns_rtt_history
             .iter()
@@ -429,6 +494,9 @@ fn dns(app: &App) -> Option<DnsObs> {
 
 fn nat(app: &App) -> Option<NatObs> {
     let health = app.health_prober.status();
+    if !crate::collectors::health::ProbeTimes::fresh(health.completed.nat, 300) {
+        return None;
+    }
     health.nat.as_ref().map(|n| NatObs {
         mappings: n.mappings.clone(),
         symmetric: n.symmetric,
@@ -462,6 +530,17 @@ fn subnet_of(ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_probe_is_learned_once_and_stale_results_are_not_learned() {
+        let mut sampler = LiveSampler::new();
+        let now = Instant::now();
+        assert!(sampler.fresh_reading("dns", Some(now)));
+        assert!(!sampler.fresh_reading("dns", Some(now)));
+        assert!(!sampler.fresh_reading("dns", Some(now - std::time::Duration::from_secs(31))));
+        assert!(!sampler.fresh_reading("dns", None));
+        assert!(sampler.fresh_reading("dns", Some(now + std::time::Duration::from_nanos(1))));
+    }
 
     #[test]
     fn percentile_of_nothing_is_not_zero() {

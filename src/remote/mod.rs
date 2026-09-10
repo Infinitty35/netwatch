@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -89,7 +89,7 @@ pub struct RemotePublisher {
     /// final bounded drain and exit.
     shutdown: Arc<AtomicBool>,
     /// Sender-thread handle, joined on shutdown for a clean flush.
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handle: Mutex<Option<crate::sandbox::worker::WorkerHandle>>,
 }
 
 impl RemotePublisher {
@@ -121,7 +121,7 @@ impl RemotePublisher {
         let collectors_ok = self.collectors_ok.clone();
         let shutdown = self.shutdown.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = crate::sandbox::worker::spawn("remote", move || {
             let host_info = collect_host_info(host_id);
             let endpoint = format!("{}/api/v1/ingest", url);
             let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(60));
@@ -137,7 +137,7 @@ impl RemotePublisher {
 
                 // Graceful shutdown: one final bounded drain, then exit so the
                 // daemon's join() returns promptly even if the backend is slow.
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Relaxed) || crate::sandbox::worker::stopping() {
                     final_drain(
                         &endpoint,
                         &api_key,

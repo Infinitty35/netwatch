@@ -1,27 +1,17 @@
-//! Security sandbox — restrict netwatch's authority after pcap + eBPF setup.
+//! Per-thread Linux filesystem enforcement using a prepared, pinned ruleset.
+//! Application worker entry points apply policy before processing; capture
+//! prepares its device first. Strict entry failure withholds processing.
+//! Main applies the same policy after resource startup. No network restrictions
+//! are installed, and macOS/Windows have no filesystem backend.
 //!
-//! A three-OS approach (Landlock / Seatbelt / restricted token),
-//! shipped in phases:
-//!
-//! - **Phase 1 (this module): Linux** — `caps` drop + `landlock` filesystem
-//!   and network restrictions. Applied after `ConnTracker::new()` returns
-//!   so the kprobe is already attached and pcap fds are already open.
-//! - **Phase 2: macOS Seatbelt** — inline SBPL profile via
-//!   `sandbox_init_with_parameters` (stubbed below).
-//! - **Phase 3: Windows** — restricted token + job object (stubbed below).
-//!
-//! The application boundary the sandbox draws around netwatch:
-//!
-//! - Read: `/proc`, configured GeoIP dbs, config dir, cache/log dir,
-//!   `/etc/{resolv,hosts,services}.conf`, zoneinfo, configured PCAP export
-//!   dir.
-//! - Write: cache/log dir, Flight Recorder bundle dir, configured PCAP
-//!   export dir.
-//! - Network (Landlock ABI V4 / kernel ≥ 6.4 only): block new TCP bind +
-//!   connect. Existing pcap and remote-publisher sockets unaffected.
-//! - Caps (Linux): drop CAP_NET_RAW, CAP_BPF, CAP_PERFMON.
+//! Selected capability removals are checked after each attempt. Best-effort
+//! retains CAP_NET_RAW; strict drops it, so later capture reopening may fail.
+//! Worker reports describe policy entry, not an exploit-proof process boundary.
+//! The eBPF SDK reader is disabled under an installed sandbox policy until it
+//! exposes a suitable entry hook. See docs/runtime-lifecycle.md for limitations.
 
 pub mod paths;
+pub mod worker;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -33,13 +23,11 @@ pub use paths::SandboxPaths;
 pub enum Mode {
     /// `--no-sandbox`: skip all enforcement. Escape hatch for debugging.
     Disabled,
-    /// Default. Apply what the platform supports; degrade silently on old
-    /// kernels (e.g., Landlock unavailable, ABI < V4 means no network
-    /// restriction). Log a single warning when degraded.
+    /// Default. Attempt supported filesystem restrictions and report warnings
+    /// on degradation. Network restrictions are not installed in any mode.
     BestEffort,
-    /// `--sandbox-strict`: fail to start if any platform-supported
-    /// restriction can't be applied. Intended for CI / production
-    /// deployments where the user wants a hard guarantee.
+    /// `--sandbox-strict`: callers abort on reported application warnings.
+    /// This does not establish worker confinement or successful capability drops.
     Strict,
 }
 
@@ -88,9 +76,9 @@ mod tests {
     }
 }
 
-/// What the sandbox actually applied. Surfaced in the Settings overlay so
-/// users can confirm enforcement happened, and consumed by `Mode::Strict`
-/// to decide whether to abort startup.
+/// Results of the calling-thread sandbox application, surfaced in Settings.
+/// This is not a verified worker or capability inventory. Strict callers use
+/// reported warnings to decide whether to abort startup.
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub mode: ModeReport,
@@ -99,8 +87,8 @@ pub struct Report {
 
 #[derive(Debug, Clone, Default)]
 pub struct ModeReport {
-    /// Effective mode after fallback (e.g., Strict downgraded to
-    /// BestEffort when the platform has no backend).
+    /// Requested application mode; unsupported strict mode produces warnings
+    /// for the caller to reject rather than downgrading to best-effort.
     pub effective: Option<&'static str>,
     /// Human-readable warning shown in Settings + logged once at startup.
     pub warnings: Vec<String>,
@@ -110,10 +98,12 @@ pub struct ModeReport {
 pub struct PlatformReport {
     /// Linux: Landlock ABI level actually enforced (0 = not applied).
     pub landlock_abi: u32,
-    /// Linux: whether the network-block ruleset was applied (ABI ≥ V4 only).
+    /// Reserved for network restrictions; the current backend leaves this false.
     pub landlock_network_blocked: bool,
-    /// Linux: capabilities dropped (names as the `caps` crate spells them).
+    /// Linux: capabilities present before removal and verified absent afterward.
     pub caps_dropped: Vec<String>,
+    /// Effective capabilities still held after verified drop attempts.
+    pub caps_retained: Vec<String>,
     /// macOS: whether `sandbox_init_with_parameters` returned 0.
     pub macos_seatbelt: bool,
     /// Windows: whether the restricted-token + job-object pair applied.
@@ -156,8 +146,8 @@ impl Report {
     }
 }
 
-/// Apply the sandbox. Call once, after every privileged fd (pcap handles,
-/// eBPF ring buffer, remote-publisher socket) is already open.
+/// Apply restrictions to the calling thread. Current callers invoke this
+/// after App construction; this does not confine already-running workers.
 ///
 /// Returns the Report unconditionally. In `Mode::Strict`, callers should
 /// check `report.mode.warnings` and abort if non-empty.

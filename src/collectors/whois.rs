@@ -26,6 +26,7 @@ enum WhoisEntry {
 pub struct WhoisCache {
     cache: Arc<Mutex<HashMap<String, WhoisEntry>>>,
     tx: std_mpsc::Sender<String>,
+    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
 }
 
 impl Default for WhoisCache {
@@ -38,11 +39,25 @@ impl WhoisCache {
     pub fn new() -> Self {
         let (tx, rx) = std_mpsc::channel::<String>();
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let resolver_cache = Arc::clone(&cache);
-        thread::spawn(move || {
+
+        Self {
+            cache,
+            tx,
+            pending_rx: Arc::new(Mutex::new(Some(rx))),
+        }
+    }
+
+    /// Start the prepared lookup worker once, shared across cache clones.
+    /// Construction only opens local resources and creates a request channel.
+    pub fn start(&self) -> bool {
+        let Some(rx) = self.pending_rx.lock().unwrap().take() else {
+            return false;
+        };
+        let resolver_cache = Arc::clone(&self.cache);
+        crate::sandbox::worker::spawn("whois", move || {
             let now = Instant::now();
             let mut last_request = now.checked_sub(Duration::from_millis(2000)).unwrap_or(now);
-            while let Ok(ip) = rx.recv() {
+            while let Some(ip) = crate::sandbox::worker::receive(&rx) {
                 // Rate limit: ~1 request per 2s
                 let elapsed = last_request.elapsed();
                 if elapsed < Duration::from_millis(2000) {
@@ -50,6 +65,9 @@ impl WhoisCache {
                 }
                 last_request = Instant::now();
 
+                if crate::sandbox::worker::stopping() {
+                    break;
+                }
                 let result = lookup_whois(&ip);
                 let mut c = resolver_cache.lock().unwrap();
                 match result {
@@ -68,7 +86,7 @@ impl WhoisCache {
                 }
             }
         });
-        Self { cache, tx }
+        true
     }
 
     pub fn lookup(&self, ip: &str) -> Option<WhoisInfo> {
@@ -237,4 +255,29 @@ fn extract_vcard_name(entity: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
+        let cache = WhoisCache::new();
+        cache.request("192.0.2.1");
+        assert_eq!(
+            cache
+                .pending_rx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .unwrap(),
+            "192.0.2.1"
+        );
+        let clone = cache.clone();
+        assert!(clone.start());
+        assert!(!cache.start());
+    }
 }

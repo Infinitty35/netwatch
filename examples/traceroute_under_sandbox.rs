@@ -28,6 +28,9 @@ fn main() {
 
     let cfg = NetwatchConfig::default();
     let paths = SandboxPaths::from_config(&cfg);
+    paths
+        .prepare()
+        .expect("prepare dedicated sandbox directories");
     let report = sandbox::apply(Mode::BestEffort, &paths);
     println!("sandbox summary = {}", report.summary());
 

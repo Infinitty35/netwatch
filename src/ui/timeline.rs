@@ -129,31 +129,27 @@ fn build_events(app: &App) -> Vec<Event> {
         });
     }
 
-    // RTT spike events — scan health probe history for samples that exceed
-    // 2× the rolling baseline AND 50ms absolute. The health prober runs every
-    // 5 main ticks (app.rs), so each history entry represents
-    // 5 * refresh_rate_ms of wall time, not 1 second.
+    // Place RTT spikes at their measured completion time, never at redraw time.
     {
         let hs = app.health_prober.status();
-        // The health histories advance once per probe, not once per tick.
-        let probe_interval_secs =
-            (crate::app::HEALTH_PROBE_TICKS as u64 * app.user_config.refresh_rate_ms / 1000).max(1);
-        for (label, history) in [
-            ("gateway", hs.gateway_rtt_history.as_slices().0),
-            ("DNS", hs.dns_rtt_history.as_slices().0),
+        for (label, history, times) in [
+            (
+                "gateway",
+                &hs.gateway_rtt_history,
+                &hs.completed.gateway_history,
+            ),
+            ("DNS", &hs.dns_rtt_history, &hs.completed.dns_history),
         ] {
             let valid: Vec<f64> = history.iter().filter_map(|x| *x).collect();
-            if valid.len() < 5 {
+            if valid.len() < 5 || history.len() != times.len() {
                 continue;
             }
             let baseline = valid.iter().sum::<f64>() / valid.len() as f64;
-            let now = Instant::now();
-            for (i, sample) in history.iter().enumerate().rev().take(20) {
+            for (sample, &when) in history.iter().zip(times).rev().take(20) {
                 let Some(rtt) = sample else { continue };
                 if *rtt > 50.0 && *rtt > baseline * 2.0 {
-                    let secs_ago = (history.len() - 1 - i) as u64 * probe_interval_secs;
                     events.push(Event {
-                        when: now - Duration::from_secs(secs_ago),
+                        when,
                         kind: Kind::Warn,
                         category: Category::Rtt,
                         summary: format!(
@@ -162,7 +158,7 @@ fn build_events(app: &App) -> Vec<Event> {
                         ),
                         detail: format!("{:.1}× normal", rtt / baseline),
                     });
-                    break; // one spike event per probe target per render
+                    break;
                 }
             }
         }

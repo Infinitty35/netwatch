@@ -27,15 +27,18 @@ The repo docs now intentionally stay focused on what is live in this codebase to
 
 NetWatch currently exposes these runtime tabs:
 
-1. Dashboard
-2. Connections
-3. Interfaces
-4. Packets
-5. Stats
-6. Topology
-7. Timeline
-8. Processes
-9. Insights (opt-in AI analysis; tab appears when enabled)
+| Key | Tab |
+| --- | --- |
+| `1` | Dashboard |
+| `2` | Connections |
+| `3` | Interfaces |
+| `4` | Packets |
+| `5` | Stats |
+| `6` | Topology |
+| `7` | Timeline |
+| `8` | Processes |
+| `9` | Diagnose (optional AI commentary below findings) |
+| `0` | Egress (destination baselines and policy drift) |
 
 ### Primary capabilities
 
@@ -49,13 +52,13 @@ NetWatch currently exposes these runtime tabs:
 - Stream reassembly with text and hex views
 - Traceroute and WHOIS/RDAP lookups
 - Flight recorder with incident export bundles
-- Landlock sandbox (Linux): capability drop + filesystem allow-list post-init
+- Linux worker entry policy with pinned filesystem grants; privileged capture acceptance remains pending (see [scope](REFERENCE.md#landlock-sandbox-linux))
 - Optional AI insights via local/cloud Ollama
 - Settings overlay with persistent user config
 
 ### Supported platforms
 
-The current public docs and release assets target macOS and Linux. There is platform-specific code in the tree for other environments, but the maintained user-facing support promise is macOS plus Linux.
+Netwatch has Linux, macOS and Windows backends and release targets. Features differ: Windows capture requires Npcap, kernel TCP metrics are absent on Windows, and only Linux has a sandbox backend. See the [capability matrix](CAPABILITIES.md) for implementation limits; backend presence is not cross-platform runtime validation.
 
 ---
 
@@ -96,6 +99,10 @@ The main loop is tick-driven.
 - Packet capture runs independently on its own capture thread when enabled
 
 ### Concurrency model
+
+See the [runtime lifecycle inventory](runtime-lifecycle.md) for worker creation,
+resource needs, restart/shutdown ownership and the remaining confinement gaps.
+Application preparation is separate from explicit worker startup.
 
 - Terminal input is read on a dedicated thread in `event.rs`
 - Blocking collectors use background threads so the UI can keep rendering
@@ -142,7 +149,8 @@ The main loop is tick-driven.
 - `src/ui/topology.rs`
 - `src/ui/timeline.rs`
 - `src/ui/processes.rs`
-- `src/ui/insights.rs`
+- `src/ui/diagnose.rs` (including AI commentary)
+- `src/ui/egress.rs`
 - `src/ui/help.rs`
 - `src/ui/settings.rs`
 - `src/ui/widgets.rs`
@@ -212,7 +220,7 @@ The schema lives in `src/config.rs`.
 NetWatch intentionally degrades instead of crashing when a capability needs more privilege.
 
 - Regular user mode still shows interface stats, connections, config, and most UI state
-- `sudo netwatch` unlocks packet capture and ICMP-backed health probes on systems that require elevated privileges
+- Capture and ICMP permissions depend on the platform and configuration; DNS health uses UDP queries and does not inherently require root. File capabilities do not establish that an eBPF program can load.
 - Exported packet data may contain raw payloads; that is expected for a diagnostics tool and should stay clearly documented
 
 ---

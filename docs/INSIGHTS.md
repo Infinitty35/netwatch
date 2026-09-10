@@ -1,228 +1,97 @@
 # AI Insights
 
-NetWatch's **Insights** tab (tab `8`) feeds a rolling snapshot of your network
-activity — protocol mix, top talkers, DNS queries, connection state counts,
-gateway/DNS health, and expert warnings/errors — to a local LLM every 15
-seconds and renders the model's analysis in the TUI.
+Insights is optional AI commentary inside **Diagnose (tab `9`)**, below the
+findings. Tab `8` is Processes. Insights is off by default; deterministic
+rule detection, cause ranking and remediation do not require a model.
 
-Insights is **opt-in** and **off by default**. When enabled, NetWatch talks to
-an [Ollama](https://ollama.com) server — either the local daemon on your own
-machine, a remote Ollama host on your network, or Ollama's hosted **cloud
-models** (see [Using cloud models](#using-cloud-models)). The local Ollama
-daemon is always the HTTP target; for cloud models it simply proxies your
-request through to Ollama's infrastructure, so netwatch itself never needs
-to handle API keys directly.
+The commentary comes from a network snapshot, not from a validated explanation
+of Diagnose's issue objects. It can be incorrect or disagree with a finding.
+Enabling it does not enable automatic model-directed remediation.
 
----
+## Setup
 
-## Quick start
+1. Configure an Ollama-compatible server with a model it can serve.
+2. Press `,` to open Settings and enable **AI Insights**. Set the model and
+   endpoint there, or edit Netwatch's config:
 
-1. Install Ollama: <https://ollama.com/download>
-2. Pull a model:
-   ```sh
-   ollama pull llama3.2
-   ```
-3. Make sure the Ollama daemon is running (`ollama serve`, or the macOS/Windows
-   tray app — `ollama run llama3.2` once will also start it).
-4. Launch NetWatch, press `,` to open the settings menu, and toggle
-   **AI Insights** on. Or edit the config file directly (see below).
-5. Press `8` to switch to the Insights tab. The first analysis appears within
-   ~15 seconds once packets are being captured.
-
----
-
-## Configuration
-
-NetWatch reads its config from `~/.config/netwatch/config.toml`. The three
-Insights-related fields are:
-
-```toml
-# Enable the Insights tab. Off by default.
-insights_enabled = true
-
-# Model name as Ollama knows it. Must be pulled via `ollama pull <model>`.
-insights_model = "llama3.2"
-
-# "local" is shorthand for http://localhost:11434.
-# Point this at a remote Ollama host by giving a full base URL.
-insights_endpoint = "local"
-```
-
-You can also edit these live from the settings menu (`,` from any tab — use
-`↑/↓` to move between rows, `Enter` to edit, `Esc` to commit). Changes take
-effect immediately — the insights worker is restarted with the new model and
-endpoint.
-
-### Choosing a model
-
-Any Ollama-compatible model works. Smaller models give faster responses and
-use less RAM; larger models give better analysis. Reasonable local picks:
-
-| Model          | Size   | Notes                                         |
-|----------------|--------|-----------------------------------------------|
-| `llama3.2`     | ~2 GB  | Default. Good balance of speed and quality.   |
-| `llama3.2:1b`  | ~1 GB  | Fastest; runs comfortably on modest hardware. |
-| `llama3.1:8b`  | ~5 GB  | Better reasoning; needs ~8 GB free RAM.       |
-| `mistral`      | ~4 GB  | Solid alternative to llama3.                  |
-| `qwen2.5:7b`   | ~5 GB  | Strong at structured analysis.                |
-
-Pull whichever you want and set `insights_model` to the exact tag Ollama uses
-(`ollama list` shows installed models).
-
-If you'd rather not run a model locally, use a **cloud model** instead —
-any tag ending in `:cloud` is served by Ollama's hosted infrastructure and
-needs no local GPU or RAM. See the next section.
-
-### Using cloud models
-
-Ollama's hosted cloud lets you run larger models than your machine could
-handle locally. The local Ollama daemon still answers on `localhost:11434`;
-it just forwards your chat request to Ollama's servers and streams the
-response back. From NetWatch's perspective, nothing changes — you point
-`insights_model` at a `:cloud` tag and leave `insights_endpoint = "local"`.
-
-Setup:
-
-1. Sign in to your Ollama account from the CLI:
-   ```sh
-   ollama signin
-   ```
-   This opens a browser to authenticate and stores the credentials in
-   `~/.ollama/`. NetWatch never sees them — the daemon handles auth.
-2. List available cloud models:
-   ```sh
-   ollama ls
-   ```
-   Cloud models appear with the `:cloud` suffix (e.g. `minimax-2.5:cloud`,
-   `gpt-oss:cloud`, `qwen3-coder:cloud`, `deepseek-v3.1:cloud`). Check
-   <https://ollama.com/cloud> for the current catalog and any account
-   requirements.
-3. Set the model in NetWatch's config:
    ```toml
    insights_enabled = true
-   insights_model = "minimax-2.5:cloud"
+   insights_model = "llama3.2" # Netwatch's default; must be available on your server
    insights_endpoint = "local"
    ```
-   Or edit it live from the settings menu (`,`).
 
-Cloud models generally return faster than running a large model locally on
-CPU-only hardware, and you avoid the 10–30 second warm-up while a local
-model loads into RAM. The tradeoff is that snapshot data leaves your machine
-— see [Privacy](#privacy) below.
+3. Open Diagnose with `9` in the full view. The commentary block shows whether
+   it is waiting, analysing, available, unable to reach the endpoint, or reporting
+   a model error. Capture must have supplied a nonempty packet snapshot.
 
-### Pointing at a remote Ollama host
+Configuration lives in the platform config directory under `netwatch/config.toml`
+(`~/.config/netwatch/config.toml` on a typical Linux installation). Settings changes
+recreate the Insights collector with the current model and endpoint.
 
-If Ollama is running on another machine (a home server, a GPU box, etc.),
-give `insights_endpoint` a full base URL:
+`local` (or an empty endpoint) resolves to `http://localhost:11434`. To use another
+server, set its base URL, for example `http://gpu-box.lan:11434`. Netwatch appends
+`/api/chat` and sends an Ollama chat request. It does not configure provider API
+keys or authentication headers. Choose a model supported by your server; Netwatch
+does not maintain a model catalogue or benchmark model quality.
 
-```toml
-insights_endpoint = "http://gpu-box.lan:11434"
-```
+## Timing and retained data
 
-NetWatch appends `/api/chat` to whatever base URL you provide. The request
-times out after 30 seconds. Remote Ollama servers must be reachable over HTTP
-with no auth — Ollama doesn't ship with auth out of the box, so put it behind
-a VPN or a reverse proxy on an internal network only.
+The collector uses a 15-second rate-limit interval and a 30-second request timeout.
+Response time and worker scheduling affect when commentary appears. The collector
+skips snapshots with zero retained packets; it does not require a new packet since
+the previous analysis. Pausing capture can therefore leave old traffic available
+for another analysis. Commentary is not proof that current traffic was measured.
 
----
+## Data sent to the endpoint
 
-## Privacy
+The prompt includes:
 
-The snapshot NetWatch sends to the model contains:
+- Retained packet count and protocol counts.
+- Top destination addresses with packet counts.
+- Recent DNS query names and observed address-to-hostname mappings.
+- Expert warnings/errors, including source/destination addresses and decoded
+  packet summary text.
+- Established and other connection counts.
+- Gateway/DNS RTT and loss, plus bandwidth rates.
 
-- aggregated protocol counts
-- top destination IPs with packet counts
-- recent DNS queries and their resolved hostnames
-- expert-layer error/warning summaries
-- gateway and DNS RTT/loss stats
-- current bandwidth rates
+Packet-derived summaries use at most the last 500 retained packets, with further
+limits on individual lists. Raw packet byte buffers are not attached, but decoded
+summary text, names and addresses can still be sensitive. There is no redaction
+profile for this prompt.
 
-It does **not** include raw packet payloads.
-
-**Where that data goes depends on which model you pick:**
-
-- **Local models** (e.g. `llama3.2`, `mistral`) — every byte stays on the
-  machine running Ollama. Nothing leaves your network.
-- **Remote self-hosted Ollama** (a VPS, home server, etc.) — data travels
-  over whatever network path you set up. Prefer a VPN or internal network.
-- **Cloud models** (`*:cloud` tags) — the local Ollama daemon forwards
-  each snapshot to Ollama's hosted infrastructure for inference. Review
-  Ollama's privacy policy at <https://ollama.com/privacy> before using
-  cloud models for traffic you consider sensitive.
-
-If privacy is the priority, stick to a local model.
-
----
+The configured endpoint receives the snapshot. A remote URL sends it off-host;
+plain HTTP provides no transport encryption. A localhost URL only identifies the
+first recipient: an Ollama-compatible server may forward inference to a cloud
+provider. Netwatch neither verifies local-only execution nor enforces a network
+boundary around the model server. Check that server's configuration and data
+handling before enabling commentary for sensitive traffic.
 
 ## Troubleshooting
 
-### Status shows `OllamaUnavailable`
+- **Waiting for the first analysis:** confirm capture has retained packets and
+  allow time for a request and model response. Merely enabling Insights does not
+  supply capture permissions.
+- **No model answering:** check the endpoint in Settings and confirm the server
+  is running and reachable. For the default endpoint, its model listing can be
+  inspected with `curl http://localhost:11434/api/tags`.
+- **Model error:** read the message in the commentary block. Confirm that the
+  configured model exists on the selected server; check server-side forwarding
+  or authentication if applicable.
+- **Slow or old commentary:** check request timeouts and server capacity, and
+  remember that retained packets can outlive active capture. Previous commentary
+  can remain visible alongside a new request or error status.
 
-NetWatch got a connection-refused error when calling the endpoint. Fixes:
-
-- Confirm Ollama is running: `curl http://localhost:11434/api/tags` should
-  return JSON.
-- On macOS, start it via the menu-bar app or `ollama serve`.
-- On Linux, `systemctl --user start ollama` (if installed as a user service)
-  or just `ollama serve` in a terminal.
-- If using a remote endpoint, check firewall rules and that Ollama is bound
-  to `0.0.0.0:11434` rather than loopback (`OLLAMA_HOST=0.0.0.0 ollama serve`).
-
-### Status shows `Error: model 'X' not found`
-
-Ollama hasn't pulled that model yet. Run `ollama pull <model>` and make sure
-`insights_model` in the config matches the tag exactly (`ollama list` to see
-installed tags — note that `llama3.2` and `llama3.2:latest` are the same thing,
-but `llama3.1` and `llama3.2` are not).
-
-### Cloud model returns an auth error
-
-If you set a `:cloud` model but see an error mentioning auth, unauthorized,
-or a 401/403 response, the local Ollama daemon isn't signed in. Run
-`ollama signin` and try again. You can sanity-check the daemon directly with:
-
-```sh
-curl http://localhost:11434/api/chat \
-  -d '{"model":"minimax-2.5:cloud","messages":[{"role":"user","content":"ping"}],"stream":false}'
-```
-
-If that curl succeeds but NetWatch still errors, the model name in your
-config probably doesn't match the tag exactly.
-
-### Insights are slow or stale
-
-- The first response after enabling can take 10–30 seconds while the model
-  loads into memory.
-- Analysis is rate-limited to once every 15 seconds, and only runs when at
-  least one packet has been captured in that window.
-- If the model takes longer than 30 seconds to respond, NetWatch times out
-  the request and shows an error. Switch to a smaller model (e.g. `llama3.2:1b`)
-  or give Ollama more resources.
-
-### Nothing appears on the Insights tab at all
-
-- Check that `insights_enabled = true` in the config (or that the toggle in
-  the settings menu is on).
-- Make sure packet capture is actually running — the Packets tab should show
-  traffic. Insights only runs when there are packets to analyze.
-- Watch the tab header for the status badge (`Idle`, `Analyzing`, `Available`,
-  `Error`, `OllamaUnavailable`).
-
----
-
-## Non-Ollama cloud providers (not supported)
-
-NetWatch speaks the Ollama `/api/chat` protocol only. Direct integrations
-with OpenAI, Anthropic, Gemini, etc. are not supported — but because Ollama
-itself offers a wide range of hosted `:cloud` models (see
-[Using cloud models](#using-cloud-models)), you can usually get a
-comparable experience without needing a direct provider integration. If
-you specifically need a non-Ollama provider, please open an issue.
-
----
+Netwatch speaks the Ollama `/api/chat` protocol. A service using a different API
+requires a compatible intermediary; direct integrations with other provider APIs
+are not implemented.
 
 ## Disabling
 
-Either flip the toggle off in the settings menu, or set
-`insights_enabled = false` in the config file. When disabled, no snapshots
-are collected and no requests are made to Ollama.
+Turn AI Insights off in Settings or set `insights_enabled = false` before startup.
+The app then stops feeding snapshots to the collector. Disabling does not recall
+requests already sent; a worker may finish an in-flight request or queued work
+before exiting. It does not stop Netwatch's other network activity, such as health
+probes or lookups.
+
+Implementation references: [snapshot and worker](../src/collectors/insights.rs),
+[commentary UI](../src/ui/diagnose.rs), [configuration](../src/config.rs).

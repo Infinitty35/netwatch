@@ -1,6 +1,5 @@
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 #[derive(Debug, Clone)]
 pub struct TracerouteHop {
@@ -20,6 +19,8 @@ pub enum TracerouteStatus {
 
 #[derive(Debug, Clone)]
 pub struct TracerouteResult {
+    pub completed: Option<std::time::Instant>,
+    pub completed_at: String,
     pub target: String,
     pub status: TracerouteStatus,
     pub hops: Vec<TracerouteHop>,
@@ -39,6 +40,8 @@ impl TracerouteRunner {
     pub fn new() -> Self {
         Self {
             result: Arc::new(Mutex::new(TracerouteResult {
+                completed: None,
+                completed_at: String::new(),
                 target: String::new(),
                 status: TracerouteStatus::Idle,
                 hops: Vec::new(),
@@ -55,16 +58,19 @@ impl TracerouteRunner {
             }
             r.target = target.to_string();
             r.status = TracerouteStatus::Running;
+            r.completed = None;
             r.hops.clear();
         }
 
         let result = Arc::clone(&self.result);
         let target = target.to_string();
-        thread::spawn(move || match run_traceroute(&target) {
+        crate::sandbox::worker::spawn("traceroute", move || match run_traceroute(&target) {
             Ok(hops) => {
                 let mut r = result.lock().unwrap();
                 r.hops = hops;
                 r.status = TracerouteStatus::Done;
+                r.completed = Some(std::time::Instant::now());
+                r.completed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             }
             Err(e) => {
                 let mut r = result.lock().unwrap();
@@ -77,6 +83,7 @@ impl TracerouteRunner {
         let mut r = self.result.lock().unwrap();
         r.target.clear();
         r.status = TracerouteStatus::Idle;
+        r.completed = None;
         r.hops.clear();
     }
 }

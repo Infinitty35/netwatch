@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::{safe_read, safe_write};
@@ -238,6 +237,7 @@ pub struct InsightsCollector {
     /// Background analysis state, published with the same pattern.
     status: Arc<RwLock<Arc<InsightsStatus>>>,
     snapshot_tx: std::sync::mpsc::Sender<NetworkSnapshot>,
+    pending_rx: Option<std::sync::mpsc::Receiver<NetworkSnapshot>>,
     pub model: String,
     pub endpoint: String,
 }
@@ -287,12 +287,27 @@ impl InsightsCollector {
         let status: Arc<RwLock<Arc<InsightsStatus>>> =
             Arc::new(RwLock::new(Arc::new(InsightsStatus::Idle)));
 
-        let insights_clone = Arc::clone(&insights);
-        let status_clone = Arc::clone(&status);
-        let model_clone = model.to_string();
-        let endpoint_clone = endpoint.to_string();
+        Self {
+            insights,
+            status,
+            snapshot_tx: tx,
+            pending_rx: Some(rx),
+            model: model.to_string(),
+            endpoint: endpoint.to_string(),
+        }
+    }
 
-        thread::spawn(move || {
+    /// Start analysis explicitly. Calling twice never creates a second worker.
+    pub fn start(&mut self) -> bool {
+        let Some(rx) = self.pending_rx.take() else {
+            return false;
+        };
+        let insights_clone = Arc::clone(&self.insights);
+        let status_clone = Arc::clone(&self.status);
+        let model_clone = self.model.clone();
+        let endpoint_clone = self.endpoint.clone();
+
+        crate::sandbox::worker::spawn("insights", move || {
             analysis_loop(
                 rx,
                 insights_clone,
@@ -302,13 +317,7 @@ impl InsightsCollector {
             );
         });
 
-        Self {
-            insights,
-            status,
-            snapshot_tx: tx,
-            model: model.to_string(),
-            endpoint: endpoint.to_string(),
-        }
+        true
     }
 
     pub fn submit_snapshot(&self, snapshot: NetworkSnapshot) {
@@ -347,7 +356,7 @@ fn analysis_loop(
     let now = Instant::now();
     let mut last_analysis = now.checked_sub(ANALYSIS_INTERVAL).unwrap_or(now);
 
-    loop {
+    while !crate::sandbox::worker::stopping() {
         // Drain to get the latest snapshot, waiting up to 1s
         let snapshot = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(snap) => {
@@ -378,6 +387,9 @@ fn analysis_loop(
 
         *safe_write(&status, "insights::analysis::start") = Arc::new(InsightsStatus::Analyzing);
 
+        if crate::sandbox::worker::stopping() {
+            break;
+        }
         let prompt = snapshot.to_prompt();
         match call_ollama(model, endpoint, &prompt) {
             Ok(response) => {
@@ -502,6 +514,29 @@ fn call_ollama(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_analysis_retains_input_until_start_and_starts_only_once() {
+        let mut collector = super::InsightsCollector::new("test-model", "http://127.0.0.1:1");
+        let snapshot = super::NetworkSnapshot::build(&[], &[], &make_health(), "0", "0");
+        collector.submit_snapshot(snapshot);
+        assert_eq!(
+            collector
+                .pending_rx
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .unwrap()
+                .total_packets,
+            0
+        );
+        assert!(collector.start());
+        assert!(!collector.start());
+        assert!(matches!(
+            *collector.get_status(),
+            super::InsightsStatus::Idle
+        ));
+    }
+
     use super::*;
     use crate::collectors::connections::Connection;
     use crate::collectors::health::HealthStatus;
@@ -510,6 +545,7 @@ mod tests {
 
     fn make_health() -> HealthStatus {
         HealthStatus {
+            completed: Default::default(),
             gateway_rtt_ms: Some(5.0),
             gateway_loss_pct: 0.0,
             dns_rtt_ms: Some(10.0),

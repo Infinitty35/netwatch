@@ -37,11 +37,11 @@ fn main() {
     }
 
     // Parent role: attach BPF, spawn the child, look up its attribution.
-    let tracker = match ConnTracker::new() {
+    let tracker = match ConnTracker::start() {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
-                "FAIL: ConnTracker::new failed ({e}) — run under sudo (needs CAP_BPF/CAP_PERFMON)"
+                "FAIL: ConnTracker::start failed ({e}) — run under sudo (needs CAP_BPF/CAP_PERFMON)"
             );
             std::process::exit(2);
         }

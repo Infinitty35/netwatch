@@ -296,6 +296,7 @@ pub fn report() -> Report {
     timeline.sort_by(|a, b| a.at.cmp(&b.at));
 
     Report {
+        coverage: engine.coverage().clone(),
         generated_at: NOW.into(),
         window_start: WINDOW_START.into(),
         window_end: NOW.into(),
@@ -434,6 +435,23 @@ mod tests {
             .primary()
             .iter()
             .any(|i| i.rule == "dns.slow_resolver"));
+
+        let id = engine
+            .primary()
+            .iter()
+            .find(|i| i.rule == "dns.slow_resolver")
+            .unwrap()
+            .id
+            .clone();
+        engine.record_applied(
+            &id,
+            '1',
+            crate::diagnose::issue::Applied::Yes {
+                at: NOW.into(),
+                before: RESOLVER.into(),
+                after: ALT_RESOLVER.into(),
+            },
+        );
 
         // The operator switches resolver. dns.slow_resolver verifies on
         // p50 < 5ms held for 60s, so it must survive a while and then close.

@@ -1,0 +1,568 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Netwatch remediation implementation plan</title><style>body{margin:0;background:#fff;color:#202020;font:17px/1.6 Georgia,serif}main{max-width:1000px;margin:54px auto;padding:0 32px 70px}h1,h2,h3,th{font-family:system-ui,sans-serif;line-height:1.25}h1{font-size:36px;margin:0 0 32px}h2{font-size:25px;margin-top:48px;border-bottom:1px solid #bbb;padding-bottom:10px}h3{font-size:20px;margin-top:32px}p{max-width:86ch}a{color:#244c68;text-underline-offset:3px}table{border-collapse:collapse;width:100%;font:14px/1.5 system-ui,sans-serif;margin:24px 0;display:block;overflow-x:auto}th,td{padding:11px 12px;text-align:left;vertical-align:top;border-bottom:1px solid #ccc}th{background:#eee}tr:nth-child(even){background:#fafafa}code{font-size:.87em;overflow-wrap:anywhere}.footnote{font-size:14px;overflow-wrap:anywhere}.footnote li{margin:12px 0}@media print{main{margin:0;padding:0}body{font-size:11pt}h1{font-size:26pt}h2{font-size:18pt}h3{font-size:14pt}table{font-size:9pt;display:table}tr,h2,h3{break-inside:avoid}a{color:inherit}@page{size:A4;margin:18mm}}pre{background:#f5f5f5;padding:16px;overflow-x:auto;font-size:14px;line-height:1.45}pre code{font-size:1em}nav{font:14px/1.5 system-ui,sans-serif;margin-bottom:28px}</style></head><body><main><nav><a href="netwatch-roadmap.html">Research report</a> · <a href="netwatch-implementation-plan.md">Markdown plan</a></nav><h1 id="netwatch-remediation-implementation-plan">Netwatch remediation implementation plan</h1>
+<p>Implement the trust fixes first: confine the actual workers, report host changes accurately, recover interrupted remediations, and distinguish missing diagnostic evidence from healthy measurements. Then complete the diagnostic session and incident handoff workflow. Egress change review follows those foundations.</p>
+<p>This plan expands items <strong>NW-R01–NW-R12</strong> in the <a href="netwatch-roadmap.md">gap assessment and roadmap</a>. It is based on Netwatch <strong>0.30.4</strong>, commit <code>9b4597e</code>, rechecked on 10 September 2026. Proposed types, modules, commands, and release groupings below are implementation decisions to build, not existing functionality. No application changes are made by this document.</p>
+<h2 id="1-delivery-strategy">1. Delivery strategy</h2>
+<p>Deliver small changes with visible acceptance evidence. Preserve the existing deterministic engine, collectors, views, and export capabilities. Extract lifecycle and report assembly where necessary; avoid a broad rewrite of <code>App</code> or packet decoding.</p>
+<p>The owner column identifies an accountable role, not additional staffing. One maintainer can fill several roles. Platform and security review require access to suitable reviewers or test machines before making the corresponding release claims.</p>
+<table>
+<thead>
+<tr>
+<th>Release group</th>
+<th>Scope</th>
+<th>Accountable role</th>
+<th>Completion condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A — Immediate corrections</td>
+<td>R02 initial outcomes, R04 availability, corrected documentation</td>
+<td>Maintainer</td>
+<td>No false “unchanged” or unqualified “healthy” result in the covered failure cases</td>
+</tr>
+<tr>
+<td>B — Runtime and recovery</td>
+<td>R01 confinement, R03 journal/recovery, R05 capability output</td>
+<td>Runtime maintainer; security reviewer</td>
+<td>Actual worker confinement and interrupted-operation recovery verified</td>
+</tr>
+<tr>
+<td>C — Complete diagnosis</td>
+<td>R06 attribution, R07 evidence model, R08 bounded sessions, initial R11 assurance</td>
+<td>Runtime/diagnostics maintainer</td>
+<td>Real collectors feed reproducible, finite diagnostic sessions</td>
+</tr>
+<tr>
+<td>D — Incident handoff</td>
+<td>R09 sharing/reopening, R10 guided workflow and timeline</td>
+<td>Diagnostics/UI maintainer</td>
+<td>A second engineer can reopen and understand evidence offline</td>
+</tr>
+<tr>
+<td>E — Egress pilot</td>
+<td>R12 workload identity and policy diffs</td>
+<td>Maintainer; pilot users</td>
+<td>Useful, explainable diffs in five real projects</td>
+</tr>
+</tbody>
+</table>
+<p>Release groups are acceptance milestones, not assigned version numbers. A correction may ship while larger work remains incomplete, provided its release notes accurately describe the remaining limitations. Do not delay truthful documentation until the underlying architecture is finished.</p>
+<h3 id="dependency-order">Dependency order</h3>
+<p>R02 → R03; R01 → R03/R05/R06; R04 → R05/R07; R03/R06 → R07; R07 → R08/R09; R08/R09 → R10; R06/R08 → R12. R11 supplies assurance throughout.</p>
+<p>R02 and R04 can be prepared independently. R01 and R03 share startup and privilege boundaries and require one agreed design before either changes the common startup path. R11 grows with the implementation; it is not a final testing phase.</p>
+<h2 id="2-common-contracts">2. Common contracts</h2>
+<h3 id="lifecycle">Lifecycle</h3>
+<p>Separate configuration and resource preparation from starting workers. The target lifecycle is:</p>
+<p><code>parse command → resolve explicit capabilities → recover eligible prior operations → prepare resources → enforce worker policies → receive readiness → collect → snapshot/export → stop and join → final recovery/state flush</code></p>
+<p>“Recover eligible prior operations” applies to live TUI, daemon, and live diagnostic sessions. Help, version, static doctor, and offline incident viewing must never change host configuration. Recovery inspection and recovery mutation are separate operations. Insufficient privileges produce a durable recovery-required status; they do not silently discard an operation.</p>
+<h3 id="measurement-provenance">Measurement provenance</h3>
+<p>Introduce a small shared representation before broad report work:</p>
+<pre><code class="language-rust">// Proposed model; exact generics may change during implementation.
+struct Sample&lt;T&gt; {
+    value: Option&lt;T&gt;,
+    source: CollectorId,
+    sequence: u64,
+    observed_at: Timestamp,
+    age_ms: u64,
+    status: MeasurementStatus,
+}
+
+enum MeasurementStatus {
+    Available,
+    NotCollected,
+    PermissionDenied,
+    Unsupported,
+    Failed,
+    Stale,
+}
+</code></pre>
+<p>Preserve reasons as stable codes plus explanatory text. A value may remain available for historical display after it becomes stale, but must not qualify as a fresh verification sample. Scope measurements to interface/network/process identity where applicable. Use monotonic elapsed time for durations and UTC timestamps for interchange.</p>
+<p>A failed probe is an observed result when the probe actually ran. A collector that failed to start is missing evidence. These cases must remain distinct throughout the engine, UI, and JSON.</p>
+<h3 id="stable-boundaries">Stable boundaries</h3>
+<p>Keep incident schema version, rule-set version, application version, remediation journal version, and existing remote-envelope version separate. An incident schema change must not silently alter remote ingest or egress policy semantics. Add compatibility readers before switching writers, and preserve old evidence during migration.</p>
+<h2 id="3-nw-r01-confine-actual-workers-and-narrow-filesystem-access">3. NW-R01 — Confine actual workers and narrow filesystem access</h2>
+<p><strong>Priority:</strong> P0. <strong>Owner:</strong> runtime maintainer with security review. <strong>Entry points:</strong> <a href="../../src/main.rs">main.rs</a>, <a href="../../src/app.rs">app.rs</a>, <a href="../../src/sandbox/mod.rs">sandbox</a>, <a href="../../src/sandbox/linux.rs">Linux backend</a>, <a href="../../src/sandbox/paths.rs">paths</a>, <a href="../../src/collectors/packets/mod.rs">packet capture</a>, <a href="../../src/ebpf/conn_tracker.rs">eBPF tracker</a>, and <a href="../../src/dpi/tls_decrypt.rs">TLS keylog support</a>.</p>
+<p>The current application constructs and starts workers before applying Landlock. The <code>#[tokio::main]</code> runtime also exists before the function body executes. Remote publishing and logging have their own startup paths. Restricting the application thread alone is insufficient. The current allow-list additionally grants recursive access to the working directory; launching from a home directory can therefore include sensitive descendants.</p>
+<h3 id="implementation">Implementation</h3>
+<ol>
+<li>Inventory every owned and dependency-owned worker: capture/decoder, TLS keylog, eBPF SDK source and drain, PKTAP, connection polling, health probes, GeoIP/WHOIS, insights, remote sender, metrics listener, logging, terminal events, and Tokio workers. Record creator, privileges, opened handles, input trust, filesystem needs, restart path, and shutdown owner. Commit this as <code>docs/runtime-lifecycle.md</code>.</li>
+<li>Split construction from start. Proposed <code>RuntimeBuilder::prepare()</code> returns resources and a plan; constructors must not secretly begin capture or outbound requests. Audit dependency constructors such as <code>EventSource::new()</code> separately. If they spawn internally, require an SDK lifecycle hook or contain the dependency behind a process boundary; do not assume the drain thread represents the whole source.</li>
+<li>Add worker readiness messages containing component ID, resource readiness, and actual confinement result. A worker may prepare handles, but must not consume untrusted input until its policy is enforced. Start the UI's “capture active” state only after readiness. Include bounded startup waits, cancellation, joins, and cleanup on partial failure.</li>
+<li>Apply restrictions in the worker before processing, or create it from an already-restricted parent that has the needed resource handles. Introduce a synchronous bootstrap before constructing async runtime workers where required. Do not rely on newer kernel thread synchronisation as the sole mechanism for all supported systems.</li>
+<li>Preserve restart behaviour through the same prepare/enforce/ready path. Best-effort mode may retain explicitly documented capture authority; strict mode must report when reopening cannot be supported after dropping it. A failed restart must never trigger an automatic unsandboxed retry.</li>
+<li>Replace whole-CWD and whole-<code>/tmp</code> defaults with dedicated Netwatch output/state/scratch directories where feasible. Create required directories with deliberate ownership and permissions before restriction. Grant individual GeoIP files and narrowly scoped keylog access; account for rotation without silently granting a home-directory tree. Refuse overly broad export roots in strict mode and explain the narrower alternative.</li>
+<li>Extend <code>sandbox::Report</code> with component-level requested/effective protections, retained capabilities, and failure reasons. Verify capability-drop results instead of recording a successful drop based only on prior presence. The aggregate report must not imply protection of an unverified component.</li>
+<li>Define strict enforcement as an explicit set of required protections for enabled components. Unsupported required protections prevent startup. Best-effort remains usable with a visible limitation. Keep network restriction claims separate from filesystem restrictions; current outbound features need a reviewed networking policy.</li>
+</ol>
+<h3 id="architecture-decision">Architecture decision</h3>
+<p>The first milestone uses explicit worker lifecycle and confinement, with temporary instruction-only host remediation. A privileged helper is a separate design decision before restoring broad automatic resolver management. If dependency-owned threads cannot be covered, or safe capture restart requires excessive parser authority, use a helper that opens approved capture resources and emits bounded messages to an unprivileged parser. Specify helper authentication, inherited-handle/IPC lifecycle, maximum message lengths, and teardown before implementing it. Keep arbitrary commands and paths out of that protocol.</p>
+<h3 id="tests-and-acceptance">Tests and acceptance</h3>
+<p>Run confinement tests in disposable child processes because restrictions cannot be undone in the test runner. Use a temporary fake home with a sentinel secret file. Launch from that home, from a normal project directory, and from a dedicated export directory. Have the actual capture/keylog worker attempt denied access before and after capture restart; check permitted exports and keylog reads still work. Test unavailable Landlock, missing capabilities, strict failure, failed worker startup, fresh state directories, and graceful shutdown.</p>
+<p><strong>Done when:</strong> every enabled input-processing worker has a verified protection result; denied-access tests pass at the actual worker boundary; strict startup cannot succeed with an uncovered required worker; best-effort limitations are visible; no broad “cannot read your SSH keys” claim exceeds the configured allow-list. Correct the stale module-level network/capability documentation at the same time.</p>
+<h2 id="4-nw-r02-report-mutation-outcomes-truthfully">4. NW-R02 — Report mutation outcomes truthfully</h2>
+<p><strong>Priority:</strong> P0, first correction. <strong>Owner:</strong> diagnostics maintainer. <strong>Files:</strong> <a href="../../src/diagnose/remediation.rs">remediation.rs</a>, <a href="../../src/diagnose/issue.rs">issue.rs</a>, <code>app.rs::apply_pending_remediation</code>, Diagnose rendering, and report rendering.</p>
+<p>The current final journal flush can fail after the target was edited, while the caller prints “host unchanged.” Read errors also become empty contents in several paths. Fix this before changing the persistence format.</p>
+<h3 id="implementation_1">Implementation</h3>
+<ol>
+<li>Introduce an internal <code>MutationOutcome</code>: <code>NotChanged</code>, <code>Applied</code>, <code>Reverted</code>, or <code>RecoveryRequired</code>. Include operation ID, last completed stage, verified current-state summary, and recovery location. Carry failures with this outcome rather than using an undifferentiated I/O error.</li>
+<li>Reserve <code>NotChanged</code> for failures before target mutation or a verified unchanged target. A failed write can be partial; a failed post-write journal update must be <code>RecoveryRequired</code> unless rollback has been completed and verified.</li>
+<li>Replace <code>read(...).unwrap_or_default()</code> in mutation/recovery paths with explicit missing/unreadable outcomes. Do not turn an unreadable resolver into a new empty file. Preserve the distinction between target absence and empty contents.</li>
+<li>Make UI, status, timeline, and report consume the same outcome. Example: “Resolver changed; recording completion failed. Recovery required; backup: …”. Do not close an issue solely because an apply call returned success.</li>
+<li>Parse journal load into <code>Missing</code>, <code>Loaded</code>, <code>UnsupportedVersion</code>, <code>Corrupt</code>, or <code>Unreadable</code>. Preserve invalid bytes and block further mutations until recovery is resolved; allow read-only monitoring with the limitation shown.</li>
+<li>Temporarily make automatic resolver editing unavailable unless a reviewed adapter and recovery store can guarantee the required stages. Show manual instructions and the reason. Merely running as root does not establish filesystem permission under Landlock or resolver-manager ownership.</li>
+</ol>
+<h3 id="tests-and-acceptance_1">Tests and acceptance</h3>
+<p>Use the existing fake <code>Host</code> as a starting point. Add an operation-index fault injector for read, backup write, target write, and journal flush, including a target write that writes a prefix then fails. Assert target bytes, preserved backup, journal state, and the outcome exposed to every surface. Add a regression for final-flush failure after successful target write and for unreadable original content.</p>
+<p><strong>Done when:</strong> every mutation failure reports a truthful state; unknown or partial state never becomes “unchanged”; corrupt recovery data never silently becomes an empty history; unsupported actions remain instructions.</p>
+<h2 id="5-nw-r03-durable-recovery-and-supported-resolver-adapters">5. NW-R03 — Durable recovery and supported resolver adapters</h2>
+<p><strong>Priority:</strong> P0. <strong>Owner:</strong> runtime/diagnostics maintainer. <strong>Depends on:</strong> R02 and the R01 privilege design. <strong>Files:</strong> current remediation module and startup/shutdown call sites. Proposed new modules: <code>src/diagnose/remediation/{store,transaction,resolver}.rs</code> and <code>src/runtime/bootstrap.rs</code> as the module grows.</p>
+<h3 id="recovery-store-and-ownership">Recovery store and ownership</h3>
+<p>Use a versioned journal with unique operation IDs and a unique immutable backup per operation. Persist original and installed digests, target identity, adapter kind, timestamps, and owner identity. Owner identity should include a session UUID and a platform-verifiable process-start token; Linux can additionally use boot identity. PID alone cannot establish ownership. If ownership cannot be verified, retain recovery-required status and avoid speculative rollback.</p>
+<p>Use OS-backed locking covering the load/validate/update transaction. Locks must have the same scope as the resource: two users editing a host-wide resolver need host-wide serialisation through the authorised adapter/helper, not independent per-user cache locks. Keep a resource lease while a temporary change is active. Liveness checks supplement the lease; a lock-file's existence alone is not a live owner.</p>
+<p>Keep authoritative recovery data in durable application state rather than disposable cache. A privileged component must not trust user-editable journal paths or follow attacker-controlled symlinks. Validate ownership and target identity. Define the treatment of old cache journals before moving anything: read and preserve legacy entries, classify unverifiable state, and migrate only what can be validated. No silent overwrite or automatic execution of a legacy path.</p>
+<h3 id="transaction-protocol">Transaction protocol</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Required durable evidence</th>
+<th>Failure behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Validate</td>
+<td>Supported adapter, authority, target identity and readable original</td>
+<td>NotChanged; explain unsupported/permission state</td>
+</tr>
+<tr>
+<td>Prepare</td>
+<td>Exclusive lease; immutable original backup synced; Prepared record persisted</td>
+<td>No target mutation; preserve any evidence created</td>
+</tr>
+<tr>
+<td>Apply</td>
+<td>Adapter executes bounded change and reads back effective state</td>
+<td>Record possible partial state; attempt only an adapter-supported safe rollback</td>
+</tr>
+<tr>
+<td>Verify recording</td>
+<td>Applied record persisted with installed identity/digest</td>
+<td>On failure, report RecoveryRequired even if the new resolver works</td>
+</tr>
+<tr>
+<td>Commit permanence</td>
+<td>Explicit keep action durably recorded</td>
+<td>Until durable success, change remains temporary; explain ambiguous failure</td>
+</tr>
+<tr>
+<td>Revert</td>
+<td>Restore only when current state still matches this operation's installed state</td>
+<td>External changes or unreadable state stop automatic rollback</td>
+</tr>
+<tr>
+<td>Complete</td>
+<td>Reverted/committed terminal record durably stored</td>
+<td>Preserve evidence until the completion state is durable</td>
+</tr>
+</tbody>
+</table>
+<p>Implement durable journal replacement using same-directory temporary files, complete writes, file synchronisation, atomic replacement where supported, and parent-directory synchronisation where required. Preserve ownership and intended permissions. Encapsulate platform differences in the store; do not assume a single Unix rename sequence is portable to Windows. A successful simulated write-order test alone does not prove power-loss durability.</p>
+<h3 id="resolver-boundary">Resolver boundary</h3>
+<p>Recognise unmanaged regular files, systemd-resolved, NetworkManager, and unsupported/unknown ownership. Initially enable automatic edits only for the adapter whose behaviour and authority have been verified; instructions are the fallback. Managed resolvers require a manager-specific adapter that snapshots and restores the relevant per-link settings. Do not replace <code>/etc/resolv.conf</code> symlinks or assume editing the file changes effective resolution.</p>
+<p>A host-changing adapter runs through explicit, authorised authority. Do not expand the packet parser's filesystem permissions to enable remediation. If a helper is required, it accepts typed resolver operations and validated addresses, never arbitrary shell commands. Keep macOS and Windows apply actions unavailable until their adapters and recovery semantics are implemented and tested.</p>
+<p>Move recovery inspection and eligible rollback into shared live bootstrap. A daemon following a crashed TUI must discover the same operations. Read-only command paths must not execute recovery. Shutdown cancels new actions, reverts temporary changes where safe, persists unresolved outcomes, and joins workers with bounded waits.</p>
+<h3 id="tests-and-acceptance_2">Tests and acceptance</h3>
+<p>Exercise every transaction boundary with deterministic faults; process-kill tests between stages; truncated/version-unknown journals; disk-full/permission failures; two competing instances; external edits; changed symlinks; PID reuse; absent backup; and restarts through TUI, daemon, and finite diagnosis. Use fake resolver files or disposable VMs/namespaces, never the developer machine's actual resolver. Test durable storage behaviour on supported filesystems and bound power-loss claims to the tested contract.</p>
+<p><strong>Done when:</strong> interrupted operations remain discoverable; supported automatic recovery restores only Netwatch-owned changes; original backups cannot be overwritten by another operation; no read-only command mutates the host; privilege and corruption failures preserve an actionable recovery record.</p>
+<h2 id="6-nw-r04-evidence-aware-diagnostic-availability">6. NW-R04 — Evidence-aware diagnostic availability</h2>
+<p><strong>Priority:</strong> P0. <strong>Owner:</strong> diagnostics maintainer. <strong>Files:</strong> <a href="../../src/diagnose/rules.rs">rules.rs</a>, <a href="../../src/diagnose/live.rs">live.rs</a>, <a href="../../src/diagnose/detectors.rs">detectors.rs</a>, <a href="../../src/diagnose/engine.rs">engine.rs</a>, <a href="../../src/diagnose/baseline.rs">baseline.rs</a>, <a href="../../src/diagnose/report.rs">report.rs</a>, Diagnose/Dense/Lite views.</p>
+<h3 id="implementation_2">Implementation</h3>
+<ol>
+<li>Separate catalogue implementation status from per-subject runtime evaluation. Add <code>RuleRequirements</code> with necessary/alternative measurements, maximum age, baseline requirements, supported scope, and optional active tests. A rule with a valid absolute-threshold alternative must not be disabled merely because its baseline is learning.</li>
+<li>Add <code>RuleAvailability</code>: available, learning, unsupported, missing permission, not measured, stale, or collector failed. Return reason codes and next checks. Compute it from actual observations, never just a feature flag or catalogue count.</li>
+<li>Immediately mark local bufferbloat as not measured when loaded/idle RTT is absent. Generate the UI count and README capability table from the same catalogue. Audit every one of the 25 entries; commit a matrix linking each to its live input and trigger/recovery fixture.</li>
+<li>Gate issue opening and recovery on fresh required evidence. Existing open issues whose inputs disappear become unverified/stale; they must not close because the detector returned no result. Distinguish a resolved finding from a monitoring gap.</li>
+<li>Replace <code>Report::summary_line()</code>'s empty-list implication of health with a shared verdict object. Suggested text: “No findings in 8 evaluated checks; 5 unavailable, 2 learning.” A genuinely scoped healthy result must name that scope and adequate evidence. Reports must also distinguish “no issues currently open” from “no issues occurred during the window”; resolved incidents still belong in the report.</li>
+<li>Audit sampling cadence: collector sequence IDs prevent repeated presentation of a cached sample from satisfying consecutive-sample tests or baseline learning. Learning requires enough distinct observations and actual elapsed coverage. Use a clock abstraction to verify independence from UI refresh rate, suspend/resume, and network changes. Treat this as a validation task until a specific defect is reproduced.</li>
+<li>Keep cause support explainable: list contributing and missing checks. Do not label a weighted fraction as a calibrated probability. Existing values require an explicit presentation change, not a silent scoring change.</li>
+</ol>
+<h3 id="tests-and-acceptance_3">Tests and acceptance</h3>
+<p>Cover all catalogue entries, missing prerequisites, alternative checks, stale samples, no-data startup, network switching, repeated sequence IDs, closed issues in a report window, collector failure during recovery, and true fault recovery. Run representative scenarios through the actual observation adapter as well as detector fixtures.</p>
+<p><strong>Done when:</strong> every advertised rule has a traced live path or an explicit limitation; missing data cannot produce false health or false recovery; TUI, preview, Markdown, and JSON agree on scope and coverage.</p>
+<h2 id="7-nw-r05-capability-output-platform-matrix-and-onboarding">7. NW-R05 — Capability output, platform matrix, and onboarding</h2>
+<p><strong>Priority:</strong> P1, with documentation corrections in A. <strong>Owner:</strong> runtime/UI maintainer. <strong>Depends on:</strong> R01/R04. <strong>Files:</strong> <code>main.rs</code>, <code>config.rs</code>, sandbox reports, attribution status, <code>ui/settings.rs</code>, <code>ui/help.rs</code>, README, REFERENCE, INSIGHTS. Proposed <code>src/runtime/capabilities.rs</code> and <code>src/cli.rs</code>.</p>
+<p>Create a serialisable <code>CapabilitySnapshot</code> describing interface selection, Npcap/libpcap availability, capture readiness, attribution backend and fallback, probe support, TCP metrics, sandbox components, enabled external services, and available remediation adapters. Preserve known limitations per platform rather than filling absent fields with zero.</p>
+<p>Add proposed commands <code>netwatch doctor</code> and <code>netwatch doctor --json</code>. Static doctor inspects configuration and dependencies without capture, remote publishing, active probes, or host recovery. A separate <code>--check-capture</code> performs a bounded open/close using the real startup path and reports its effective protection. Diagnostic checks should not implicitly enable configured cloud streaming. Route static/offline commands before Windows Npcap initialisation.</p>
+<p>Replace ad-hoc argument searching with one command model as subcommands are introduced. Preserve existing invocation and aliases; reject missing values and conflicting options. Generate help from that model. Show a short first-run capability summary with a way to inspect details, rather than a new mandatory setup wizard.</p>
+<p>Correct stale Insights tab instructions, optional AI data-flow description, sandbox/network comments, and “all rules active” wording. Explain where reports are written and why protection or attribution is reduced. Make help and version work without drivers or writable state directories.</p>
+<p><strong>Tests:</strong> CLI compatibility, missing Npcap, no capture authority, no interface, Linux without eBPF, unsupported sandbox, malformed options, no external I/O from static doctor, and accessible output at 80×24. <strong>Done when:</strong> a user can distinguish no traffic from no observation capability without reading source code.</p>
+<h2 id="8-nw-r06-attribution-identity-freshness-and-coverage">8. NW-R06 — Attribution identity, freshness, and coverage</h2>
+<p><strong>Priority:</strong> P1. <strong>Owner:</strong> collector maintainer. <strong>Depends on:</strong> R01. <strong>Files:</strong> <a href="../../src/collectors/connections.rs">connections</a>, <a href="../../src/ebpf/conn_tracker.rs">eBPF</a>, <a href="../../src/platform/pktap.rs">PKTAP</a>, process bandwidth, packet stream keys, Connections/Processes/Egress UI.</p>
+<p>Extend the existing attribution source rather than inventing a second independent attribution pipeline. Separate backend readiness from the provenance of an individual match. Add match observation time, process-start identity where available, and a stable unknown reason. Avoid silently reassigning a reused PID or reused five-tuple to an old executable.</p>
+<p>Define a session flow key using protocol, endpoints, observation generation/start, and network namespace where available. Add process identity as host/session, PID, process-start token, and executable identity. Executable hashing is optional and cached per file identity; do not hash every binary every tick. A hash alone does not identify scripts sharing an interpreter, so reserve workload/session metadata for R12.</p>
+<p>Display flow coverage and byte coverage separately. Denominators must explicitly identify eligible observed flows; zero observed flows is “not measured,” not 100%. A working eBPF backend does not prove complete capture or attribution. Report captures lost, event-source limitations, stale process snapshots, and fallback operation without merging these into a misleading single percentage.</p>
+<p>Build controlled workload generators that independently log their PID, process start, protocol, endpoints, and timing. Test pre-existing/short-lived/long-lived TCP and UDP, IPv4/IPv6, close/reopen, PID churn, sandbox restart, and missing BPF authority. Include macOS PKTAP and Windows polling scenarios with their own expected limits. Linux namespace/cgroup identity is a bounded addition; Kubernetes API integration is deferred.</p>
+<p><strong>Acceptance:</strong> at least 95% correct attribution of eligible observed flows in the agreed supported controlled scenarios, with wrong attribution counted separately from unknown. No stale identity misattribution in deterministic reuse cases. Publish results by platform, backend, lifetime, and protocol; the aggregate must not conceal a failing subgroup.</p>
+<h2 id="9-nw-r07-one-incident-and-evidence-model">9. NW-R07 — One incident and evidence model</h2>
+<p><strong>Priority:</strong> P1. <strong>Owner:</strong> diagnostics maintainer. <strong>Depends on:</strong> R02/R04; final capabilities/identity integrate from R03/R06. <strong>Files:</strong> <a href="../../src/collectors/incident.rs">incident recorder</a>, diagnostic reports and issue model, <code>app.rs::build_diagnose_report</code>. Proposed <code>src/incident/{mod,schema,assemble,store}.rs</code>.</p>
+<h3 id="package-contract">Package contract</h3>
+<pre><code class="language-text">incident-&lt;uuid&gt;/
+  manifest.json        schema/application/ruleset versions and completeness
+  report.json          canonical saved findings and evidence references
+  report.md            human-readable rendering of the saved report
+  events.jsonl         bounded, timestamped incident events
+  observations.jsonl   optional measurements required for reassessment
+  packets.pcap         optional explicitly selected raw evidence
+</code></pre>
+<p>The manifest records incident/session IDs, UTC window, monotonic ordering origin, capture interfaces and epochs, collector capabilities, available measurements, packet/event truncation, sharing profile, and artifact names/sizes/digests. Digests detect corruption; they are not proof of authenticity. Record enough baseline context to interpret evidence without copying unrelated historical networks.</p>
+<p>Assign IDs at event creation, not render time. Link issue evidence to observations and packet/flow references where retained. A packet missing due to retention produces an unavailable reference with a reason. Store original findings separately from future recomputation.</p>
+<p>Create one immutable incident snapshot for both report formats and recorder export. Freeze/snapshot must be internally consistent while collectors continue; avoid holding the capture lock for disk I/O. Retain bounded-memory behaviour and record evictions. Export to a unique temporary directory and publish the completed manifest/package only after required writes succeed. Preserve useful partial output with an explicit incomplete marker on failure; timestamps alone must not cause directory collisions.</p>
+<p>Define a compatibility reader for current v1 recorder bundles and standalone reports. Missing provenance in old files stays unknown. Keep current export controls and filenames where practical through compatibility adapters; do not change the remote publisher envelope.</p>
+<p><strong>Tests:</strong> concurrent snapshot consistency, burst capture, truncation, two exports in the same second, disk-full failure, missing optional artifacts, clock changes, deterministic semantic report rendering, and legacy package reading. <strong>Done when:</strong> both reports represent the same frozen evidence and every omission is visible.</p>
+<h2 id="10-nw-r08-bounded-headless-diagnosis">10. NW-R08 — Bounded headless diagnosis</h2>
+<p><strong>Priority:</strong> P1. <strong>Owner:</strong> runtime/diagnostics maintainer. <strong>Depends on:</strong> R04/R05/R07 and common recovery lifecycle. <strong>Files:</strong> <code>main.rs</code>, <code>app.rs::run_headless</code>, collectors, diagnostic engine. Proposed <code>src/runtime/{mod,session}.rs</code>.</p>
+<p>Extract <code>RuntimeSession</code> as owner of collectors, cancellation, snapshots, and diagnosis. <code>App</code> becomes a consumer for the affected paths. Existing <code>netwatch daemon</code> remains continuous; add a separate finite command:</p>
+<pre><code class="language-text">netwatch diagnose --duration 60s --json
+netwatch diagnose --duration 60s --output &lt;directory&gt;
+</code></pre>
+<p>These are proposed interfaces. Bound individual probe timeouts, worker startup, and shutdown separately from the observation duration. Avoid blocking the Tokio selector with synchronous collector or export work. Install signal handling early; cancellation must prevent new active work and preserve available evidence. JSON stdout contains one documented result envelope; progress goes to stderr. Disable configured AI/cloud publication for this command unless explicitly selected for that invocation.</p>
+<p>Define exit statuses before implementation: <code>0</code> completed with no qualifying finding and adequate requested coverage; <code>1</code> qualifying finding; <code>2</code> incomplete coverage or operational failure without a qualifying finding; <code>64</code> invalid invocation; <code>130</code> interruption. When findings and incomplete coverage coexist, return <code>1</code> and retain incompleteness in JSON. Schema fields are authoritative for callers needing finer distinctions. Define qualifying severity with an explicit threshold option. A short session on a new network can legitimately return incomplete while baselines learn.</p>
+<p>Active loaded-latency testing is a separate opt-in extension. Require an explicit controlled endpoint, duration, traffic/byte budget, cancellation, and clear disclosure of generated load. Collect idle/load/recovery windows through the same clock/provenance system. Do not silently saturate a production uplink, and do not enable the bufferbloat rule just because a flag was supplied. Unsupported endpoints or insufficient load leave the measurement inconclusive.</p>
+<p><strong>Tests:</strong> finite completion with dead targets; SIGINT during startup/probe/export; missing privileges; no-data and learning sessions; successful detection/recovery; JSON validity; stdout purity; and cleanup of workers/resources. <strong>Done when:</strong> an automated caller can tell finding, incomplete observation, and execution failure apart reliably.</p>
+<h2 id="11-nw-r09-sharing-profiles-and-offline-reopening">11. NW-R09 — Sharing profiles and offline reopening</h2>
+<p><strong>Priority:</strong> P1. <strong>Owner:</strong> incident maintainer. <strong>Depends on:</strong> R07 and CLI routing from R05. Proposed <code>src/incident/{privacy,reader}.rs</code> plus report/export UI.</p>
+<p>Introduce three explicit profiles:</p>
+<table>
+<thead>
+<tr>
+<th>Profile</th>
+<th>Content</th>
+<th>Default behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Share</td>
+<td>Structured summary, pseudonymised identities, coverage, timings</td>
+<td>Default for new sharing flow; omit raw packets, secrets, and arbitrary captured text</td>
+</tr>
+<tr>
+<td>Diagnostic</td>
+<td>Selected detailed observations and identifiers</td>
+<td>Preview the information categories included</td>
+</tr>
+<tr>
+<td>Raw</td>
+<td>Original packet evidence plus selected details</td>
+<td>Explicit opt-in; clearly identify sensitive raw data</td>
+</tr>
+</tbody>
+</table>
+<p>Use an allow-list of serialised fields for Share. Transform structured identifiers before generating text; do not run regexes over rendered Markdown and call it redacted. Stable pseudonyms are package-local and the reversal map is excluded. Strip credentials, URL query values, executable paths, DNS names, hostname/IP identity, and uncontrolled free text unless the profile explicitly includes them. Keylog secrets are never included automatically in any profile. Pseudonymisation does not guarantee anonymity; avoid that claim.</p>
+<p>Add proposed <code>netwatch incident open &lt;directory&gt;</code> with an offline viewer using saved findings. Its execution path must not construct live collectors, read current network state, initialise Npcap, run recovery, resolve hostnames, or start remote/AI clients. Display collection time and versions prominently. Escape terminal control sequences and HTML in imported text.</p>
+<p>Treat imported bundles as untrusted: enforce maximum sizes/counts/depth, reject path traversal and symlink escapes, validate required digests, handle unknown schema versions explicitly, and keep parsing failures out of the render loop. Begin with directory packages; archive extraction is separate scope. A future <code>reassess</code> command writes a derived report with a new engine version and never overwrites saved findings.</p>
+<p>Migrate current export UX deliberately: preserve explicit raw PCAP export, explain the new default share profile, and make the output path visible. Do not silently remove evidence from an operation named “raw capture export.”</p>
+<p><strong>Tests:</strong> seeded secrets in structured fields/free text/URLs, stable pseudonyms, absent reversal map, file permissions, malicious paths and control sequences, corrupted artifacts, unsupported versions, no-network execution on a machine without capture drivers, and old bundle compatibility. <strong>Done when:</strong> a second machine can inspect saved evidence safely and understand what was omitted.</p>
+<h2 id="12-nw-r10-guided-diagnosis-and-a-correlated-timeline">12. NW-R10 — Guided diagnosis and a correlated timeline</h2>
+<p><strong>Priority:</strong> P1. <strong>Owner:</strong> diagnostics/UI maintainer. <strong>Depends on:</strong> R07/R08/R09. <strong>Files:</strong> Diagnose, Dashboard, Connections, Packets, Timeline and Topology views; event and issue models.</p>
+<p>Add three task entry points: application slowness, network reachability, and changed destinations. Each selects a scope and a diagnostic plan using the existing engine. Show measured stages, unavailable stages, strongest supported explanation, next useful check, and evidence/export action. Preserve expert tabs and Dense/Lite views.</p>
+<p>Introduce a shared navigation context with incident, subject, selected time window, and optional flow ID. Drill-through from an issue to Connections and Packets retains that context; Escape returns to the originating selection. If evidence has expired, say so instead of showing unrelated current traffic.</p>
+<p>Extend the existing timeline with structured issue-open/update/close, collector-loss/recovery, interface/route/resolver change, egress drift, and remediation outcome events. Sort by recorded timestamps with sequence tie-breakers. Use one time cursor across relevant panels; historical inspection must not silently substitute live values. Bound event retention and mark gaps. Keep correlation labelled as evidence, not proof of causation.</p>
+<p>Audit suppression scoping as part of multi-interface support: a fault on one interface must not suppress an unrelated healthy interface's finding. Test VPN, multiple routes, and resolver changes. Keep status colours consistent and annotate stale data; do not require colour or a particular glyph to understand the result.</p>
+<p><strong>Tests:</strong> scripted fault/recovery sessions and UI interactions at 80×24, normal full size, and Dense size; keyboard-only drill-through; lost evidence; simultaneous interface incidents; closed findings retained historically. <strong>Usability gate:</strong> four of five pilot engineers can identify the supported explanation and export/open the relevant incident within five minutes without coaching. Record confusion and revise the workflow before adding more presentation features.</p>
+<h2 id="13-nw-r11-release-assurance-fuzzing-and-performance">13. NW-R11 — Release assurance, fuzzing, and performance</h2>
+<p><strong>Priority:</strong> P1 with P0 regression coverage delivered immediately. <strong>Owner:</strong> maintainer/release reviewer. <strong>Files:</strong> <a href="../../.github/workflows/ci.yml">.github/workflows/ci.yml</a>, <a href="../../.github/workflows/release.yml">release workflow</a>, <code>examples/</code>, proposed <code>tests/integration/</code>, <code>fuzz/</code>, and <code>benches/</code>.</p>
+<p>Keep the existing formatting, Clippy, build, and three-OS test checks. Add no-default-features compilation/tests because fallback behaviour is part of the product. Separate tests requiring raw capture, BPF, or host privileges from ordinary PR tests. Run privileged suites only on isolated trusted runners/VMs, with no production credentials and no untrusted PR execution on a privileged host.</p>
+<p>Start fuzz targets at wire input and imported evidence: packet dispatch, DNS/TLS/QUIC parsing, stream reassembly, compressed HTTP/3 content, display filters, and incident reader. Enforce allocation, decompression, recursion, stream-count, and time budgets. Keep crash reproducers in the regression corpus after minimisation. A successful fuzz duration is evidence of testing, not proof of parser safety.</p>
+<p>Build performance profiles for idle monitoring, ordinary desktop traffic, many short connections, sustained capture, TLS keylog/decode, and armed recorder. Record commit, compiler, OS/kernel, CPU, traffic generator, packet sizes/rates, enabled features, and duration. Measure CPU, RSS, retained buffers, capture drops, attribution coverage, collection lag, event queue drops, and p95 input-to-render latency. Use the existing pcap statistics as the primary capture-loss source and label their limits.</p>
+<p>Establish a baseline first. Investigate reproducible regressions above 10% on stable profiles; choose hard product budgets after measuring target hardware. Run a shorter repeatable PR smoke and scheduled longer soak. Avoid comparing noisy shared-runner timings as if they were controlled benchmarks.</p>
+<p>Add dependency vulnerability/license review and release-artifact checks appropriate to the actual build. Produce an inventory/SBOM and provenance where the release system supports it; verify signatures/checksums and installation smoke paths. These improve distribution assurance and do not replace runtime tests.</p>
+<p><strong>Done when:</strong> critical fixes have scenario evidence, fuzz targets enforce resource bounds, fallback builds work, published performance numbers are reproducible, and release artifacts are exercised through supported installation paths. Record known failing or skipped platform cases in release notes.</p>
+<h2 id="14-nw-r12-egress-change-review-pilot">14. NW-R12 — Egress change-review pilot</h2>
+<p><strong>Priority:</strong> P2. <strong>Owner:</strong> maintainer with five pilot projects. <strong>Depends on:</strong> R06 identity, R08 finite sessions, and R07 versioned output. <strong>Files:</strong> <a href="../../src/collectors/egress/policy.rs">egress policy</a>, egress profiler, Processes/Egress UI, CLI/session model.</p>
+<p>Begin with explicit before/after sessions over selected workloads. Prefer attaching to an identified process tree or cgroup over introducing arbitrary process execution in the first release. If a later command launches a workload, define lifecycle and environment handling separately.</p>
+<p>Store reviewed baseline metadata: workload identity, observation window, coverage, destinations, evidence method, policy version, and selected approved scope. Do not automatically promote learned traffic into trusted policy. Surface added/removed destinations, new ports, broadened matching, undeclared processes, and identity uncertainty. A broad ASN match remains visibly broader than hostname identity; ECH/no-readable-name states remain explicit.</p>
+<p>Preserve current policy matching semantics by versioning any new schema. Add exceptions with reason, owner label, expiry, and exact scope. Learning, reviewing, approving, and evaluating are separate steps. A dependency update is not malicious merely because it changes destinations.</p>
+<p>Emit deterministic JSON suitable for CI. Define result classes for no observed drift, observed drift, and incomplete observation; incomplete sessions cannot pass as clean. Optional CI failure on drift is an observation verdict, not traffic blocking. Keep a reviewable TOML/JSON diff and make reports useful outside Netwatch.</p>
+<p><strong>Tests:</strong> shared process names, interpreter workloads, changed binary identity, expected CDN changes, port restrictions plus SNI/ASN/IP matching, expired exceptions, unknown attribution, encrypted names, short sessions, and policy round trips. <strong>Pilot gate:</strong> five projects complete real before/after reviews; record false alarms, review time, explainability, and return usage. Expand only if users can identify actionable changes consistently.</p>
+<h2 id="15-pull-request-sequence">15. Pull-request sequence</h2>
+<p>Each PR should explain the triggering condition, resulting behaviour, relevant tests, and remaining limitations. Split migrations into reader support before writer changes. The sequence below is concrete enough to become issues; it does not require a single long-lived branch.</p>
+<table>
+<thead>
+<tr>
+<th>PR</th>
+<th>Scope</th>
+<th>Depends on</th>
+<th>Review evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>01</td>
+<td>Accurate mutation outcomes and non-silent journal load errors</td>
+<td>None</td>
+<td>Final-flush/partial-write regression cases</td>
+</tr>
+<tr>
+<td>02</td>
+<td>Rule prerequisites and evidence-aware verdict/report summary</td>
+<td>None</td>
+<td>Missing-input, stale-recovery, closed-window cases</td>
+</tr>
+<tr>
+<td>03</td>
+<td>Correct capability, sandbox and Insights documentation</td>
+<td>01/02 where applicable</td>
+<td>Checked against current UI/runtime</td>
+</tr>
+<tr>
+<td>04</td>
+<td>Worker inventory and resource/start split</td>
+<td>None</td>
+<td>Existing behaviour preserved; no hidden starts in refactored constructors</td>
+</tr>
+<tr>
+<td>05</td>
+<td>Worker enforcement/readiness and narrow path defaults</td>
+<td>04</td>
+<td>Actual-worker isolation plus restart/fresh-install tests</td>
+</tr>
+<tr>
+<td>06</td>
+<td>Common bootstrap and explicit recovery authority</td>
+<td>01/04/05</td>
+<td>TUI/daemon parity; offline/static commands remain read-only</td>
+</tr>
+<tr>
+<td>07</td>
+<td>Journal v2 reader, ownership/locking and durable store</td>
+<td>01/06</td>
+<td>Legacy migration, corruption, concurrency and fault injection</td>
+</tr>
+<tr>
+<td>08</td>
+<td>Supported resolver transaction adapter and rollback</td>
+<td>07; helper decision if needed</td>
+<td>Disposable-host recovery evidence; truthful disabled states elsewhere</td>
+</tr>
+<tr>
+<td>09</td>
+<td>Capability snapshot, CLI model and doctor</td>
+<td>02/05</td>
+<td>Platform/argument and no-network doctor tests</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Attribution identity/freshness and coverage</td>
+<td>05</td>
+<td>Independent traffic-generator comparisons</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Shared incident schema, snapshot/export and legacy reader</td>
+<td>02/07/10</td>
+<td>Consistency, truncation and round trips</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Finite diagnostic sessions</td>
+<td>06/09/11</td>
+<td>Deadlines, cancellation, stdout and exit status contracts</td>
+</tr>
+<tr>
+<td>13</td>
+<td>Sharing profiles and defensive offline reader</td>
+<td>09/11</td>
+<td>Seeded sensitive data, malformed package, offline tests</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Guided diagnosis, linked navigation and shared timeline</td>
+<td>12/13</td>
+<td>Multi-interface scenarios and usability sessions</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Optional loaded-latency measurement</td>
+<td>02/12</td>
+<td>Controlled endpoint, load budget, inconclusive outcomes</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Workload session diff and reviewed exceptions</td>
+<td>10/12</td>
+<td>Policy/identity regressions and pilot review evidence</td>
+</tr>
+</tbody>
+</table>
+<p>Fuzzing, performance profiles, dependency checks, and release validation are incremental PRs alongside 05–16. They should not be bundled into an oversized final assurance PR.</p>
+<h2 id="16-required-scenario-suite">16. Required scenario suite</h2>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Expected result</th>
+<th>Primary release gate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Capture starts before UI and attempts disallowed read</td>
+<td>Worker denied; no false aggregate protection</td>
+<td>B</td>
+</tr>
+<tr>
+<td>Launch in fake home / broad keylog parent</td>
+<td>Sensitive descendants excluded or strict configuration rejected</td>
+<td>B</td>
+</tr>
+<tr>
+<td>Capture restart under strict/best-effort</td>
+<td>Same declared protection; explicit failure if unsupported</td>
+<td>B</td>
+</tr>
+<tr>
+<td>Journal flush fails after resolver write</td>
+<td>RecoveryRequired with preserved original</td>
+<td>A/B</td>
+</tr>
+<tr>
+<td>Resolver write partially succeeds</td>
+<td>Never NotChanged without verified restoration</td>
+<td>A/B</td>
+</tr>
+<tr>
+<td>Corrupt/unknown-version legacy journal</td>
+<td>Original preserved; mutation blocked; monitoring available</td>
+<td>A/B</td>
+</tr>
+<tr>
+<td>Two instances / reused PID / external resolver edit</td>
+<td>No unsafe ownership claim or overwrite</td>
+<td>B</td>
+</tr>
+<tr>
+<td>Daemon starts after TUI crash</td>
+<td>Eligible operation discovered through common recovery</td>
+<td>B</td>
+</tr>
+<tr>
+<td>No capture/probe permission</td>
+<td>Coverage missing; no unqualified healthy verdict</td>
+<td>A/C</td>
+</tr>
+<tr>
+<td>Loaded-latency input absent</td>
+<td>Bufferbloat unavailable, not healthy</td>
+<td>A/C</td>
+</tr>
+<tr>
+<td>Cached samples repeat across UI ticks</td>
+<td>No invented learning or recovery progress</td>
+<td>C</td>
+</tr>
+<tr>
+<td>Genuine fault then fresh sustained recovery</td>
+<td>One scoped issue opens and closes with evidence</td>
+<td>C</td>
+</tr>
+<tr>
+<td>An issue closes before export</td>
+<td>Historical incident preserved; current state distinguished</td>
+<td>C</td>
+</tr>
+<tr>
+<td>Short-lived IPv4/IPv6 TCP/UDP flows</td>
+<td>Backend-specific attribution accuracy and gaps measured</td>
+<td>C</td>
+</tr>
+<tr>
+<td>Two interfaces with unrelated faults</td>
+<td>Suppression respects actual subject scope</td>
+<td>D</td>
+</tr>
+<tr>
+<td>Bundle export during capture / memory truncation</td>
+<td>Coherent snapshot; completeness explicit</td>
+<td>C/D</td>
+</tr>
+<tr>
+<td>Secrets seeded in report fields and free text</td>
+<td>Share profile excludes them</td>
+<td>D</td>
+</tr>
+<tr>
+<td>Malformed package / path escape / terminal controls</td>
+<td>Safe rejection or escaped rendering</td>
+<td>D</td>
+</tr>
+<tr>
+<td>Open incident without network or Npcap</td>
+<td>Saved findings render with no live initialisation</td>
+<td>D</td>
+</tr>
+<tr>
+<td>Bounded diagnosis with dead target / SIGINT</td>
+<td>Deadline/cancellation contract and cleanup hold</td>
+<td>C</td>
+</tr>
+<tr>
+<td>Egress diff with missing attribution</td>
+<td>Incomplete; never a clean CI verdict</td>
+<td>E</td>
+</tr>
+</tbody>
+</table>
+<p>Fixture tests verify logic; live collector tests verify measurement plumbing; subprocess/VM tests verify privilege and recovery behaviour. Keep these evidence types separate in the release checklist.</p>
+<h2 id="17-estimates-release-decisions-and-rollback">17. Estimates, release decisions, and rollback</h2>
+<p>The earlier roadmap's four-week trust phase was directional. The detailed scope includes dependency-owned workers, broad path allowances, durable recovery, and resolver authority; treating all of that as a four-week commitment would be optimistic.</p>
+<table>
+<thead>
+<tr>
+<th>Work group</th>
+<th>Initial effort range</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Immediate truthful outcomes, availability and documentation</td>
+<td>1–2 engineer-weeks</td>
+</tr>
+<tr>
+<td>Worker lifecycle/confinement and common bootstrap</td>
+<td>3–5 engineer-weeks</td>
+</tr>
+<tr>
+<td>Durable recovery and first supported resolver adapter</td>
+<td>3–5 engineer-weeks</td>
+</tr>
+<tr>
+<td>Capabilities and attribution validation</td>
+<td>2–4 engineer-weeks</td>
+</tr>
+<tr>
+<td>Incident model and bounded diagnosis</td>
+<td>3–5 engineer-weeks</td>
+</tr>
+<tr>
+<td>Sharing, reopening and guided workflow</td>
+<td>4–6 engineer-weeks</td>
+</tr>
+<tr>
+<td>Assurance work across these changes</td>
+<td>2–4 engineer-weeks</td>
+</tr>
+<tr>
+<td>Optional loaded-latency test and egress pilot implementation</td>
+<td>3–5 engineer-weeks</td>
+</tr>
+</tbody>
+</table>
+<p>These are rough effort ranges, not calendar promises or statistically calibrated estimates. Approximately <strong>18–31 engineer-weeks</strong> covers the core through incident handoff and assurance; optional work adds <strong>3–5</strong>. A new privileged helper or SDK changes can increase this. Re-estimate after PR05 using actual startup and platform findings. Platform availability, review, and pilot recruitment add elapsed time.</p>
+<p>A release candidate requires the applicable scenarios above, normal CI, targeted live platform checks, a migration/compatibility note, and documentation of unimplemented capabilities. Roll back UI additions or disable new active features if needed, but do not downgrade to a binary unable to read an active journal format. Preserve recovery compatibility across rollback releases. New rule thresholds should be versioned and tested against the incident corpus before becoming defaults.</p>
+<p>Track completion by accepted behaviour and evidence, not merged lines or feature count. The first success is a trustworthy tool under missing permissions and failed writes. The next is a repeatable diagnosis that another engineer can inspect. Fleet expansion, enforcement, and broad new protocol work remain outside this implementation plan.</p>
+<h2 id="18-plan-verification-and-reference-notes">18. Plan verification and reference notes</h2>
+<p>The checkout remained at <code>9b4597e</code> during planning. The earlier <strong>958 passing / 3 ignored</strong> library result belongs to the preceding review; it was not rerun for this documentation-only change. The plan's proposed acceptance tests have not yet been implemented or passed.</p>
+<p>The worker-order, mutation-write, missing-bufferbloat-input, and daemon-reconciliation observations were checked against the current source. Closer inspection additionally identified recursive working-directory permission, empty-report health wording, and pre-body async runtime creation as implementation considerations. Sampling-cadence correctness, platform-specific transaction durability, and dependency worker coverage remain tasks to establish through focused tests and dependency review.</p>
+<p>Refer to the <a href="netwatch-roadmap.md">research report</a> for the competitive rationale and external sources. The <a href="https://www.kernel.org/doc/html/latest/userspace-api/landlock.html">Linux Landlock documentation</a> explains thread inheritance/synchronisation; <a href="https://www.wireshark.org/docs/wsdg_html_chunked/ChWorksCapturePackets.html">Wireshark's capture architecture</a> provides a reference for separating privileged capture. Actual API choices must be checked against the pinned dependencies and supported operating systems when implementing each PR.</p></main></body></html>

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 const DNS_CACHE_MAX: usize = 4096; // max resolved hostname entries kept in memory
 
@@ -13,6 +12,7 @@ const DNS_CACHE_MAX: usize = 4096; // max resolved hostname entries kept in memo
 pub struct DnsCache {
     cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
     tx: std_mpsc::Sender<String>,
+    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
 }
 
 /// Per-IP resolution state in `DnsCache`.
@@ -40,9 +40,21 @@ impl DnsCache {
     pub(crate) fn new() -> Self {
         let (tx, rx) = std_mpsc::channel::<String>();
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let resolver_cache = Arc::clone(&cache);
-        thread::spawn(move || {
-            while let Ok(ip) = rx.recv() {
+        Self {
+            cache,
+            tx,
+            pending_rx: Arc::new(Mutex::new(Some(rx))),
+        }
+    }
+
+    /// Start PTR resolution explicitly, once across all clones.
+    pub fn start(&self) -> bool {
+        let Some(rx) = self.pending_rx.lock().unwrap().take() else {
+            return false;
+        };
+        let resolver_cache = Arc::clone(&self.cache);
+        crate::sandbox::worker::spawn("reverse-dns", move || {
+            while let Some(ip) = crate::sandbox::worker::receive(&rx) {
                 let hostname = resolve_ip(&ip);
                 let mut c = resolver_cache.lock().unwrap();
                 match hostname {
@@ -61,7 +73,7 @@ impl DnsCache {
                 }
             }
         });
-        Self { cache, tx }
+        true
     }
 
     pub fn lookup(&self, ip: &str) -> Option<String> {
@@ -130,5 +142,30 @@ fn dns_lookup_reverse(ip: &std::net::IpAddr) -> Option<String> {
         None
     } else {
         Some(hostname)
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
+        let cache = DnsCache::new();
+        cache.lookup("192.0.2.1");
+        assert_eq!(
+            cache
+                .pending_rx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .unwrap(),
+            "192.0.2.1"
+        );
+        let clone = cache.clone();
+        assert!(clone.start());
+        assert!(!cache.start());
     }
 }

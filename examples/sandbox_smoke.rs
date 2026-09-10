@@ -1,82 +1,50 @@
-//! Smoke test for `netwatch::sandbox`.
-//!
-//! Runs from a CI / dev shell on Linux: applies the sandbox in
-//! BestEffort mode, prints the report, then exercises a few accesses
-//! to confirm enforcement:
-//!
-//! - Read `/proc/self/status`  → allowed
-//! - Read `~/.cache/netwatch/x` → allowed (if cache_dir resolves)
-//! - Read `/etc/shadow`         → expected EACCES (Landlock or DAC)
-//! - Open new raw socket        → expected EPERM (caps dropped)
-//!
-//! Exits 0 on success, 1 on unexpected outcome. Linux-only — the
-//! sandbox backend is Linux-only, so the example compiles to a no-op
-//! stub on macOS / Windows so CI can build the workspace `--all-targets`.
-
+//! Linux smoke check using a disposable sentinel, never real credentials.
+//! Applies strict policy on the actual probe worker; parent cleans up the fixture.
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    println!("sandbox_smoke is Linux-only; no-op on this platform.");
+    println!("sandbox_smoke is Linux-only");
 }
 
 #[cfg(target_os = "linux")]
-use netwatch::config::NetwatchConfig;
-#[cfg(target_os = "linux")]
-use netwatch::sandbox::{self, Mode, SandboxPaths};
-#[cfg(target_os = "linux")]
-use std::fs;
-
-#[cfg(target_os = "linux")]
-fn main() {
-    let cfg = NetwatchConfig::default();
-    let paths = SandboxPaths::from_config(&cfg);
-    println!("paths = {:#?}", paths);
-
-    let report = sandbox::apply(Mode::BestEffort, &paths);
-    println!("report = {:#?}", report);
-    println!("summary = {}", report.summary());
-
-    // /proc — should still be readable.
-    match fs::read_to_string("/proc/self/status") {
-        Ok(s) => println!("OK   read /proc/self/status ({} bytes)", s.len()),
-        Err(e) => {
-            eprintln!("FAIL read /proc/self/status: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    // /etc/shadow — readable only as root pre-sandbox. After Landlock
-    // applies, the *kernel* enforces deny independent of DAC.
-    match fs::read_to_string("/etc/shadow") {
-        Ok(_) => {
-            eprintln!("FAIL read /etc/shadow succeeded — sandbox did not block");
-            std::process::exit(1);
-        }
-        Err(e) => println!("OK   read /etc/shadow denied ({})", e),
-    }
-
-    // Try to open a new raw socket. Without CAP_NET_RAW, socket(2) with
-    // SOCK_RAW returns EPERM. If the sandbox dropped the cap, this
-    // fails; if we never had it, this also fails. Either way the
-    // post-apply state should be "no raw socket".
-    let sock = unsafe {
-        nix::libc::socket(
-            nix::libc::AF_INET,
-            nix::libc::SOCK_RAW,
-            nix::libc::IPPROTO_ICMP,
-        )
+fn main() -> anyhow::Result<()> {
+    use netwatch::sandbox::{worker, Mode, SandboxPaths};
+    let root =
+        std::env::temp_dir().join(format!("netwatch-sandbox-smoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("sentinel"), b"test-only")?;
+    let paths = SandboxPaths {
+        cache_dir: Some(root.join("cache")),
+        cwd: Some(root.join("exports")),
+        ..Default::default()
     };
-    if sock >= 0 {
-        unsafe {
-            nix::libc::close(sock);
-        }
-        eprintln!("FAIL opened a raw socket after sandbox apply — CAP_NET_RAW retained");
-        std::process::exit(1);
-    } else {
-        println!(
-            "OK   socket(AF_INET, SOCK_RAW) denied ({})",
-            std::io::Error::last_os_error()
+    paths.prepare()?;
+    worker::install(Mode::Strict, paths).map_err(anyhow::Error::msg)?;
+    let sentinel = root.join("sentinel");
+    let exports = root.join("exports");
+    worker::spawn("smoke", move || {
+        assert_eq!(
+            std::fs::read(sentinel).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
         );
-    }
-
-    println!("\nsandbox smoke: all checks passed");
+        std::fs::write(exports.join("allowed"), b"test-only").unwrap();
+        let sock = unsafe {
+            nix::libc::socket(
+                nix::libc::AF_INET,
+                nix::libc::SOCK_RAW,
+                nix::libc::IPPROTO_ICMP,
+            )
+        };
+        if sock >= 0 {
+            unsafe {
+                nix::libc::close(sock);
+            }
+            panic!("raw socket remained available under strict policy");
+        }
+    })
+    .join()
+    .expect("probe worker panicked");
+    let result = worker::wait_ready(std::time::Duration::from_secs(1));
+    println!("{}", worker::summary());
+    std::fs::remove_dir_all(root)?;
+    result.map_err(anyhow::Error::msg)
 }

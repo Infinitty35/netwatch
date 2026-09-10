@@ -1258,9 +1258,46 @@ impl CaptureStats {
     }
 }
 
+/// Open/configure capture resources without reading or decoding traffic.
+/// Called inside the worker for startup and every capture restart.
+fn prepare_capture(
+    interface: &str,
+    bpf: Option<&str>,
+) -> Result<pcap::Capture<pcap::Active>, String> {
+    let iface = resolve_device_name(interface).map_err(|message| {
+        tracing::error!(target: "netwatch::capture", %interface, error = %message, "device resolution failed");
+        message
+    })?;
+    // Some interfaces do not support promiscuous mode; preserve the fallback.
+    let cap = pcap::Capture::from_device(iface.as_str())
+        .and_then(|c| c.promisc(true).snaplen(CAPTURE_SNAPLEN).timeout(CAPTURE_TIMEOUT_MS).open())
+        .or_else(|_| pcap::Capture::from_device(iface.as_str())
+            .and_then(|c| c.promisc(false).snaplen(CAPTURE_SNAPLEN).timeout(CAPTURE_TIMEOUT_MS).open()))
+        .map_err(|error| {
+            tracing::error!(target: "netwatch::capture", interface = %iface, %error, "pcap open failed");
+            if error.to_string().contains("Permission denied") {
+                "Permission denied — run with sudo".to_string()
+            } else { format!("Capture failed: {error}") }
+        })?;
+    // Blocking reads can hang forever on idle TPACKET_V3 links (#41).
+    // Set nonblocking mode before processing so cancellation stays responsive.
+    let mut cap = cap.setnonblock().map_err(|error| {
+        tracing::error!(target: "netwatch::capture", interface = %iface, %error, "pcap setnonblock failed");
+        format!("Capture failed: {error}")
+    })?;
+    if let Some(filter) = bpf {
+        cap.filter(filter, true).map_err(|error| {
+            tracing::error!(target: "netwatch::capture", %filter, %error, "BPF filter compile/install failed");
+            format!("BPF filter error: {error}")
+        })?;
+    }
+    Ok(cap)
+}
+
 pub struct PacketCollector {
     pub packets: Arc<RwLock<Vec<CapturedPacket>>>,
     pub capturing: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     /// Live capture health — drops and throughput, straight from `pcap_stats`.
     pub stats: Arc<CaptureStats>,
     pub error: Arc<Mutex<Option<String>>>,
@@ -1285,6 +1322,7 @@ impl PacketCollector {
         Self {
             packets: Arc::new(RwLock::new(Vec::new())),
             capturing: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(CaptureStats::default()),
             error: Arc::new(Mutex::new(None)),
             dns_cache: DnsCache::new(),
@@ -1318,13 +1356,17 @@ impl PacketCollector {
     }
 
     pub fn start_capture(&mut self, interface: &str, bpf_filter: Option<&str>) {
-        if self
-            .capturing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        self.dns_cache.start();
+        // &mut self serializes starts. Never set an old generation's flag:
+        // a detached worker may still hold it and must remain cancelled.
+        if self.capturing.load(Ordering::SeqCst) {
             return;
         }
+        // Every generation owns its cancellation flag, including detached old workers.
+        self.capturing = Arc::new(AtomicBool::new(true));
+        self.ready = Arc::new(AtomicBool::new(false));
+        let ready = Arc::clone(&self.ready);
+        crate::sandbox::worker::begin("capture");
         *crate::app::safe_lock(&self.error, "packets::clear_error") = None;
 
         let packets = Arc::clone(&self.packets);
@@ -1339,81 +1381,32 @@ impl PacketCollector {
         let bpf = bpf_filter.map(|s| s.to_string());
 
         self.handle = Some(thread::spawn(move || {
-            // Resolved on the capture thread: on Windows this shells out to
-            // PowerShell, which must not stall the key handler.
-            let iface = match resolve_device_name(&interface) {
-                Ok(name) => name,
-                Err(msg) => {
-                    tracing::error!(target: "netwatch::capture", interface = %interface, error = %msg, "device resolution failed");
-                    *crate::app::safe_lock(&error, "packets::capture_resolve_error") = Some(msg);
+            // Resource preparation stays off the UI thread (device resolution
+            // may invoke PowerShell). No packet is read during preparation.
+            let mut cap = match prepare_capture(&interface, bpf.as_deref()) {
+                Ok(cap) => cap,
+                Err(message) => {
+                    // A cancelled generation must not overwrite a newer start's error.
+                    if !capturing.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    crate::sandbox::worker::fail("capture", message.clone());
+                    *crate::app::safe_lock(&error, "packets::capture_prepare_error") =
+                        Some(message);
                     capturing.store(false, Ordering::SeqCst);
                     return;
                 }
             };
-
-            // Try with promiscuous mode first, fall back to non-promiscuous
-            // (some interfaces like loopback don't support promisc on macOS)
-            let cap = pcap::Capture::from_device(iface.as_str())
-                .and_then(|c| {
-                    c.promisc(true)
-                        .snaplen(CAPTURE_SNAPLEN)
-                        .timeout(CAPTURE_TIMEOUT_MS)
-                        .open()
-                })
-                .or_else(|_| {
-                    pcap::Capture::from_device(iface.as_str()).and_then(|c| {
-                        c.promisc(false)
-                            .snaplen(CAPTURE_SNAPLEN)
-                            .timeout(CAPTURE_TIMEOUT_MS)
-                            .open()
-                    })
-                });
-
-            let cap = match cap {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = if e.to_string().contains("Permission denied") {
-                        "Permission denied — run with sudo".to_string()
-                    } else {
-                        format!("Capture failed: {e}")
-                    };
-                    tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap open failed");
-                    *crate::app::safe_lock(&error, "packets::capture_init_error") = Some(msg);
-                    capturing.store(false, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            // Switch to non-blocking capture. With a blocking read, libpcap's
-            // timeout is unreliable on idle links — on Linux (TPACKET_V3) the
-            // block-retire timer never fires with zero traffic, so
-            // `next_packet()` can block for seconds or forever and the loop
-            // never re-checks `capturing`. That wedged `stop_capture()`'s join
-            // on quit and interface switches (issue #41). In non-blocking mode
-            // `next_packet()` returns TimeoutExpired immediately when no packet
-            // is ready; the loop sleeps briefly instead, staying responsive to
-            // the stop flag (~50x/sec) so the thread exits cleanly in ~30ms.
-            let mut cap = match cap.setnonblock() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(target: "netwatch::capture", interface = %iface, error = %e, "pcap setnonblock failed");
-                    *crate::app::safe_lock(&error, "packets::capture_failed") =
-                        Some(format!("Capture failed: {e}"));
-                    capturing.store(false, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            // Apply BPF capture filter if specified
-            if let Some(filter) = bpf.as_deref() {
-                if let Err(e) = cap.filter(filter, true) {
-                    tracing::error!(target: "netwatch::capture", filter = %filter, error = %e, "BPF filter compile/install failed");
-                    *crate::app::safe_lock(&error, "packets::bpf_error") =
-                        Some(format!("BPF filter error: {e}"));
-                    capturing.store(false, Ordering::SeqCst);
-                    return;
-                }
+            if !capturing.load(Ordering::SeqCst) {
+                return;
             }
+            if !crate::sandbox::worker::enter("capture") {
+                *crate::app::safe_lock(&error, "packets::confinement") =
+                    Some("Capture stopped: worker confinement failed; see Settings".into());
+                capturing.store(false, Ordering::SeqCst);
+                return;
+            }
+            ready.store(true, Ordering::SeqCst);
 
             let mut batch: Vec<CapturedPacket> = Vec::with_capacity(CAPTURE_BATCH_SIZE);
 
@@ -1543,6 +1536,9 @@ impl PacketCollector {
                 }
             }
 
+            ready.store(false, Ordering::SeqCst);
+            capturing.store(false, Ordering::SeqCst);
+
             // Flush remaining batch on shutdown
             if !batch.is_empty() {
                 let mut pkts = packets.write().unwrap();
@@ -1556,6 +1552,7 @@ impl PacketCollector {
     }
 
     pub fn stop_capture(&mut self) {
+        self.ready.store(false, Ordering::SeqCst);
         self.capturing.store(false, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             // Bounded join: the capture loop observes `capturing` at least
@@ -1579,8 +1576,13 @@ impl PacketCollector {
         crate::app::safe_lock(&self.stream_tracker, "packets::reset").clear();
     }
 
-    pub fn is_capturing(&self) -> bool {
+    /// Includes preparation, for toggle/cancellation ownership decisions.
+    pub fn capture_requested(&self) -> bool {
         self.capturing.load(Ordering::SeqCst)
+    }
+
+    pub fn is_capturing(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && self.capturing.load(Ordering::SeqCst)
     }
 
     pub fn get_error(&self) -> Option<String> {
@@ -3919,5 +3921,35 @@ mod tests {
         let stream = tracker.get_stream(idx).unwrap();
         assert_eq!(stream.retransmits_a_to_b, 0);
         assert_eq!(stream.out_of_order_a_to_b, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn failed_capture_preparation_can_be_stopped_and_retried() {
+        let mut collector = PacketCollector::new();
+        for _ in 0..2 {
+            let previous_generation = Arc::clone(&collector.capturing);
+            collector.start_capture("netwatch-pr04-nonexistent-interface", None);
+            assert!(
+                !previous_generation.load(Ordering::SeqCst),
+                "restart revived the cancelled generation"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while collector.capturing.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                !collector.is_capturing(),
+                "failed preparation must clear capture state"
+            );
+            assert!(collector.get_error().is_some());
+            assert!(collector.packets.read().unwrap().is_empty());
+            collector.stop_capture();
+        }
     }
 }

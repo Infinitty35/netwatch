@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">NetWatch</h1>
   <p align="center">
-    <strong>A network monitor for the terminal that names the process behind every connection, reads TLS you hold the keys to, and tells you what is wrong and how to fix it.</strong>
+    <strong>A network monitor for the terminal that helps identify the process behind connections, reads TLS you hold the keys to, and tells you what is wrong and how to fix it.</strong>
   </p>
   <p align="center">
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
@@ -24,7 +24,7 @@
   <em><code>netwatch --view dense</code>. Four boxes, no chrome, every keybind on a border. Download grows up from the axis, upload grows down.</em>
 </p>
 
-One binary, no config. `sudo netwatch` and you have live capture with L7 decode, the program behind each socket, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
+One binary, no config. `sudo netwatch` and you have live capture with L7 decode, process attribution where available, and a diagnostic engine that opens an issue when a learned baseline breaks and closes it when the fix holds.
 
 ## Install
 
@@ -42,7 +42,7 @@ Prebuilt binaries, including static Linux builds with libpcap bundled, are on th
 
 ```bash
 netwatch              # interfaces, connections, config. No privileges.
-sudo netwatch         # adds packet capture and health probes
+sudo netwatch         # enables capture where elevated access is required
 netwatch --lite       # one 80x24 screen
 netwatch --view dense # four boxes, 130x44 or larger
 ```
@@ -51,7 +51,7 @@ netwatch --view dense # four boxes, 130x44 or larger
 
 ## What it does
 
-**Diagnose (tab `9`).** Per-metric baselines learned over 30 minutes and scoped to the network that taught them. 25 rules, all active as of 0.30.3, with a suppression graph so a dead gateway is one finding with its consequences underneath. Each cause is ranked by the checks that separated it from the others. Fixes are key-bound, journal before they write, and revert on the next start if the process died mid-write. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
+**Diagnose (tab `9`).** Per-metric baselines scoped to the network that taught them; readiness requires 1,800 distinct samples, so learning time depends on probe cadence. 25 catalogued rules, with 18 implemented Diagnose detectors and seven awaiting integration. Runtime coverage states which inputs are available, learning, stale, or unmeasured. A suppression graph groups a dead gateway and its consequences under one finding. Each cause is ranked by the checks that separated it from the others. Live automatic resolver changes are temporarily unavailable while durable recovery and resolver-manager support are completed; Diagnose provides manual steps. The demo still simulates apply and verified recovery. Existing journals are inspected on startup, and unreadable or corrupt recovery records block further host changes. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
 
 <p align="center">
   <img src="docs/media/demo-diagnose.gif" alt="A slow resolver at 33 times its baseline, three ranked causes, a key-bound fix, and the issue closing itself once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
@@ -67,11 +67,11 @@ SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exp
 
 **Egress drift.** The Egress tab (`0`) learns which hosts, autonomous systems and ports each process reaches. `Enter` promotes that baseline to a rule; the next new destination arrives as `drift` with an alert. It observes and never blocks. Verdicts are `sni`, `ip`, `asn`, `ech`, `drift`, `no rule` and `undeclared` under `strict = true`, because "matched by AS" admits everything a hyperscaler runs and the table should say so. [Rule language and export schema](docs/egress-linter-plan.md).
 
-**Process attribution.** `ss`/`lsof` on every platform, PKTAP on macOS, and an optional eBPF kprobe on Linux (`ebpf` feature) that catches flows too short for polling. [Permissions](docs/REFERENCE.md#permissions).
+**Process attribution.** Platform socket polling, PKTAP on macOS, and an optional eBPF kprobe on Linux (`ebpf` feature). Attribution can be missing or stale, especially for short-lived flows; Windows uses its own network/process tools. [Permissions](docs/REFERENCE.md#permissions).
 
 **Threat detection.** C2 beaconing, port scans and DNS tunnelling run in the background. A critical alert freezes the flight recorder so the bundle exists before you look. JA4 fingerprints each TLS and QUIC handshake so you can pivot to every flow from the same client. [Security and forensics](docs/REFERENCE.md#security--forensics), [flight recorder](docs/REFERENCE.md#flight-recorder), [JA4](docs/REFERENCE.md#threat-hunting-with-ja4).
 
-**Sandboxed.** After setup, NetWatch drops privileges and confines itself to a Landlock allow-list on Linux. It parses hostile traffic and cannot read your SSH keys.
+**Linux worker sandbox.** Worker entry points apply a prepared Landlock filesystem policy before processing; capture prepares its device first. Writable grants use dedicated application directories. eBPF attribution is temporarily disabled in sandboxed runs pending an SDK reader hook. Network access remains unrestricted, and privileged capture/restart validation is pending. [Scope and limitations](docs/REFERENCE.md#landlock-sandbox-linux).
 
 ## The tabs
 
@@ -104,6 +104,7 @@ SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exp
 
 | | |
 |---|---|
+| [Capability matrix](docs/CAPABILITIES.md) | Platform differences, diagnostic limits and verification scope |
 | [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions, security |
 | [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
 | [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |

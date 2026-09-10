@@ -17,8 +17,7 @@ use std::io;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Handle CLI flags before entering TUI mode
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -115,6 +114,25 @@ async fn main() -> Result<()> {
         netwatch::sandbox::Mode::from_config(&NetwatchConfig::load().sandbox)
     };
 
+    let sandbox_paths = netwatch::sandbox::SandboxPaths::from_config(&NetwatchConfig::load());
+    if !matches!(sandbox_mode, netwatch::sandbox::Mode::Disabled) {
+        sandbox_paths.prepare()?;
+    } else if let Some(exports) = &sandbox_paths.cwd {
+        std::fs::create_dir_all(exports)?;
+    }
+    netwatch::sandbox::worker::install(sandbox_mode, sandbox_paths).map_err(anyhow::Error::msg)?;
+    let _worker_session = netwatch::sandbox::worker::SessionGuard;
+    netwatch::sandbox::worker::preflight().map_err(anyhow::Error::msg)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            assert!(
+                netwatch::sandbox::worker::enter("tokio-blocking"),
+                "blocking worker confinement failed"
+            );
+        })
+        .build()?;
+
     let remote_publisher = match (remote_url, api_key) {
         (Some(url), Some(key)) => {
             let publisher =
@@ -165,12 +183,11 @@ async fn main() -> Result<()> {
             exporter
         });
 
-        if let Err(e) =
-            app::run_headless(remote_publisher.as_ref(), metrics.as_ref(), sandbox_mode).await
-        {
-            eprintln!("Error: {e:?}");
-        }
-        return Ok(());
+        return runtime.block_on(app::run_headless(
+            remote_publisher.as_ref(),
+            metrics.as_ref(),
+            sandbox_mode,
+        ));
     }
 
     enable_raw_mode()?;
@@ -179,14 +196,13 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = app::run(
+    let result = runtime.block_on(app::run(
         &mut terminal,
         remote_publisher.as_ref(),
         sandbox_mode,
         view,
         demo,
-    )
-    .await;
+    ));
 
     disable_raw_mode()?;
     execute!(
@@ -196,9 +212,5 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    if let Err(e) = result {
-        eprintln!("Error: {e:?}");
-    }
-
-    Ok(())
+    result
 }

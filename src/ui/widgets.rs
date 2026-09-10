@@ -579,7 +579,8 @@ pub fn build_verdict_line(app: &App) -> Line<'static> {
             " ● no issues · baselines ready",
             Style::default().fg(t.text_muted),
         )]),
-        crate::diagnose::Verdict::Learning { detail } => with_demo(vec![Span::styled(
+        crate::diagnose::Verdict::Learning { detail }
+        | crate::diagnose::Verdict::Incomplete { detail } => with_demo(vec![Span::styled(
             format!(" ◌ no issues detected · {detail}"),
             Style::default().fg(t.text_muted),
         )]),

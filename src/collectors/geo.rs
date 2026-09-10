@@ -113,6 +113,7 @@ pub struct GeoCache {
     cache: Arc<Mutex<HashMap<String, GeoEntry>>>,
     mmdb: Arc<Option<MaxMindReader>>,
     online_tx: std_mpsc::Sender<String>,
+    pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
 }
 
 impl Default for GeoCache {
@@ -133,19 +134,37 @@ impl GeoCache {
 
         let (tx, rx) = std_mpsc::channel::<String>();
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let resolver_cache = Arc::clone(&cache);
+
+        Self {
+            cache,
+            mmdb,
+            online_tx: tx,
+            pending_rx: Arc::new(Mutex::new(Some(rx))),
+        }
+    }
+
+    /// Start the prepared lookup worker once, shared across cache clones.
+    /// Construction only opens local resources and creates a request channel.
+    pub fn start(&self) -> bool {
+        let Some(rx) = self.pending_rx.lock().unwrap().take() else {
+            return false;
+        };
+        let resolver_cache = Arc::clone(&self.cache);
 
         // Online fallback thread (ip-api.com) — only needed without a local DB
-        thread::spawn(move || {
+        crate::sandbox::worker::spawn("geoip", move || {
             let now = Instant::now();
             let mut last_request = now.checked_sub(Duration::from_millis(1500)).unwrap_or(now);
-            while let Ok(ip) = rx.recv() {
+            while let Some(ip) = crate::sandbox::worker::receive(&rx) {
                 let elapsed = last_request.elapsed();
                 if elapsed < Duration::from_millis(1400) {
                     thread::sleep(Duration::from_millis(1400) - elapsed);
                 }
                 last_request = Instant::now();
 
+                if crate::sandbox::worker::stopping() {
+                    break;
+                }
                 let result = lookup_geo_online(&ip);
                 let mut c = resolver_cache.lock().unwrap();
                 match result {
@@ -165,11 +184,7 @@ impl GeoCache {
             }
         });
 
-        Self {
-            cache,
-            mmdb,
-            online_tx: tx,
-        }
+        true
     }
 
     pub fn has_offline_db(&self) -> bool {
@@ -403,5 +418,30 @@ mod tests {
         assert!(!cache.has_offline_db());
         // Should still work via online fallback path
         assert!(cache.lookup("192.168.1.1").is_none()); // private
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
+        let cache = GeoCache::new();
+        cache.lookup("192.0.2.1");
+        assert_eq!(
+            cache
+                .pending_rx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .unwrap(),
+            "192.0.2.1"
+        );
+        let clone = cache.clone();
+        assert!(clone.start());
+        assert!(!cache.start());
     }
 }

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use super::connections::Connection;
@@ -229,7 +228,7 @@ impl ProcessBandwidthCollector {
         self.cpu_busy.store(true, Ordering::SeqCst);
         let cache = Arc::clone(&self.cpu_cache);
         let busy = Arc::clone(&self.cpu_busy);
-        thread::spawn(move || {
+        crate::sandbox::worker::spawn("process-cpu", move || {
             if let Some(pid_cpu) = sample_cpu() {
                 *cache.lock().unwrap() = pid_cpu;
             }

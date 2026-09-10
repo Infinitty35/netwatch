@@ -719,6 +719,7 @@ mod tests {
 
     fn make_health() -> HealthStatus {
         HealthStatus {
+            completed: Default::default(),
             gateway_rtt_ms: Some(2.5),
             gateway_loss_pct: 0.0,
             dns_rtt_ms: Some(14.0),

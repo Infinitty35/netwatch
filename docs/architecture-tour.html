@@ -226,10 +226,11 @@
             <li><b>wait</b> — block on the next <code class="inl">AppEvent</code></li>
             <li><b>handle</b> — key/mouse mutate state directly; a tick refreshes collectors</li>
           </ul>
-          <p class="small muted">The sandbox is applied <i>here</i>, right after <code class="inl">App::new()</code> — once pcap, PKTAP and the eBPF kprobe are already open, privileges can be dropped.</p>
+          <p class="small muted">The sandbox is applied <i>here</i>, after resource startup. Workers also enter policy at their own processing boundary; this call restricts the main thread.</p>
         </div>
         <div class="code"><div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>src/app.rs — run()</span></div><div data-rust><script type="text/plain">pub async fn run(/* … */) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::prepare();
+    app.start_workers();
 
     // pcap + PKTAP + eBPF kprobe are open —
     // now drop caps & restrict the filesystem.
@@ -484,25 +485,25 @@ pub enum EbpfStatus {
   <section class="slide" data-title="Security sandbox">
     <div class="wrap">
       <p class="kick">src/sandbox/ · Landlock</p>
-      <h2>Earn privilege, then drop it</h2>
+      <h2>Current sandbox boundary</h2>
       <div class="cols">
         <div>
-          <p class="lede">NetWatch may run under <code class="inl">sudo</code> for capture. So the moment setup is done — pcap fds open, kprobe attached — it <b>drops capabilities</b> and draws a Landlock filesystem boundary. A sudo'd NetWatch still can't read your home dir.</p>
+          <p class="lede">Worker entry points apply a prepared Linux filesystem policy before processing. Capture configures its device first. Grants use exact input files and dedicated output directories. The SDK eBPF source is disabled in sandboxed runs; privileged capture/restart validation remains pending. Network access remains unrestricted.</p>
           <div class="flowv" style="margin-top:8px">
-            <div class="node k">App::new() — open pcap · PKTAP · eBPF (needs caps)</div><div class="down">↓</div>
-            <div class="node p">sandbox::apply() — drop CAP_NET_RAW/BPF/PERFMON · Landlock</div><div class="down">↓</div>
-            <div class="node g">run loop — restricted: read /proc + dbs, write cache/exports only</div>
+            <div class="node k">App::prepare() + start_workers() — open pcap · PKTAP · eBPF (needs caps)</div><div class="down">↓</div>
+            <div class="node p">worker entry — verified selected cap drops · pinned Landlock FS</div><div class="down">↓</div>
+            <div class="node g">run loop — entry results in Settings; network unrestricted</div>
           </div>
-          <p class="small muted" style="margin-top:10px"><b>Three modes:</b> <code class="inl">Disabled</code> · <code class="inl">BestEffort</code> (degrade quietly on old kernels) · <code class="inl">Strict</code> (refuse to start if it can't enforce).</p>
+          <p class="small muted" style="margin-top:10px"><b>Three modes:</b> <code class="inl">Disabled</code> · <code class="inl">BestEffort</code> (report degradation) · <code class="inl">Strict</code> (reject failed required policy entries).</p>
         </div>
-        <div class="code"><div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>src/sandbox/mod.rs</span></div><div data-rust><script type="text/plain">//! Phase 1 (Linux): drop caps + Landlock FS/net restriction,
-//! applied AFTER setup (kprobe & pcap fds already open).
-//! Drops CAP_NET_RAW/BPF/PERFMON; read /proc + dbs, write cache.
+        <div class="code"><div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>src/sandbox/mod.rs</span></div><div data-rust><script type="text/plain">//! Linux: policy at worker entry using a prepared ruleset.
+//! No network restrictions; capture acceptance tests remain pending.
+//! CAP_NET_RAW retained in best-effort; strict attempts to drop it.
 
 pub enum Mode {
     Disabled,    // --no-sandbox escape hatch
     BestEffort,  // default: degrade on old kernels
-    Strict,      // --sandbox-strict: fail if unenforceable
+    Strict,      // abort on reported application warnings
 }</script></div></div>
       </div>
     </div>
@@ -519,7 +520,7 @@ pub enum Mode {
           <ul class="clean">
             <li><kbd>Shift</kbd>+<kbd>R</kbd> arm / disarm the rolling recorder</li>
             <li><kbd>Shift</kbd>+<kbd>F</kbd> freeze the current incident window</li>
-            <li><kbd>Shift</kbd>+<kbd>E</kbd> export the bundle to your home dir</li>
+            <li><kbd>Shift</kbd>+<kbd>E</kbd> export the bundle to the startup working directory</li>
           </ul>
           <p class="small muted">Detectors (port scan, beaconing, DNS tunnel) in <code class="inl">network_intel.rs</code> feed both the dashboard and the recorder.</p>
         </div>

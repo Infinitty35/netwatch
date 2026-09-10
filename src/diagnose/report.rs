@@ -42,6 +42,8 @@ pub struct TimelineEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
+    #[serde(default)]
+    pub coverage: super::coverage::Coverage,
     pub generated_at: String,
     pub window_start: String,
     pub window_end: String,
@@ -67,9 +69,9 @@ impl Report {
         let primary = self.primary();
         if primary.is_empty() {
             return format!(
-                "healthy — no issues open between {} and {}",
-                time_of(&self.window_start),
-                time_of(&self.window_end)
+                "no open findings · {} · {} retained closed findings",
+                self.coverage.label(),
+                self.issues.iter().filter(|i| !i.state.is_open()).count()
             );
         }
         let worst = primary
@@ -125,11 +127,27 @@ impl Report {
 
         let primary = self.primary();
         if primary.is_empty() {
-            m.push_str("No issues were open in this window.\n\n");
+            m.push_str("No findings are currently open. This does not establish health for unmeasured checks.\n\n");
         }
 
+        m.push_str(&format!("**Coverage** — {}.\n\n", self.coverage.label()));
         for (n, issue) in primary.iter().enumerate() {
             m.push_str(&self.issue_section(n + 1, issue));
+        }
+
+        m.push_str("## Diagnostic coverage\n\n");
+        for row in &self.coverage.rules {
+            m.push_str(&format!(
+                "- `{}`: {:?} — {}\n",
+                row.rule, row.status, row.reason
+            ));
+        }
+        m.push('\n');
+        for issue in self.issues.iter().filter(|i| !i.state.is_open()) {
+            m.push_str(&format!(
+                "Retained closed finding: `{}` — {} ({:?})\n\n",
+                issue.id, issue.title, issue.state
+            ));
         }
 
         if !self.timeline.is_empty() {
@@ -268,6 +286,9 @@ impl Report {
                             time_of(at)
                         ));
                     }
+                    Some(outcome @ Applied::RecoveryRequired { .. }) => {
+                        m.push_str(&format!("\n  - {}", outcome.recovery_summary().unwrap()));
+                    }
                     Some(Applied::No { reason }) => {
                         m.push_str(&format!("\n  - not applied: {reason}"));
                     }
@@ -369,6 +390,61 @@ mod tests {
     }
 
     #[test]
+    fn recovery_outcome_survives_json_and_markdown_export() {
+        let mut report = report();
+        let step = report
+            .issues
+            .iter_mut()
+            .flat_map(|i| &mut i.remediation)
+            .find(|s| s.kind == StepKind::Apply)
+            .unwrap();
+        step.applied = Some(Applied::RecoveryRequired {
+            operation_id: "operation-42".into(),
+            reason: "completion journal write failed; target may have changed".into(),
+            backup: "/recovery/original.bak".into(),
+        });
+        let json = report.to_json().unwrap();
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, report);
+        let md = restored.to_markdown();
+        for expected in [
+            "recovery required",
+            "operation-42",
+            "target may have changed",
+            "/recovery/original.bak",
+        ] {
+            assert!(md.contains(expected), "missing {expected}: {md}");
+        }
+    }
+
+    #[test]
+    fn legacy_report_without_coverage_is_explicitly_unknown() {
+        let mut value = serde_json::to_value(report()).unwrap();
+        value.as_object_mut().unwrap().remove("coverage");
+        value["issues"] = serde_json::json!([]);
+        let old: Report = serde_json::from_value(value).unwrap();
+        assert!(old.summary_line().contains("coverage not recorded"));
+        assert!(!old.summary_line().contains("healthy"));
+    }
+
+    #[test]
+    fn closed_findings_are_retained_in_markdown_and_not_described_as_absent() {
+        let mut report = report();
+        for i in &mut report.issues {
+            i.state = IssueState::Resolved {
+                at: "2026-09-03 07:00:00".into(),
+            };
+        }
+        let md = report.to_markdown();
+        assert!(report.summary_line().contains("retained closed findings"));
+        assert!(md.contains("Retained closed finding"));
+        assert!(!md.contains("No issues were open in this window"));
+        for issue in &report.issues {
+            assert!(md.contains(&issue.id));
+        }
+    }
+
+    #[test]
     fn markdown_summary_states_the_verdict() {
         let md = report().to_markdown();
         let first = md.lines().find(|l| l.starts_with("**Summary**")).unwrap();
@@ -424,6 +500,7 @@ mod tests {
     fn a_preview_with_no_environment_still_has_a_sane_heading() {
         // What the Diagnose tab's `o` preview renders.
         let r = Report {
+            coverage: Default::default(),
             generated_at: String::new(),
             window_start: String::new(),
             window_end: String::new(),
@@ -487,13 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn a_healthy_report_says_healthy_without_inventing_issues() {
+    fn an_empty_report_does_not_claim_health() {
         let mut r = report();
         r.issues.clear();
         let md = r.to_markdown();
-        assert!(md.contains("No issues were open"), "{md}");
+        assert!(md.contains("No findings are currently open"), "{md}");
         assert!(
-            r.summary_line().starts_with("healthy"),
+            r.summary_line().starts_with("no open findings"),
             "{}",
             r.summary_line()
         );

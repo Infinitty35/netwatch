@@ -369,21 +369,12 @@ use crate::sort::{SortColumn, TabSortState};
 /// this brings the three export sites in line.
 /// Where exports land.
 ///
-/// The current directory, not the home directory. The Landlock sandbox grants
-/// write access to the CWD it was started in and *not* to `$HOME` (see
-/// `sandbox::linux::collect_read_write`, whose comment already said "PCAP
-/// exports and Flight Recorder bundles land in CWD by default"). While this
-/// returned the home directory, every export under the default sandbox failed
-/// with `Permission denied` — which, with no on-screen confirmation, looked
-/// exactly like an export that had silently done nothing.
-///
-/// Falls back to `$HOME` for the `--no-sandbox` case where the CWD is
-/// somewhere unwritable, and finally to `.`.
+/// Dedicated export directory, prepared at bootstrap and granted explicitly.
 fn export_dir() -> std::path::PathBuf {
-    std::env::current_dir()
-        .ok()
-        .or_else(dirs::home_dir)
+    dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("netwatch")
+        .join("exports")
 }
 
 pub fn sort_columns_for_tab(tab: Tab) -> &'static [SortColumn] {
@@ -509,8 +500,9 @@ impl DiagnoseState {
                 fingerprint,
             ),
             sampler: crate::diagnose::live::LiveSampler::new(),
-            journal: crate::diagnose::remediation::Journal::new(
+            journal: crate::diagnose::remediation::Journal::load(
                 crate::diagnose::remediation::Journal::default_path(),
+                &crate::diagnose::remediation::RealHost,
             ),
             selected: 0,
             show_report: false,
@@ -611,7 +603,7 @@ pub struct App {
     /// preserved in `ebpf_init_error` for UI display.
     #[cfg(feature = "ebpf")]
     pub conn_tracker: Option<crate::ebpf::conn_tracker::ConnTracker>,
-    /// Stringified `EbpfError` from the failed `ConnTracker::new()` call,
+    /// Stringified `EbpfError` from the failed `ConnTracker::start()` call,
     /// surfaced by `attribution_status()` so the Connections header can
     /// tell users why eBPF fell back to lsof. Read only by the
     /// non-macOS branch of `attribution_status()`; on macOS PKTAP wins
@@ -644,9 +636,10 @@ pub struct App {
     #[cfg(target_os = "macos")]
     pktap_handle: Option<crate::platform::pktap::PktapHandle>,
     /// Outcome of the post-startup sandbox apply. Populated by
-    /// `app::run` after `App::new` returns and the privileged fds are
-    /// open. Surfaced in the Settings overlay.
+    /// `app::run` after explicit worker startup. Surfaced in Settings; this
+    /// does not report worker resource readiness or confinement.
     pub sandbox_report: crate::sandbox::Report,
+    workers_started: bool,
     /// Issue detection, baselines and remediation. See [`DiagnoseState`].
     pub diagnose: DiagnoseState,
 }
@@ -682,8 +675,11 @@ pub enum AttributionStatus {
 }
 
 impl App {
-    fn new() -> Self {
-        let user_config = NetwatchConfig::load();
+    fn prepare() -> Self {
+        Self::prepare_with_config(NetwatchConfig::load())
+    }
+
+    fn prepare_with_config(user_config: NetwatchConfig) -> Self {
         let interface_info = platform::collect_interface_info().unwrap_or_default();
         let mut config_collector = ConfigCollector::new();
         config_collector.update();
@@ -720,73 +716,20 @@ impl App {
         let mut network_intel = NetworkIntelCollector::new();
         network_intel.set_bandwidth_threshold(user_config.alerts.bandwidth_threshold);
 
-        let mut packet_collector = PacketCollector::new();
-        // Wire the TLS keylog watcher BEFORE starting capture so the
-        // store is hooked up when the first TLS handshakes arrive.
-        // Empty path = decryption disabled; non-empty = spawn a poller
-        // that ingests secrets as the cooperating client process
-        // appends them.
-        if !user_config.tls_keylog_path.trim().is_empty() {
-            packet_collector
-                .configure_tls_keylog(Some(std::path::PathBuf::from(&user_config.tls_keylog_path)));
-        }
-        // Start ambient packet capture so the Connections view can show
-        // per-connection rates. If this fails (no sudo, no interface), the
-        // error surfaces on the Packets tab and rate columns stay blank.
-        packet_collector.start_capture(&capture_interface, bpf_filter_active.as_deref());
-
-        // On macOS, try to start PKTAP capture for kernel-level per-packet
-        // process attribution. Requires root — falls back gracefully to lsof
-        // polling when unavailable.
-        #[cfg(target_os = "macos")]
-        let pktap_handle = {
-            let handle = crate::platform::pktap::spawn();
-            // If startup fails fast we still keep the handle so the UI can
-            // surface the reason; lookups against the empty cache are cheap.
-            Some(handle)
-        };
-
-        // Load netwatch-sdk's tcp_v4_connect kprobe. Same fallback pattern
-        // as PKTAP: if the SDK can't load the BPF object (missing CAP_BPF,
-        // no embedded object, non-Linux host running an ebpf-enabled
-        // build), conn_tracker stays None and the connection collector
-        // continues with lsof/ss attribution only. The failure reason is
-        // captured for UI display.
-        #[cfg(feature = "ebpf")]
-        let (conn_tracker_opt, ebpf_init_error) = match crate::ebpf::conn_tracker::ConnTracker::new(
-        ) {
-            Ok(t) => (Some(t), None),
-            Err(e) => {
-                tracing::warn!(target: "netwatch::ebpf", error = %e, "eBPF kprobe init failed; falling back to lsof/ss attribution");
-                (None, Some(e.to_string()))
-            }
-        };
-
-        let mut connection_collector =
+        let packet_collector = PacketCollector::new();
+        let connection_collector =
             ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(h) = pktap_handle.as_ref() {
-                connection_collector = connection_collector.with_pktap(Arc::clone(&h.attributor));
-            }
-        }
-        #[cfg(feature = "ebpf")]
-        {
-            if let Some(t) = conn_tracker_opt.as_ref() {
-                connection_collector = connection_collector.with_ebpf(Arc::clone(&t.attributor));
-            }
-        }
 
         // Capture a /proc attribution snapshot NOW — before the sandbox is
-        // applied (app::run does that after App::new returns). Landlock's
+        // applied (app::run does that after explicit worker startup). Landlock's
         // process-introspection (ptrace) scoping later blocks reading other
         // processes' /proc/<pid>/fd, so connections that already exist must be
         // attributed here; eBPF handles connections opened afterward. See #38.
         #[cfg(target_os = "linux")]
-        {
+        let connection_collector = {
             let snapshot = crate::collectors::connections::capture_proc_snapshot();
-            connection_collector = connection_collector.with_proc_snapshot(Arc::new(snapshot));
-        }
+            connection_collector.with_proc_snapshot(Arc::new(snapshot))
+        };
 
         let ui = AppUiState::from_config(&user_config);
 
@@ -813,9 +756,9 @@ impl App {
             },
             intel_last_pkt_id: 0,
             #[cfg(feature = "ebpf")]
-            conn_tracker: conn_tracker_opt,
+            conn_tracker: None,
             #[cfg(feature = "ebpf")]
-            ebpf_init_error,
+            ebpf_init_error: None,
             info_tick: 0,
             conn_tick: 0,
             health_tick: 0,
@@ -829,10 +772,61 @@ impl App {
             insights_collector,
             incident_capture_started: false,
             #[cfg(target_os = "macos")]
-            pktap_handle,
+            pktap_handle: None,
             sandbox_report: crate::sandbox::Report::default(),
+            workers_started: false,
             diagnose: DiagnoseState::new(),
         }
+    }
+
+    /// Start persistent workers through their policy entry boundaries.
+    /// Capture opens its resource before entering; the SDK source stays disabled
+    /// under sandbox policy because its internal reader has no entry hook.
+    fn start_workers(&mut self) {
+        if self.workers_started {
+            return;
+        }
+        self.workers_started = true;
+        self.packet_collector.dns_cache.start();
+        if let Some(collector) = &mut self.insights_collector {
+            collector.start();
+        }
+        if !self.user_config.tls_keylog_path.trim().is_empty() {
+            self.packet_collector
+                .configure_tls_keylog(Some(std::path::PathBuf::from(
+                    &self.user_config.tls_keylog_path,
+                )));
+        }
+        self.packet_collector
+            .start_capture(&self.capture_interface, self.bpf_filter_active.as_deref());
+        #[cfg(target_os = "macos")]
+        {
+            let handle = crate::platform::pktap::spawn();
+            self.connection_collector
+                .attach_pktap(Arc::clone(&handle.attributor));
+            self.pktap_handle = Some(handle);
+        }
+        #[cfg(feature = "ebpf")]
+        match if matches!(
+            crate::sandbox::worker::mode(),
+            crate::sandbox::Mode::Disabled
+        ) {
+            crate::ebpf::conn_tracker::ConnTracker::start().map_err(|e| e.to_string())
+        } else {
+            Err("eBPF disabled: SDK reader has no pre-processing confinement hook; using socket polling".into())
+        } {
+            Ok(tracker) => {
+                self.connection_collector
+                    .attach_ebpf(Arc::clone(&tracker.attributor));
+                self.conn_tracker = Some(tracker);
+            }
+            Err(error) => {
+                tracing::warn!(target: "netwatch::ebpf", %error, "eBPF startup failed; falling back to socket polling");
+                self.ebpf_init_error = Some(error.to_string());
+            }
+        }
+        self.geo_cache.start();
+        self.whois_cache.start();
     }
 
     /// One diagnose pass: learn, sample, evaluate.
@@ -864,19 +858,20 @@ impl App {
             self.diagnose.baselines.set_network(fingerprint);
         }
 
-        let readings = crate::diagnose::live::LiveSampler::readings(self);
+        let mut sampler = std::mem::take(&mut self.diagnose.sampler);
+        let readings = sampler.readings(self);
         crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
 
-        // The sampler is moved out for the duration of the borrow: it needs
-        // `&mut self` for its own cross-tick state and `&self` to read the
-        // collectors, which the borrow checker cannot see are disjoint.
-        let mut sampler = std::mem::take(&mut self.diagnose.sampler);
         let thresholds = self.diagnose.engine.settings().thresholds;
         let observations = sampler.sample(self, &thresholds);
         self.diagnose.sampler = sampler;
 
         let baselines = self.diagnose.baselines.clone();
-        self.diagnose.engine.observe(&observations, &baselines);
+        self.diagnose.engine.observe_live(
+            &observations,
+            &baselines,
+            &self.diagnose.sampler.completed,
+        );
 
         // Keep the cursor on a real row as issues open and close.
         let open = self.diagnose.engine.open_count();
@@ -1099,11 +1094,11 @@ impl App {
         );
 
         self.incident_capture_started = false;
-        if !self.packet_collector.is_capturing() {
+        if !self.packet_collector.capture_requested() {
             let iface = self.capture_interface.clone();
             let bpf = self.bpf_filter_active.clone();
             self.packet_collector.start_capture(&iface, bpf.as_deref());
-            self.incident_capture_started = self.packet_collector.is_capturing();
+            self.incident_capture_started = self.packet_collector.capture_requested();
         }
 
         self.sync_incident_recorder();
@@ -1325,7 +1320,7 @@ impl App {
 
     fn disarm_incident_recorder(&mut self) {
         self.incident_recorder.disarm();
-        if self.incident_capture_started && self.packet_collector.is_capturing() {
+        if self.incident_capture_started && self.packet_collector.capture_requested() {
             self.packet_collector.stop_capture();
         }
         self.incident_capture_started = false;
@@ -1340,7 +1335,7 @@ impl App {
         self.sync_incident_recorder();
         match self.incident_recorder.freeze(reason) {
             Ok(()) => {
-                if self.incident_capture_started && self.packet_collector.is_capturing() {
+                if self.incident_capture_started && self.packet_collector.capture_requested() {
                     self.packet_collector.stop_capture();
                 }
                 self.incident_capture_started = false;
@@ -1707,7 +1702,19 @@ pub async fn run<B: Backend>(
     view: Option<ViewMode>,
     demo: bool,
 ) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::prepare();
+    crate::sandbox::worker::ensure(
+        sandbox_mode,
+        crate::sandbox::SandboxPaths::from_config(&app.user_config),
+    )
+    .map_err(anyhow::Error::msg)?;
+    app.start_workers();
+    if let Err(error) = crate::sandbox::worker::wait_ready(std::time::Duration::from_secs(5)) {
+        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) {
+            anyhow::bail!("worker startup: {error}");
+        }
+        tracing::warn!(%error, "worker readiness incomplete");
+    }
     if demo {
         app.diagnose.enter_demo_mode();
         // Live capture needs CAP_NET_RAW, so without a recorded conversation
@@ -1733,10 +1740,9 @@ pub async fn run<B: Backend>(
     // user never sees a screen shaped by a change they didn't ask for.
     app.reconcile_remediations();
 
-    // Apply the security sandbox after App::new finishes — pcap handles,
-    // PKTAP attributor, and the eBPF kprobe are all up at this point, so
-    // we can drop the elevated capabilities and restrict filesystem
-    // access. Strict mode surfaces any warnings and aborts startup.
+    // Apply the calling-thread sandbox after requesting worker startup.
+    // Capture resource opening is asynchronous; readiness and existing-worker
+    // enforcement remain PR05 work. Strict mode aborts on reported warnings.
     {
         let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
         let report = crate::sandbox::apply(sandbox_mode, &paths);
@@ -1759,7 +1765,7 @@ pub async fn run<B: Backend>(
     }
 
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
-    let mut events = EventHandler::new(tick_rate);
+    let mut events = EventHandler::start(tick_rate);
 
     // Initial data collection
     app.traffic.update();
@@ -1947,10 +1953,22 @@ pub async fn run_headless(
 ) -> Result<()> {
     install_collector_panic_flag();
 
-    let mut app = App::new();
+    let mut app = App::prepare();
+    crate::sandbox::worker::ensure(
+        sandbox_mode,
+        crate::sandbox::SandboxPaths::from_config(&app.user_config),
+    )
+    .map_err(anyhow::Error::msg)?;
+    app.start_workers();
+    if let Err(error) = crate::sandbox::worker::wait_ready(std::time::Duration::from_secs(5)) {
+        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) {
+            anyhow::bail!("worker startup: {error}");
+        }
+        tracing::warn!(%error, "worker readiness incomplete");
+    }
 
-    // Same post-init sandbox application as the TUI path: pcap/eBPF/PKTAP are
-    // up by now, so we can drop caps and restrict the filesystem.
+    // Same boundary as the TUI: worker starts requested, then calling-thread
+    // sandbox application. This is not a worker readiness/enforcement barrier.
     {
         let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
         let report = crate::sandbox::apply(sandbox_mode, &paths);
@@ -2828,6 +2846,9 @@ fn handle_settings_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                             } else {
                                 None
                             };
+                            if let Some(collector) = &mut app.insights_collector {
+                                collector.start();
+                            }
                         }
                         app.ui.settings_status = Some("✓ Applied".into());
                         app.ui.settings_status_tick = 0;
@@ -3326,7 +3347,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Char('c') if app.ui.current_tab == Tab::Packets => {
-            if app.packet_collector.is_capturing() {
+            if app.packet_collector.capture_requested() {
                 app.packet_collector.stop_capture();
             } else {
                 let iface = app.capture_interface.clone();
@@ -3338,7 +3359,7 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             // Cycling while capturing restarts the capture on the new
             // interface (keeping the buffer and BPF filter) — a silent
             // no-op here left users stuck on the wrong NIC (issue #43).
-            let was_capturing = app.packet_collector.is_capturing();
+            let was_capturing = app.packet_collector.capture_requested();
             if was_capturing {
                 app.packet_collector.stop_capture();
             }
@@ -3965,6 +3986,31 @@ mod view_cycle_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparing_an_app_does_not_start_capture_or_optional_workers() {
+        let config = crate::config::NetwatchConfig {
+            insights_enabled: true,
+            insights_endpoint: "http://127.0.0.1:1".into(),
+            tls_keylog_path: "/nonexistent/netwatch-pr04-keylog".into(),
+            ..Default::default()
+        };
+        let app = super::App::prepare_with_config(config);
+        assert!(!app.workers_started);
+        assert!(!app
+            .packet_collector
+            .capturing
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.packet_collector.error.lock().unwrap().is_none());
+        assert!(matches!(
+            *app.insights_collector.as_ref().unwrap().get_status(),
+            crate::collectors::insights::InsightsStatus::Idle
+        ));
+        #[cfg(feature = "ebpf")]
+        assert!(app.conn_tracker.is_none());
+        #[cfg(target_os = "macos")]
+        assert!(app.pktap_handle.is_none());
+    }
+
     use super::*;
     use crate::collectors::process_bandwidth::ProcessBandwidth;
     use crate::collectors::traffic::InterfaceTraffic;
@@ -4850,6 +4896,10 @@ fn stage_remediation(app: &mut App) {
             let key = step.key.unwrap_or('1');
             let text = step.text.clone();
             app.diagnose.pending_apply = Some((id, key));
+            if !app.diagnose.is_demo() {
+                apply_pending_remediation(app);
+                return;
+            }
             app.diagnose
                 .set_status(format!("apply: {text}?  y = yes, n = no"));
         }
@@ -4895,6 +4945,9 @@ fn apply_pending_remediation(app: &mut App) {
             crate::diagnose::issue::Applied::Yes { before, after, .. } => {
                 format!("simulated · {before} → {after} · watching for verify to hold")
             }
+            crate::diagnose::issue::Applied::RecoveryRequired { .. } => {
+                applied.recovery_summary().unwrap()
+            }
             crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
             crate::diagnose::issue::Applied::Reverted { reason, .. } => {
                 format!("reverted · {reason}")
@@ -4905,47 +4958,16 @@ fn apply_pending_remediation(app: &mut App) {
         return;
     }
 
-    let mut host = crate::diagnose::remediation::RealHost;
-    let outcome = match &action {
-        crate::diagnose::issue::Action::SetResolver { addr } => {
-            let target = std::path::Path::new("/etc/resolv.conf");
-            let current = std::fs::read_to_string(target).unwrap_or_default();
-            let new = crate::diagnose::remediation::resolv_conf_with(&current, addr);
-            app.diagnose.journal.apply_file_edit(
-                &mut host,
-                &id,
-                action.clone(),
-                target,
-                &new,
-                crate::diagnose::remediation::first_nameserver,
-            )
-        }
-        // Every other action is either an instruction or not yet wired to a
-        // host change. Recording "not applied" beats pretending.
-        _ => Ok(crate::diagnose::issue::Applied::No {
-            reason: "netwatch cannot perform this step itself".into(),
-        }),
-    };
-
-    match outcome {
-        Ok(applied) => {
-            let msg = match &applied {
-                crate::diagnose::issue::Applied::Yes { before, after, .. } => {
-                    format!("applied · {before} → {after} · reverts on quit unless made permanent")
-                }
-                crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
-                crate::diagnose::issue::Applied::Reverted { reason, .. } => {
-                    format!("reverted · {reason}")
-                }
-            };
-            app.diagnose.engine.record_applied(&id, key, applied);
-            app.diagnose.set_status(msg);
-        }
-        Err(e) => {
-            app.diagnose
-                .set_status(format!("could not apply: {e} — host unchanged"));
-        }
-    }
+    let reason = app.diagnose.journal.blocked_reason().map(str::to_owned)
+        .unwrap_or_else(|| match action {
+            crate::diagnose::issue::Action::SetResolver { .. } =>
+                "automatic resolver changes are unavailable until durable recovery and a supported resolver adapter are available; follow the manual steps".into(),
+            _ => "netwatch cannot perform this step itself".into(),
+        });
+    app.diagnose.set_status(format!("not applied · {reason}"));
+    app.diagnose
+        .engine
+        .record_applied(&id, key, crate::diagnose::issue::Applied::No { reason });
 }
 
 /// Write `report.md` and `report.json`, and say where they went.
@@ -5002,6 +5024,13 @@ pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
             text: format!("{} · {}", i.title, i.subject.label()),
         })
         .collect();
+    if let Some(reason) = app.diagnose.journal.blocked_reason() {
+        timeline.push(crate::diagnose::report::TimelineEvent {
+            at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            kind: "recovery_status".into(),
+            text: reason.to_string(),
+        });
+    }
     timeline.sort_by(|a, b| a.at.cmp(&b.at));
 
     let iface_info = app
@@ -5010,6 +5039,7 @@ pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
         .find(|i| i.name == app.capture_interface);
 
     crate::diagnose::report::Report {
+        coverage: app.diagnose.engine.coverage().clone(),
         generated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         window_start: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         window_end: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
