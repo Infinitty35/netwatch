@@ -31,18 +31,19 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: netwatch-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: netwatch-linux-aarch64
+          # Linux ships musl-static only (issue #53): a dynamically-linked
+          # glibc build needs the running system's libpcap to match what
+          # the CI runner had, which a minimal distro or container usually
+          # doesn't have installed. That is the exact failure the static
+          # build was already added to solve — it just weakened the effect
+          # by leaving both on the releases page with no signal for which
+          # one to pick. There is now only one Linux binary, self-contained.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: netwatch-linux-x86_64-static
+            name: netwatch-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: netwatch-linux-aarch64-static
+            name: netwatch-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
             name: netwatch-macos-x86_64
@@ -62,33 +63,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install libpcap (Linux x86_64 glibc)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
-
-      - name: Install cross-compilation dependencies (Linux aarch64 glibc)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          if ! grep -q '^Architectures: amd64$' /etc/apt/sources.list.d/ubuntu.sources; then
-            sudo sed -i '/^Signed-By:/i Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/ubuntu-arm64.sources >/dev/null
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: noble noble-updates noble-backports noble-security
-          Components: main universe restricted multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libpcap0.8-dev:arm64 pkg-config
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
-          echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
-          echo "LIBPCAP_LIBDIR=/usr/lib/aarch64-linux-gnu" >> $GITHUB_ENV
 
       - name: Install zig + cargo-zigbuild (Linux musl)
         if: contains(matrix.target, 'linux-musl')
@@ -268,8 +242,8 @@ jobs:
           for asset in \
             netwatch-macos-x86_64.tar.gz \
             netwatch-macos-aarch64.tar.gz \
-            netwatch-linux-x86_64-static.tar.gz \
-            netwatch-linux-aarch64-static.tar.gz
+            netwatch-linux-x86_64.tar.gz \
+            netwatch-linux-aarch64.tar.gz
           do
             url="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${asset}"
             for i in 1 2 3 4 5; do
@@ -294,8 +268,8 @@ jobs:
           VERSION: ${{ steps.sha.outputs.version }}
           SHA_MACOS_X86_64: ${{ steps.sha.outputs.sha_macos_x86_64 }}
           SHA_MACOS_AARCH64: ${{ steps.sha.outputs.sha_macos_aarch64 }}
-          SHA_LINUX_X86_64: ${{ steps.sha.outputs.sha_linux_x86_64_static }}
-          SHA_LINUX_AARCH64: ${{ steps.sha.outputs.sha_linux_aarch64_static }}
+          SHA_LINUX_X86_64: ${{ steps.sha.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_AARCH64: ${{ steps.sha.outputs.sha_linux_aarch64 }}
         run: |
           cat > homebrew-tap/Formula/netwatch.rb <<EOF
           class Netwatch < Formula
@@ -325,19 +299,19 @@ jobs:
 
             on_linux do
               on_arm do
-                url "https://github.com/matthart1983/netwatch/releases/download/v${VERSION}/netwatch-linux-aarch64-static.tar.gz"
+                url "https://github.com/matthart1983/netwatch/releases/download/v${VERSION}/netwatch-linux-aarch64.tar.gz"
                 sha256 "${SHA_LINUX_AARCH64}"
 
                 def install
-                  bin.install "netwatch-linux-aarch64-static" => "netwatch"
+                  bin.install "netwatch-linux-aarch64" => "netwatch"
                 end
               end
               on_intel do
-                url "https://github.com/matthart1983/netwatch/releases/download/v${VERSION}/netwatch-linux-x86_64-static.tar.gz"
+                url "https://github.com/matthart1983/netwatch/releases/download/v${VERSION}/netwatch-linux-x86_64.tar.gz"
                 sha256 "${SHA_LINUX_X86_64}"
 
                 def install
-                  bin.install "netwatch-linux-x86_64-static" => "netwatch"
+                  bin.install "netwatch-linux-x86_64" => "netwatch"
                 end
               end
             end

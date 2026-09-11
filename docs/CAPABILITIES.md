@@ -14,7 +14,7 @@ establish macOS or Windows runtime parity.
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend |
 | Strict sandbox startup | Rejects preflight/required entry failures; raw capture reopening may fail | Rejected: no backend | Rejected: no backend |
-| Live automatic resolver edits | Temporarily disabled | Temporarily disabled | Temporarily disabled |
+| Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable |
 | AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
 
 Attribution may be unknown or stale. Polling can miss short-lived connections;
@@ -31,11 +31,22 @@ interface saturation lacks link capacity in the live adapter. Empty findings do
 not establish host health. Baseline readiness is sample-based, not a guaranteed
 30-minute elapsed window.
 
-Live resolver changes are disabled pending durable recovery and supported resolver
-adapters. Manual guidance and simulated demo remediation remain. TUI startup can
-attempt recovery of legacy journal entries; the daemon does not yet have equivalent
-startup reconciliation. Recovery-required outcomes preserve failures after a target
-write, but the legacy journal is not a crash-durable transaction system.
+The [Linux resolver authority command](resolver-adapter.md) supports temporary
+changes to an explicitly confirmed unmanaged regular file. Managed resolvers and
+other platforms remain unsupported; automatic TUI/daemon edits stay disabled.
+Manual guidance and simulated demo remediation remain. TUI and daemon
+startup inspect the same legacy journal and report unresolved entries without
+executing its target or backup paths. Startup and shutdown leave legacy operations
+unchanged: their ownership cannot be verified, even when running as root or with
+`--no-sandbox`. Journal/backup locations are reported as unverified evidence for
+manual review. Demo startup/shutdown performs no recovery and does not save
+simulated baselines. Startup also inspects the [v2 recovery store](recovery-store.md)
+in durable state. Its Unix writer provides synced atomic replacement and a
+per-store OS lock; it does not grant resolver authority or a host-wide lease.
+The Linux resolver CLI uses a separate root-owned shared authority store/lease at
+`/var/lib/netwatch/resolver-v2`; normal startup reports its unresolved evidence but
+does not perform privileged rollback. Windows v2 writes remain unavailable. The
+legacy journal is not crash-durable.
 
 ## Security boundary
 

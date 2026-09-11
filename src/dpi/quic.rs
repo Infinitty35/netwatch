@@ -52,6 +52,16 @@ const VERSION_V2: u32 = 0x6b33_43cf;
 
 const SAMPLE_LEN: usize = 16;
 
+/// Ceiling on the reassembled CRYPTO-frame (ClientHello) buffer. The `offset`
+/// a CRYPTO frame declares is a 62-bit varint chosen by the sender, so
+/// `offset + length` used as a `Vec::resize` target is an easy multi-GiB
+/// allocation from a single small Initial packet — `resize`'s allocator
+/// failure aborts the whole process, not just this parse (issue found in
+/// review 2026-09-11). A real ClientHello, even a heavily padded or
+/// multi-fragment one, is a few KiB; 1 MiB leaves generous room without
+/// reopening the same hole.
+const MAX_QUIC_CRYPTO_BUF: usize = 1024 * 1024;
+
 #[derive(Clone, Copy)]
 pub(crate) enum QuicVersion {
     V1,
@@ -485,9 +495,24 @@ fn decrypt_payload(
 
     // Ciphertext spans from end of header to end of (pn + payload). The
     // last 16 bytes are the auth tag.
+    //
+    // `header.pn_plus_payload_len` (the wire `Length` varint) and `pn_len`
+    // (decoded from the *unprotected* first byte, after `unprotect_header`)
+    // come from independent parts of the packet and were never checked
+    // against each other: a sender can advertise a `Length` shorter than
+    // the packet-number field it then uses, which put `payload_end` before
+    // `payload_start` and panicked the slice below on one crafted Initial
+    // packet (issue found in review 2026-09-11). Both header fields are
+    // otherwise attacker-controlled — `parse_long_header` only checked
+    // `pn_plus_payload_len` against the *total* buffer length, not against
+    // `pn_len` — so this has to be a data check, not a debug assertion.
     let payload_start = header_end;
     let payload_end = header.pn_offset + header.pn_plus_payload_len;
-    if buf.len() < payload_end {
+    if payload_end < payload_start || buf.len() < payload_end {
+        return Err(());
+    }
+    let tag_len = aead::AES_128_GCM.tag_len();
+    if payload_end - payload_start < tag_len {
         return Err(());
     }
     let mut ciphertext = buf[payload_start..payload_end].to_vec();
@@ -498,8 +523,9 @@ fn decrypt_payload(
         .open_in_place(nonce, aad, &mut ciphertext)
         .map_err(|_| ())?;
     // open_in_place truncates the tag in-place by returning a slice
-    // shorter than input; we explicitly resize.
-    let plain_len = ciphertext.len() - aead::AES_128_GCM.tag_len();
+    // shorter than input; we explicitly resize. The `tag_len` check above
+    // guarantees this subtraction cannot underflow.
+    let plain_len = ciphertext.len() - tag_len;
     ciphertext.truncate(plain_len);
     Ok(ciphertext)
 }
@@ -528,11 +554,15 @@ fn reassemble_crypto(plaintext: &[u8]) -> Result<Vec<u8>, ()> {
                 if pos + length > plaintext.len() {
                     return Err(());
                 }
-                let end = (offset as usize) + length;
+                let offset = offset as usize;
+                let end = offset.checked_add(length).ok_or(())?;
+                if end > MAX_QUIC_CRYPTO_BUF {
+                    return Err(());
+                }
                 if out.len() < end {
                     out.resize(end, 0);
                 }
-                out[offset as usize..end].copy_from_slice(&plaintext[pos..pos + length]);
+                out[offset..end].copy_from_slice(&plaintext[pos..pos + length]);
                 pos += length;
             }
             0x02 | 0x03 => {
@@ -885,5 +915,92 @@ e221af44860018ab0856972e194cd934";
         // RFC 9000 §A.3 worked example: largest=0xa82f30ea, truncated=0x9b32,
         // pn_len=2 → 0xa82f9b32.
         assert_eq!(decode_packet_number(0xa82f30ea, 0x9b32, 2), 0xa82f9b32);
+    }
+
+    /// A sender's declared `Length` (the wire varint `parse_long_header`
+    /// reads into `pn_plus_payload_len`) and the packet-number length
+    /// `unprotect_header` decodes from the *unprotected* first byte come
+    /// from independent parts of the packet. Nothing checked them against
+    /// each other, so a `Length` shorter than the packet-number field put
+    /// `payload_end` before `payload_start` and panicked the slice in
+    /// `decrypt_payload` on one crafted Initial packet.
+    #[test]
+    fn decrypt_payload_rejects_length_shorter_than_packet_number() {
+        let dcid = hex_to_bytes("8394c8f03e515708");
+        let keys = derive_initial_keys(&dcid, QuicVersion::V1).expect("derive");
+        let header = LongHeader {
+            version_kind: Some(QuicVersion::V1),
+            type_initial: true,
+            dcid_offset: 6,
+            dcid_len: dcid.len(),
+            pn_offset: 20,
+            // Shorter than pn_len (4) below: payload_end < payload_start.
+            pn_plus_payload_len: 1,
+        };
+        let mut buf = vec![0u8; 64];
+        // Must not panic; a length this inconsistent is simply rejected.
+        assert_eq!(decrypt_payload(&mut buf, &header, &keys, 0, 4), Err(()));
+    }
+
+    /// Same field, the other way round: `Length` claims more than fits in
+    /// the buffer once the auth tag is accounted for. Still a rejection,
+    /// never a panic or an underflowed `tag_len` subtraction.
+    #[test]
+    fn decrypt_payload_rejects_length_shorter_than_tag() {
+        let dcid = hex_to_bytes("8394c8f03e515708");
+        let keys = derive_initial_keys(&dcid, QuicVersion::V1).expect("derive");
+        let header = LongHeader {
+            version_kind: Some(QuicVersion::V1),
+            type_initial: true,
+            dcid_offset: 6,
+            dcid_len: dcid.len(),
+            pn_offset: 20,
+            // pn_len (1) + 10 bytes of "payload" is short of the 16-byte tag.
+            pn_plus_payload_len: 11,
+        };
+        let mut buf = vec![0u8; 64];
+        assert_eq!(decrypt_payload(&mut buf, &header, &keys, 0, 1), Err(()));
+    }
+
+    /// A CRYPTO frame's `offset` is a 62-bit varint the sender chooses.
+    /// `offset + length` used directly as a `Vec::resize` target is a
+    /// multi-exabyte allocation from a handful of packet bytes, and
+    /// `resize`'s allocator failure aborts the process rather than
+    /// returning an error — this must be rejected before the resize.
+    #[test]
+    fn reassemble_crypto_rejects_offset_past_the_ceiling() {
+        // CRYPTO frame (type 0x06), offset = 2^40 (varint, 8-byte form),
+        // length = 1, one data byte. `read_varint`'s 8-byte encoding needs
+        // the top two bits set (0xC0) on the first byte.
+        let mut plaintext = vec![0x06];
+        let offset: u64 = 1 << 40;
+        plaintext.extend_from_slice(&(offset | (0xC0u64 << 56)).to_be_bytes());
+        plaintext.push(0x01); // length = 1 (1-byte varint)
+        plaintext.push(0xAA); // the one data byte
+        assert_eq!(reassemble_crypto(&plaintext), Err(()));
+    }
+
+    /// The varint format caps `offset` at 62 bits, so `offset + length`
+    /// cannot overflow `u64` in practice — but the largest representable
+    /// offset must still be rejected by the ceiling check, and
+    /// `checked_add` (rather than a bare `+`) stays as the belt-and-braces
+    /// guard in case that format assumption ever changes.
+    #[test]
+    fn reassemble_crypto_rejects_the_largest_representable_offset() {
+        let mut plaintext = vec![0x06];
+        // Largest 8-byte varint value: top two bits 11, remaining 62 bits set.
+        plaintext.extend_from_slice(&(u64::MAX >> 2 | (0xC0u64 << 56)).to_be_bytes());
+        plaintext.push(0x01);
+        plaintext.push(0xAA);
+        assert_eq!(reassemble_crypto(&plaintext), Err(()));
+    }
+
+    #[test]
+    fn reassemble_crypto_accepts_offset_within_the_ceiling() {
+        // A real single-packet ClientHello: offset 0, well under the cap.
+        let mut plaintext = vec![0x06, 0x00]; // CRYPTO, offset 0
+        plaintext.push(0x03); // length = 3
+        plaintext.extend_from_slice(b"abc");
+        assert_eq!(reassemble_crypto(&plaintext), Ok(b"abc".to_vec()));
     }
 }

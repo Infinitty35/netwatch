@@ -475,7 +475,7 @@ pub struct DiagnoseState {
     /// Apply steps beyond it are hidden rather than offered and then refused.
     pub capability: crate::diagnose::issue::Capability,
     /// Transient line under the panels: export path, applied confirmation, or
-    /// what startup reconciliation had to undo.
+    /// what startup recovery inspection found.
     pub status: Option<String>,
     /// An apply step awaiting confirmation, as `(issue id, step key)`.
     /// Nothing touches the host until the user answers this.
@@ -500,10 +500,7 @@ impl DiagnoseState {
                 fingerprint,
             ),
             sampler: crate::diagnose::live::LiveSampler::new(),
-            journal: crate::diagnose::remediation::Journal::load(
-                crate::diagnose::remediation::Journal::default_path(),
-                &crate::diagnose::remediation::RealHost,
-            ),
+            journal: crate::diagnose::remediation::Journal::load_live(),
             selected: 0,
             show_report: false,
             capability: detect_capability(),
@@ -744,7 +741,11 @@ impl App {
             capture_interface,
             bpf_filter_active,
             incident_recorder: IncidentRecorder::new(),
-            geo_cache: GeoCache::with_mmdb(&user_config.geoip_db, &user_config.geoip_asn_db),
+            geo_cache: GeoCache::with_mmdb_and_online(
+                &user_config.geoip_db,
+                &user_config.geoip_asn_db,
+                user_config.geoip_online,
+            ),
             whois_cache: WhoisCache::new(),
             traceroute_runner: TracerouteRunner::new(),
             connection_timeline: ConnectionTimeline::new(),
@@ -782,7 +783,7 @@ impl App {
     /// Start persistent workers through their policy entry boundaries.
     /// Capture opens its resource before entering; the SDK source stays disabled
     /// under sandbox policy because its internal reader has no entry hook.
-    fn start_workers(&mut self) {
+    pub(crate) fn start_workers(&mut self) {
         if self.workers_started {
             return;
         }
@@ -904,33 +905,28 @@ impl App {
         }
     }
 
-    /// Undo anything a previous netwatch left behind, before the UI draws.
-    ///
-    /// A run that was killed can't revert its own changes, so the next run
-    /// does it. Without this, "netwatch reverts on quit" is a promise that
-    /// breaks exactly when it matters most.
-    pub fn reconcile_remediations(&mut self) {
-        let mut host = crate::diagnose::remediation::RealHost;
-        self.diagnose.journal = crate::diagnose::remediation::Journal::load(
-            crate::diagnose::remediation::Journal::default_path(),
-            &host,
-        );
-        let outcome = self.diagnose.journal.reconcile(&mut host);
-        if let Some(summary) = outcome.summary() {
-            tracing::info!("remediation reconciliation: {summary}");
-            self.diagnose.set_status(summary);
+    /// Inspect recovery metadata without trusting legacy target paths or PIDs.
+    pub fn inspect_remediations(
+        &mut self,
+        authority: crate::diagnose::remediation::RecoveryAuthority,
+    ) {
+        let outcome = self.diagnose.journal.inspect_recovery(authority);
+        for detail in &outcome.abandoned {
+            tracing::warn!("remediation recovery: {detail}");
+        }
+        if let Some(reason) = self.diagnose.journal.blocked_reason().map(str::to_owned) {
+            self.diagnose.set_status(reason);
         }
     }
 
-    /// Revert this session's remediations and flush the baselines. Best
-    /// effort — anything that fails here is picked up by the next run's
-    /// reconciliation pass.
+    /// No automatic rollback authority exists for legacy entries. Preserve them
+    /// on shutdown too, including entries whose old PID matches this process.
     pub fn shutdown_diagnose(&mut self) {
-        let mut host = crate::diagnose::remediation::RealHost;
-        let outcome = self.diagnose.journal.revert_session(&mut host);
-        for msg in outcome.abandoned {
-            tracing::warn!("could not revert on quit: {msg}");
+        self.diagnose.pending_apply = None;
+        if self.diagnose.is_demo() {
+            return;
         }
+        self.inspect_remediations(crate::diagnose::remediation::RecoveryAuthority::InspectOnly);
         let path = crate::diagnose::baseline::BaselineStore::default_path();
         let _ = self.diagnose.baselines.save(&path);
     }
@@ -1703,20 +1699,16 @@ pub async fn run<B: Backend>(
     demo: bool,
 ) -> Result<()> {
     let mut app = App::prepare();
-    crate::sandbox::worker::ensure(
+    crate::runtime::bootstrap::start(
+        &mut app,
+        if demo {
+            crate::runtime::bootstrap::SessionKind::Demo
+        } else {
+            crate::runtime::bootstrap::SessionKind::Tui
+        },
         sandbox_mode,
-        crate::sandbox::SandboxPaths::from_config(&app.user_config),
-    )
-    .map_err(anyhow::Error::msg)?;
-    app.start_workers();
-    if let Err(error) = crate::sandbox::worker::wait_ready(std::time::Duration::from_secs(5)) {
-        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) {
-            anyhow::bail!("worker startup: {error}");
-        }
-        tracing::warn!(%error, "worker readiness incomplete");
-    }
+    )?;
     if demo {
-        app.diagnose.enter_demo_mode();
         // Live capture needs CAP_NET_RAW, so without a recorded conversation
         // the packets tab is blank in the demo — on the machines most likely
         // to be running it.
@@ -1734,49 +1726,11 @@ pub async fn run<B: Backend>(
         app.user_config.view = v.name().to_string();
     }
 
-    // Undo anything a previous run left on the host before the sandbox goes
-    // up — reverting a resolv.conf edit needs write access the sandbox is
-    // about to take away, and it needs to happen before the first frame so a
-    // user never sees a screen shaped by a change they didn't ask for.
-    app.reconcile_remediations();
-
-    // Apply the calling-thread sandbox after requesting worker startup.
-    // Capture resource opening is asynchronous; readiness and existing-worker
-    // enforcement remain PR05 work. Strict mode aborts on reported warnings.
-    {
-        let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
-        let report = crate::sandbox::apply(sandbox_mode, &paths);
-        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) && !report.mode.warnings.is_empty()
-        {
-            anyhow::bail!(
-                "sandbox: strict mode could not be enforced: {}",
-                report.mode.warnings.join("; ")
-            );
-        }
-        for w in &report.mode.warnings {
-            tracing::warn!(target: "netwatch::sandbox", "{w}");
-        }
-        tracing::info!(
-            target: "netwatch::sandbox",
-            summary = %report.summary(),
-            "sandbox applied"
-        );
-        app.sandbox_report = report;
-    }
-
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
     let mut events = EventHandler::start(tick_rate);
 
     // Initial data collection
-    app.traffic.update();
-    app.connection_collector.update();
-    {
-        let conns = app.connection_collector.connections();
-        app.connection_timeline.update(&conns);
-    }
-    let gateway = app.config_collector.config.gateway.clone();
-    let dns = app.config_collector.config.primary_dns();
-    app.health_prober.probe(gateway.as_deref(), dns.as_deref());
+    crate::runtime::bootstrap::prime_collectors(&mut app);
     // Kick off a one-shot traceroute so the topology view's ISP gateway hop
     // is populated without requiring the user to press T first.
     app.traceroute_runner.run("1.1.1.1");
@@ -1856,10 +1810,7 @@ pub async fn run<B: Backend>(
                 if handle_key(&mut app, key) {
                     app.packet_collector.stop_capture();
                     app.egress_profiler.persist_now();
-                    // Put back anything this session changed on the host, and
-                    // flush the baselines it learned. A run that is killed
-                    // instead of quit is covered by the next run's
-                    // reconciliation pass.
+                    // Preserve unresolved legacy recovery and save live baselines.
                     app.shutdown_diagnose();
                     return Ok(());
                 }
@@ -1954,49 +1905,16 @@ pub async fn run_headless(
     install_collector_panic_flag();
 
     let mut app = App::prepare();
-    crate::sandbox::worker::ensure(
+    crate::runtime::bootstrap::start(
+        &mut app,
+        crate::runtime::bootstrap::SessionKind::Daemon,
         sandbox_mode,
-        crate::sandbox::SandboxPaths::from_config(&app.user_config),
-    )
-    .map_err(anyhow::Error::msg)?;
-    app.start_workers();
-    if let Err(error) = crate::sandbox::worker::wait_ready(std::time::Duration::from_secs(5)) {
-        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) {
-            anyhow::bail!("worker startup: {error}");
-        }
-        tracing::warn!(%error, "worker readiness incomplete");
-    }
-
-    // Same boundary as the TUI: worker starts requested, then calling-thread
-    // sandbox application. This is not a worker readiness/enforcement barrier.
-    {
-        let paths = crate::sandbox::SandboxPaths::from_config(&app.user_config);
-        let report = crate::sandbox::apply(sandbox_mode, &paths);
-        if matches!(sandbox_mode, crate::sandbox::Mode::Strict) && !report.mode.warnings.is_empty()
-        {
-            anyhow::bail!(
-                "sandbox: strict mode could not be enforced: {}",
-                report.mode.warnings.join("; ")
-            );
-        }
-        for w in &report.mode.warnings {
-            tracing::warn!(target: "netwatch::sandbox", "{w}");
-        }
-        app.sandbox_report = report;
-    }
+    )?;
 
     let tick_rate = app.user_config.refresh_rate_ms.clamp(100, 5000);
 
     // Prime the collectors so the first published snapshot isn't empty.
-    app.traffic.update();
-    app.connection_collector.update();
-    {
-        let conns = app.connection_collector.connections();
-        app.connection_timeline.update(&conns);
-    }
-    let gateway = app.config_collector.config.gateway.clone();
-    let dns = app.config_collector.config.primary_dns();
-    app.health_prober.probe(gateway.as_deref(), dns.as_deref());
+    crate::runtime::bootstrap::prime_collectors(&mut app);
 
     tracing::info!(
         target: "netwatch::daemon",
@@ -4961,7 +4879,7 @@ fn apply_pending_remediation(app: &mut App) {
     let reason = app.diagnose.journal.blocked_reason().map(str::to_owned)
         .unwrap_or_else(|| match action {
             crate::diagnose::issue::Action::SetResolver { .. } =>
-                "automatic resolver changes are unavailable until durable recovery and a supported resolver adapter are available; follow the manual steps".into(),
+                format!("{}; automatic TUI edits are unavailable; follow the manual steps or inspect with netwatch resolver status", crate::diagnose::remediation::resolver::ownership().map(|o| o.description().to_owned()).unwrap_or_else(|e| format!("resolver ownership unavailable: {e}"))),
             _ => "netwatch cannot perform this step itself".into(),
         });
     app.diagnose.set_status(format!("not applied · {reason}"));

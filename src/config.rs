@@ -31,11 +31,18 @@ pub struct NetwatchConfig {
     pub bpf_filter: String,
 
     /// Path to MaxMind GeoLite2-City or GeoLite2-Country .mmdb file
-    /// (empty = fall back to online ip-api.com lookups)
+    /// (empty = no offline lookups; see `geoip_online` for the fallback)
     pub geoip_db: String,
 
     /// Path to MaxMind GeoLite2-ASN .mmdb file (optional, for AS numbers)
     pub geoip_asn_db: String,
+
+    /// Allow falling back to ip-api.com when no local `geoip_db` is
+    /// configured. Off by default: without an mmdb, enabling this sends
+    /// every public peer IP a connection or packet touches to a third
+    /// party, in cleartext HTTP, with no per-host opt-out. Install a
+    /// MaxMind database for offline lookups, or opt into this explicitly.
+    pub geoip_online: bool,
 
     /// Network intelligence alert settings
     pub alerts: AlertConfig,
@@ -168,6 +175,7 @@ impl Default for NetwatchConfig {
             bpf_filter: String::new(),
             geoip_db: String::new(),
             geoip_asn_db: String::new(),
+            geoip_online: false,
             alerts: AlertConfig::default(),
             insights_enabled: false,
             insights_model: "llama3.2".into(),
@@ -339,6 +347,7 @@ show_geo = false
             bpf_filter: "tcp port 443".into(),
             geoip_db: "/path/to/GeoLite2-City.mmdb".into(),
             geoip_asn_db: "/path/to/GeoLite2-ASN.mmdb".into(),
+            geoip_online: true,
             alerts: AlertConfig {
                 bandwidth_threshold: 50_000_000,
                 port_scan_threshold: 10,

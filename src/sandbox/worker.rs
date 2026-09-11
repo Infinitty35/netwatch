@@ -381,7 +381,10 @@ mod tests {
                 snapshot()
             );
         }
-        let geo = crate::collectors::geo::GeoCache::new();
+        // Online lookups are opt-in (off by default, see `geoip_online` in
+        // NetwatchConfig); force them on here so the geoip worker actually
+        // spawns and this test still covers its sandbox entry.
+        let geo = crate::collectors::geo::GeoCache::with_mmdb_and_online("", "", true);
         geo.start();
         let whois = crate::collectors::whois::WhoisCache::new();
         whois.start();

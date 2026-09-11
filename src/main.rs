@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         println!(
             "netwatch {} — real-time network diagnostics in your terminal\n\n\
              USAGE:\n    netwatch [OPTIONS]\n    sudo netwatch              Full mode (health probes + packet capture)\n    netwatch daemon [OPTIONS]  Headless agent (no TUI); streams to --remote\n\n\
+             RESOLVER: netwatch resolver status | set <IP> --unmanaged [--seconds 1..3600] | recover --unmanaged\n\n\
              OPTIONS:\n    --generate-config         Write a default config file and exit\n    \
              --remote <url>            Stream metrics to a NetWatch Core instance\n    \
              --api-key <key>           API key for remote streaming\n    \
@@ -55,6 +56,12 @@ fn main() -> Result<()> {
             None => println!("Config written (could not determine path)"),
         }
         return Ok(());
+    }
+
+    // Resolver authority commands never initialize capture, app workers or the
+    // parser sandbox. Their own typed CLI validates the fixed host resource.
+    if args.get(1).map(String::as_str) == Some("resolver") {
+        return netwatch::diagnose::remediation::resolver::command(&args[2..]);
     }
 
     // Everything past this point can reach libpcap, so this is where Npcap has

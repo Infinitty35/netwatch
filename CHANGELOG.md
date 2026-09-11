@@ -4,6 +4,56 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-09-12
+
+### Added
+- Explicit Linux resolver authority commands (`resolver status`, temporary `set`,
+  and `recover`) for administrator-confirmed unmanaged regular files. A shared
+  root-owned lease/store, identity/digest checks and durable records protect
+  cooperating transactions. Managed/symlink/platform adapters remain unavailable;
+  TUI/daemon automatic edits stay disabled. Privileged VM acceptance is pending.
+- Recovery store v2 in durable application state: versioned operation records,
+  UUID backups with SHA-256 verification, Unix synced atomic journal replacement,
+  and an OS-backed store lock. Live startup inspects both v2 and legacy evidence.
+  The generic per-user store does not authorize resolver changes; the Linux
+  authority command uses its own fixed shared store. Windows writes remain unavailable.
+
+### Fixed
+- TUI and daemon share recovery inspection, worker startup/readiness, sandbox
+  application and initial polling. Legacy journal entries no longer trigger
+  automatic startup/shutdown writes based on unverified paths or reused PIDs.
+  Both modes preserve unresolved recovery and report why it needs manual review.
+- Demo shutdown no longer saves simulated baselines to the host.
+- A QUIC Initial packet whose declared `Length` was shorter than the
+  packet-number field it implied crashed the capture thread on one crafted
+  datagram (start-past-end slice). A CRYPTO frame with a large declared
+  offset could abort the whole process via an unbounded `Vec::resize`. Both
+  are now rejected as unparseable instead.
+- `egress-profiles.json` (the learned process-to-destination baseline) was
+  written at umask permissions; it now matches the egress policy file next
+  to it at owner-only (`0600`).
+- **The Linux release binary now ships static-only**
+  ([#53](https://github.com/matthart1983/netwatch/issues/53)). Releases used
+  to publish two Linux x86_64/aarch64 binaries — a dynamically-linked one
+  needing the host's own libpcap, and a musl-static one bundling it — with
+  nothing on the releases page or in the README saying which to pick. A
+  minimal distro or container without libpcap preinstalled would download
+  the dynamic one (the more obviously-named of the two) and fail with
+  `libpcap.so.0.8: cannot open shared object file`, the same failure mode
+  as the long-since-fixed #8. The static build already solved this; it just
+  wasn't the only option. `netwatch-linux-x86_64` and
+  `netwatch-linux-aarch64` are now the static builds themselves — the
+  dynamic glibc targets are no longer built, and the `-static` suffix is
+  gone because there is no longer a choice to disambiguate. A download
+  script pinned to the old `-static` asset names needs the suffix dropped.
+
+### Security
+- Online GeoIP lookups (`http://ip-api.com`, used when no MaxMind database
+  is configured) are now off by default behind a new `geoip_online` config
+  key. Previously every public peer IP a connection or packet touched was
+  sent to ip-api.com in cleartext with no opt-out; install a MaxMind
+  `.mmdb`, or set `geoip_online = true`, to keep GeoIP lookups working.
+
 ## [0.31.0] - 2026-09-11
 
 ### Fixed

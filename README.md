@@ -36,7 +36,7 @@ scoop install netwatch                # Windows (needs Npcap)
 cargo install netwatch-tui            # anywhere with Rust and libpcap headers
 ```
 
-Prebuilt binaries, including static Linux builds with libpcap bundled, are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
+Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux binary is static with libpcap bundled in, so it needs nothing installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
 
 ## Run
 
@@ -51,7 +51,7 @@ netwatch --view dense # four boxes, 130x44 or larger
 
 ## What it does
 
-**Diagnose (tab `9`).** Per-metric baselines scoped to the network that taught them; readiness requires 1,800 distinct samples, so learning time depends on probe cadence. 25 catalogued rules, with 18 implemented Diagnose detectors and seven awaiting integration. Runtime coverage states which inputs are available, learning, stale, or unmeasured. A suppression graph groups a dead gateway and its consequences under one finding. Each cause is ranked by the checks that separated it from the others. Live automatic resolver changes are temporarily unavailable while durable recovery and resolver-manager support are completed; Diagnose provides manual steps. The demo still simulates apply and verified recovery. Existing journals are inspected on startup, and unreadable or corrupt recovery records block further host changes. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
+**Diagnose (tab `9`).** Per-metric baselines scoped to the network that taught them; readiness requires 1,800 distinct samples, so learning time depends on probe cadence. 25 catalogued rules, with 18 implemented Diagnose detectors and seven awaiting integration. Runtime coverage states which inputs are available, learning, stale, or unmeasured. A suppression graph groups a dead gateway and its consequences under one finding. Each cause is ranked by the checks that separated it from the others. Automatic TUI resolver changes remain unavailable; Diagnose provides manual steps. An explicit [Linux resolver command](docs/resolver-adapter.md) supports temporary changes to administrator-confirmed unmanaged regular files; managed resolvers remain unsupported. The demo still simulates apply and verified recovery. Existing journals are inspected on startup, and unreadable or corrupt recovery records block further host changes. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
 
 <p align="center">
   <img src="docs/media/demo-diagnose.gif" alt="A slow resolver at 33 times its baseline, three ranked causes, a key-bound fix, and the issue closing itself once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">

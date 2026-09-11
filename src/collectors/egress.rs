@@ -28,7 +28,6 @@ mod policy;
 // Re-exported so `collectors::egress::EgressPolicy` (and friends) keep
 // resolving for every existing caller — the split is an internal
 // reorganisation, not an API change.
-#[cfg(test)]
 use policy::write_owner_only;
 pub use policy::{
     default_policy_path, load_policy_file, merge_rules_into_policy_file,
@@ -1064,7 +1063,11 @@ impl EgressProfiler {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, body)
+        // Owner-only: this is a per-process history of every remote host and
+        // SNI a local program has talked to, which is exactly the kind of
+        // file the policy store next to it (`write_owner_only`) already
+        // treats as sensitive. `std::fs::write` alone leaves it at umask.
+        write_owner_only(path, body.as_bytes())
     }
 
     /// Merge a persisted baseline from `path` into the profiler, dropping
@@ -1660,6 +1663,30 @@ mod tests {
             .unwrap();
         assert_eq!(dest.count, 1);
         assert_eq!(dest.asn_org.as_deref(), Some("Google LLC"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_profiles_are_owner_only() {
+        // A process-to-host history is as sensitive as the egress policy
+        // next to it, which already enforces 0600 (see policy.rs).
+        use std::os::unix::fs::PermissionsExt;
+        let path = scratch("profiles-perms.json");
+        let mut p = EgressProfiler::new();
+        p.record(
+            "chrome",
+            "142.250.1.1",
+            443,
+            sni("www.google.com"),
+            Some("Google LLC".into()),
+            SystemTime::now(),
+        );
+        p.save_profiles(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "egress-profiles.json must not be group/world readable"
+        );
     }
 
     #[test]

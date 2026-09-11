@@ -114,6 +114,10 @@ pub struct GeoCache {
     mmdb: Arc<Option<MaxMindReader>>,
     online_tx: std_mpsc::Sender<String>,
     pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
+    /// Opt-in: without it, an IP with no offline DB hit simply has no geo
+    /// info rather than being sent to ip-api.com. See `geoip_online` in
+    /// `NetwatchConfig` for why this defaults to off.
+    online_enabled: bool,
 }
 
 impl Default for GeoCache {
@@ -123,11 +127,19 @@ impl Default for GeoCache {
 }
 
 impl GeoCache {
+    /// No offline DB, no online fallback — used by tests and any caller
+    /// that hasn't opted into `geoip_online`.
     pub fn new() -> Self {
         Self::with_mmdb("", "")
     }
 
+    /// No online fallback. Prefer `with_mmdb_and_online` when wiring up a
+    /// real config that may have `geoip_online` set.
     pub fn with_mmdb(city_path: &str, asn_path: &str) -> Self {
+        Self::with_mmdb_and_online(city_path, asn_path, false)
+    }
+
+    pub fn with_mmdb_and_online(city_path: &str, asn_path: &str, online_enabled: bool) -> Self {
         let reader = MaxMindReader::open(city_path, asn_path);
         let has_db = reader.city_reader.is_some();
         let mmdb = Arc::new(if has_db { Some(reader) } else { None });
@@ -136,6 +148,7 @@ impl GeoCache {
         let cache = Arc::new(Mutex::new(HashMap::new()));
 
         Self {
+            online_enabled,
             cache,
             mmdb,
             online_tx: tx,
@@ -149,6 +162,13 @@ impl GeoCache {
         let Some(rx) = self.pending_rx.lock().unwrap().take() else {
             return false;
         };
+        if !self.online_enabled {
+            // `lookup()` never sends on this channel when online lookups are
+            // disabled, so there is nothing for a worker to do — `rx` drops
+            // here. `pending_rx` was still taken above, so a second `start()`
+            // call correctly reports "already started" either way.
+            return true;
+        }
         let resolver_cache = Arc::clone(&self.cache);
 
         // Online fallback thread (ip-api.com) — only needed without a local DB
@@ -223,7 +243,12 @@ impl GeoCache {
             }
         }
 
-        // Fall back to online lookup (async via background thread)
+        // Fall back to online lookup (async via background thread) — opt-in
+        // only. Without a local DB and without this, an IP just has no geo
+        // info rather than being sent to ip-api.com.
+        if !self.online_enabled {
+            return None;
+        }
         let mut cache = self.cache.lock().unwrap();
         cache.insert(ip.to_string(), GeoEntry::Pending);
         if let Err(e) = self.online_tx.send(ip.to_string()) {
@@ -396,8 +421,51 @@ mod tests {
     #[test]
     fn geocache_no_db_returns_none_first_call() {
         let cache = GeoCache::new();
-        // Without a DB, first call queues online lookup, returns None
+        // No DB and online lookups off (the default): nothing is queued,
+        // this just returns None.
         assert!(cache.lookup("8.8.8.8").is_none());
+        assert!(cache
+            .pending_rx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .try_recv()
+            .is_err());
+    }
+
+    #[test]
+    fn geocache_online_disabled_by_default_does_not_queue() {
+        // Same IP, both constructors: without opting in, ip-api.com never
+        // sees a request queued for it.
+        for cache in [GeoCache::new(), GeoCache::with_mmdb("", "")] {
+            assert!(cache.lookup("8.8.8.8").is_none());
+            assert!(cache
+                .pending_rx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn geocache_online_opt_in_queues_the_lookup() {
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
+        assert!(cache.lookup("8.8.8.8").is_none());
+        assert_eq!(
+            cache
+                .pending_rx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_recv()
+                .unwrap(),
+            "8.8.8.8"
+        );
     }
 
     #[test]
@@ -427,7 +495,9 @@ mod lifecycle_tests {
 
     #[test]
     fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
-        let cache = GeoCache::new();
+        // Online lookups must be opted into for this to exercise the
+        // worker-sharing path at all (see geo.rs's `online_enabled` gate).
+        let cache = GeoCache::with_mmdb_and_online("", "", true);
         cache.lookup("192.0.2.1");
         assert_eq!(
             cache

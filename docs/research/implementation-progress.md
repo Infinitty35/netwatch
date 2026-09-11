@@ -1,5 +1,10 @@
 # Netwatch implementation progress
 
+Release update: PR01–PR05 core and the RTT timeline fixes shipped in **v0.31.0**
+(`805cf71`). CI passed on Linux, macOS and Windows. The dated entries below retain
+their original implementation-stage status; PR05 privileged/interactive acceptance
+remains pending despite release. Current work continues with PR06 below.
+
 ## PR01 — Initial remediation corrections
 
 Implemented locally on 11 September 2026 against `9b4597e`; not committed or published.
@@ -189,3 +194,126 @@ release or expanding the confinement claim.
 
 Next implementation slice is PR06 (common bootstrap and explicit recovery
 authority); PR05's outstanding acceptance gates must remain tracked alongside it.
+
+
+## PR06 — Common bootstrap and explicit recovery authority
+
+Implemented locally after v0.31.0; not committed or released.
+
+- TUI and daemon now share `runtime::bootstrap::start`: recovery inspection,
+  worker startup/readiness and calling-thread confinement. Initial traffic,
+  connection and health polling also use a common function.
+- Live authority is explicitly `InspectOnly`. Legacy journal PID/path metadata
+  does not establish ownership, so there are no eligible automatic rollbacks.
+  Inspection does not open target/backup paths or mutate the journal. Unresolved
+  temporary entries block subsequent writes and retain persistent UI/report
+  warnings; daemon startup logs the same recovery details.
+- Shutdown cancels pending applies and preserves legacy records even when an old
+  PID matches the current process. Root and `--no-sandbox` do not enable rollback.
+- Demo bootstrap skips recovery; demo shutdown also skips baseline persistence,
+  preventing scenario data from replacing learned host baselines.
+- Static CLI paths remain outside live bootstrap. Help/version leave application
+  state untouched; config generation writes its requested config only.
+
+Validation: **995 tests passed, 3 ignored**. New fake-host regressions cover both
+live entry-point authorities, reused/dead PIDs, preservation of targets/backups/
+journal bytes through later rollback attempts, corruption and permanent records.
+CLI subprocess checks used isolated Linux HOME/XDG directories and verified
+help/version/config-generation behavior against a synthetic corrupt journal.
+Clippy with warnings denied, normal build, no-default-features check, formatting
+and diff checks passed. No real resolver was edited. New cross-platform runtime
+acceptance was not performed in this slice.
+
+Next: **PR07 — Durable journal v2 and locking**, followed by PR08 resolver adapters.
+The legacy low-level library transaction APIs remain available for explicit callers
+and tests; no durable recovery or privileged helper is claimed here. PR05's
+privileged capture/restart and interactive platform acceptance remains outstanding.
+
+## PR07 — Recovery journal v2 and store locking
+
+Storage core implemented locally after PR06; not committed or released. Platform
+and resolver-authority limits below remain tracked acceptance work.
+
+- Added version-2 records in durable state (`netwatch/recovery-v2`), with operation
+  and session UUIDs, owner process/UID metadata, available Linux boot/start tokens,
+  resource identity, timestamps, original/installed SHA-256 and explicit states.
+- Unix writes hold an OS-backed exclusive store lock from load through updates.
+  Backups use exclusive UUID filenames and are synced before Prepared publication.
+  Journal updates use a unique temporary file, complete write, file sync, atomic
+  same-directory rename and directory sync. Persistence errors poison the writer.
+- Directory-relative file descriptors pin operations; private ownership/permissions,
+  regular files, no symlinks and no extra hardlinks are checked. Backup reads derive
+  names from UUIDs and verify digests. Unknown/corrupt records remain untouched.
+- State transitions reject different recorded owners, invalid/terminal transitions
+  and duplicate unresolved resources. No target file is ever opened by this store.
+- Live startup discovers v2 and legacy evidence together. Observation creates no
+  store and performs no migration. Corruption and unresolved v2 operations appear
+  in the existing persistent recovery warnings/report and daemon logs.
+
+Validation: **1003 tests passed, 3 ignored**. Tests include competing processes,
+SIGKILL at eight partial-write/sync/rename boundaries, lock release after death,
+old-or-new complete snapshots, verified referenced backups, injected persistence
+failures, ownership/state checks, backup non-reuse, corruption/unknown versions,
+backup tampering, symlink/hardlink and directory replacement, and combined live
+legacy/v2 discovery. Clippy with warnings denied, no-default-features checking,
+formatting and diff checks passed. Tests used synthetic files, not a real resolver.
+
+Limits: the per-store lock is not a host-wide resolver lease; PR08 must implement
+that at the authorized adapter boundary. Recorded owner equality does not authorize
+recovery from untrusted metadata. Windows writes remain unavailable pending a
+validated platform backend; macOS runtime validation is outstanding. Process-crash
+tests do not demonstrate hardware power-loss durability or network-filesystem
+semantics. Orphan evidence is retained, with no automatic garbage collection.
+See [the store contract](../recovery-store.md).
+
+Next implementation: **PR08 — Resolver adapter and resource authority**, while
+retaining PR05/PR07 platform and privileged acceptance work. Automatic host changes
+remain disabled until those authority and recovery conditions are met.
+
+
+## PR08 — Linux unmanaged-file resolver authority and rollback
+
+Implemented locally after PR07; not committed or released. Privileged disposable-VM
+acceptance remains pending; managed/platform adapters are explicitly unavailable.
+
+- Added typed `resolver status`, temporary `set <IP> --unmanaged [--seconds N]`,
+  and `recover --unmanaged` commands before runtime/Npcap/application startup.
+  Mutation commands require root, use fixed paths and accept no arbitrary shell,
+  target, backup or journal arguments. Lifetime is bounded to 1–3600 seconds.
+- Conservative ownership detection distinguishes systemd-resolved, NetworkManager,
+  generated/managed files, symlinks and unconfirmed regular files. Administrator
+  confirmation is mandatory; plain-file appearance alone is not ownership proof.
+- The root-owned `/var/lib/netwatch/resolver-v2` store provides one cooperating
+  resource lease across invoking users, retained for the entire temporary change.
+  Root-owned directory ancestry and target identity/permissions are validated.
+  User recovery journals are never promoted into privileged authority.
+- Durable preparation precedes descriptor-based file mutation; sync/readback
+  precedes Applied. Verified original bytes/identity are required for restoration.
+  External edits, inode changes, invalid backups and partial writes preserve
+  evidence instead of speculative rollback. Completion failures remain explicit.
+- SIGINT/SIGTERM and the deadline restore a verified temporary change. SIGKILL
+  leaves discoverable records for the explicit recovery command. Process ownership
+  includes boot/start tokens and PID namespace; missing/cross-namespace identity
+  is unknown. Automatic TUI/daemon edits and startup rollback remain disabled.
+- Shared startup reports the authority store alongside legacy/per-user v2 evidence.
+  Read-only status creates no store. File verification is explicitly distinguished
+  from effective system DNS resolution, which this adapter does not prove.
+
+Validation: **1013 tests passed, 3 ignored**. Ten added tests cover command/type
+validation, ownership detection, temporary apply/restore with identity/permissions
+preservation, resource contention, external/symlink/inode changes, invalid backups,
+partial target writes, journal completion failure, process identity, and child
+SIGKILL at Prepared/target-sync/Applied/restored boundaries followed by recovery.
+All mutation tests used disposable files. The actual read-only status command
+identified systemd-resolved on this host and no authority journal; no real resolver
+was modified. Clippy, normal build, no-default-features checking, formatting and
+diff checks passed.
+
+Limits: no privileged VM/network-namespace or actual unmanaged-host validation has
+been performed. The lease excludes cooperating Netwatch commands, not arbitrary
+root writers. In-place updates are not atomic to DNS readers. Managed resolvers,
+macOS/Windows apply, permanent changes and effective system-DNS verification remain
+unavailable. See [the adapter contract](../resolver-adapter.md).
+
+Next implementation: **PR09 — Unified capability snapshot, CLI and doctor**, while
+retaining the outstanding PR05/07/08 privileged and platform acceptance work.

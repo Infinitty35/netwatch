@@ -1,24 +1,20 @@
 //! Applying and un-applying remediations.
 //!
-//! ## Why there is a journal
+//! Live TUI and daemon bootstrap use [`Journal::inspect_recovery`] with explicit
+//! [`RecoveryAuthority::InspectOnly`]. Legacy entries do not establish trusted
+//! ownership or resolver authority, so the application never executes their paths
+//! at startup or shutdown. Unresolved metadata and backup locations are preserved
+//! for manual review. Automatic TUI apply actions remain disabled; the explicit
+//! Linux resolver command uses its own fixed root-owned authority store.
 //!
-//! "netwatch writes resolv.conf, keeps a backup, and reverts on quit" is only
-//! true if netwatch gets to quit. `SIGKILL`, a panic in the render loop, an
-//! OOM kill, or a laptop losing power all leave the host's resolver pointing
-//! wherever netwatch put it, with a backup file nobody will ever restore. A
-//! diagnostic tool that can silently and permanently reconfigure DNS is worse
-//! than one that never offered to.
-//!
-//! So the order is: **journal first, mutate second.** Before touching a file,
-//! [`Journal::apply_file_edit`] writes an entry naming the target, the backup, and the
-//! value we are about to install. On startup [`Journal::reconcile`] reads that
-//! file back, and anything still open belongs to a process that did not exit
-//! cleanly — it is reverted before the UI is drawn, and reported.
-//!
-//! The revert is conservative: if the target's current contents no longer
-//! match what netwatch installed, something else has edited it since, and the
-//! entry is abandoned (backup kept, loudly reported) rather than stomping a
-//! third party's change.
+//! The legacy apply/reconcile APIs remain for transaction tests and explicit
+//! library callers. They journal before mutation and compare installed contents
+//! before reverting, but do not provide durable storage, trustworthy PID identity,
+//! cross-process exclusion or path validation. They are not the live bootstrap's
+//! authorized recovery mechanism.
+
+pub mod resolver;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -154,6 +150,14 @@ impl Host for RealHost {
     }
 }
 
+/// Authority granted by the live bootstrap, independent of UID or sandbox mode.
+/// Legacy journals have no verifiable ownership or supported resolver adapter,
+/// so no automatic write authority is available yet.
+#[derive(Clone, Copy, Debug)]
+pub enum RecoveryAuthority {
+    InspectOnly,
+}
+
 pub struct Journal {
     path: PathBuf,
     entries: Vec<JournalEntry>,
@@ -205,8 +209,80 @@ impl Journal {
         journal
     }
 
+    /// Inspect both formats without migrating or rewriting legacy evidence.
+    pub fn load_live() -> Self {
+        let mut journal =
+            Self::load_with_store(Self::default_path(), &RealHost, store::default_directory());
+        if let Some(notice) = resolver::authority_notice() {
+            journal.inspect_recovery(RecoveryAuthority::InspectOnly);
+            journal.blocked = Some(match journal.blocked.take() {
+                Some(other) => format!("{other}; {notice}"),
+                None => notice,
+            });
+        }
+        journal
+    }
+
+    fn load_with_store<H: Host>(legacy: PathBuf, host: &H, durable: Option<PathBuf>) -> Self {
+        let mut journal = Self::load(legacy, host);
+        let warning = match durable {
+            None => Some("cannot determine durable recovery state directory".to_owned()),
+            Some(directory) => match store::inspect(&directory) {
+                Ok(None) => None,
+                Ok(Some(snapshot)) => {
+                    let pending: Vec<String> = snapshot.operations.iter()
+                        .filter(|o| o.state.unresolved())
+                        .map(|o| format!("{} ({:?}); backup: {} (unverified)", o.id, o.state, directory.join(o.backup_name()).display()))
+                        .collect();
+                    (!pending.is_empty()).then(|| format!(
+                        "recovery-v2 requires adapter/ownership verification; journal: {}; operations: {}",
+                        directory.join("journal.json").display(), pending.join("; ")
+                    ))
+                }
+                Err(error) => Some(format!("cannot inspect recovery-v2 at {}: {error}; evidence preserved; host changes blocked", directory.display())),
+            },
+        };
+        if let Some(warning) = warning {
+            // Include legacy unresolved metadata alongside v2 diagnostics. No
+            // supplied target or backup is opened by this inspection.
+            journal.inspect_recovery(RecoveryAuthority::InspectOnly);
+            journal.blocked = Some(match journal.blocked.take() {
+                Some(legacy) => format!("{legacy}; {warning}"),
+                None => warning,
+            });
+        }
+        journal
+    }
+
     pub fn blocked_reason(&self) -> Option<&str> {
         self.blocked.as_deref()
+    }
+
+    /// Inspect legacy metadata without reading or writing journal-supplied paths.
+    /// Preserve unresolved entries and prevent shutdown/PID reuse from turning
+    /// them into this session's operations. Root and --no-sandbox are not consent.
+    pub fn inspect_recovery(&mut self, authority: RecoveryAuthority) -> Reconciliation {
+        match authority {
+            RecoveryAuthority::InspectOnly => {}
+        }
+        let mut outcome = Reconciliation::default();
+        if let Some(reason) = &self.blocked {
+            outcome.abandoned.push(reason.clone());
+            return outcome;
+        }
+        for entry in self.open_entries().filter(|entry| !entry.permanent) {
+            outcome.abandoned.push(format!(
+                "recovery required for {}: legacy ownership and resolver authority are unverified; \
+                 automatic rollback disabled; journal: {}; backup: {} (unverified)",
+                entry.issue_id,
+                self.path.display(),
+                entry.backup.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".into())
+            ));
+        }
+        if !outcome.abandoned.is_empty() {
+            self.blocked = Some(outcome.abandoned.join("; "));
+        }
+        outcome
     }
 
     fn ensure_writable(&self) -> std::io::Result<()> {
@@ -591,6 +667,111 @@ mod tests {
                 first_nameserver,
             )
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_load_discovers_both_formats_without_changing_either() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root =
+            std::env::temp_dir().join(format!("netwatch-live-journal-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let directory = root.join("recovery-v2");
+        let mut durable = store::Store::open(&directory).unwrap();
+        let id = durable
+            .prepare(
+                "new issue".into(),
+                store::Owner::current(),
+                store::Resource {
+                    adapter: store::Adapter::UnmanagedFile,
+                    target: "/synthetic/resolver".into(),
+                    device: 1,
+                    inode: 2,
+                },
+                b"original",
+                b"installed",
+            )
+            .unwrap();
+        drop(durable);
+        let journal_bytes = std::fs::read(directory.join("journal.json")).unwrap();
+        let mut host = FakeHost::new(41);
+        host.files.insert(TARGET.into(), RESOLV.into());
+        let mut legacy = Journal::new(journal_path());
+        apply_resolver(&mut host, &mut legacy, "1.1.1.1");
+        let before = host.files.clone();
+        let live = Journal::load_with_store(journal_path(), &host, Some(directory.clone()));
+        let warning = live.blocked_reason().unwrap();
+        assert!(warning.contains(&id.to_string()));
+        assert!(warning.contains("legacy ownership"));
+        assert_eq!(live.open_entries().count(), 1);
+        assert_eq!(host.files, before);
+        assert_eq!(
+            std::fs::read(directory.join("journal.json")).unwrap(),
+            journal_bytes
+        );
+        std::fs::write(directory.join("journal.json"), b"corrupt-v2").unwrap();
+        let corrupt = Journal::load_with_store(journal_path(), &host, Some(directory.clone()));
+        assert!(corrupt
+            .blocked_reason()
+            .unwrap()
+            .contains("cannot inspect recovery-v2"));
+        assert_eq!(
+            std::fs::read(directory.join("journal.json")).unwrap(),
+            b"corrupt-v2"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_bootstrap_preserves_legacy_operations_regardless_of_pid() {
+        use crate::runtime::bootstrap::SessionKind;
+        for kind in [SessionKind::Tui, SessionKind::Daemon] {
+            for current_pid in [41, 42] {
+                let mut host = FakeHost::new(41);
+                host.files.insert(TARGET.into(), RESOLV.into());
+                let mut journal = Journal::new(journal_path());
+                apply_resolver(&mut host, &mut journal, "1.1.1.1");
+                let before = host.files.clone();
+                host.pid = current_pid;
+                host.alive.clear();
+                host.writes = 0;
+                let mut restarted = Journal::load(journal_path(), &host);
+                let outcome = restarted.inspect_recovery(kind.recovery_authority().unwrap());
+                assert_eq!(outcome.abandoned.len(), 1);
+                assert!(outcome.reverted.is_empty());
+                assert!(restarted.blocked_reason().unwrap().contains("unverified"));
+                // Even an accidental later legacy rollback call is blocked.
+                restarted.revert_session(&mut host);
+                restarted.reconcile(&mut host);
+                assert_eq!(host.writes, 0);
+                assert_eq!(host.files, before);
+                assert_eq!(restarted.open_entries().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_inspection_preserves_corrupt_and_permanent_history() {
+        let mut host = FakeHost::new(41);
+        host.files.insert(journal_path(), "invalid journal".into());
+        let mut journal = Journal::load(journal_path(), &host);
+        assert!(!journal
+            .inspect_recovery(RecoveryAuthority::InspectOnly)
+            .is_empty());
+        assert_eq!(host.read(&journal_path()).unwrap(), "invalid journal");
+        host.files.clear();
+        host.files.insert(TARGET.into(), RESOLV.into());
+        let mut journal = Journal::new(journal_path());
+        apply_resolver(&mut host, &mut journal, "1.1.1.1");
+        journal.make_permanent(&mut host, "2026-0903-01").unwrap();
+        let before = host.files.clone();
+        assert!(journal
+            .inspect_recovery(RecoveryAuthority::InspectOnly)
+            .is_empty());
+        assert_eq!(host.files, before);
     }
 
     #[test]

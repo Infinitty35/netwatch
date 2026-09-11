@@ -402,7 +402,8 @@ impl Capability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
-    /// Rewrite the session resolver in /etc/resolv.conf. Reversible.
+    /// Request a resolver change. TUI apply remains disabled; the explicit Linux
+    /// authority command supports only confirmed unmanaged regular files.
     SetResolver { addr: String },
     /// Persist the resolver through the system's resolver manager.
     /// Not reversible by netwatch — it's an instruct step for that reason.

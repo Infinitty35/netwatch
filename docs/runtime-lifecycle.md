@@ -3,6 +3,39 @@
 PR04 audit, 11 September 2026. This inventory describes the current local code,
 including the prepare/start refactor. It does not certify confinement or readiness.
 
+## PR08 resolver command boundary
+
+`netwatch resolver ...` dispatches before application runtime/policy preparation
+and before Npcap loading. `status` is read-only; Linux `set`/`recover` require root
+and explicit unmanaged confirmation. The bounded foreground `set` command creates
+only a current-thread signal/timer runtime, registers SIGINT/SIGTERM before mutation,
+and holds the fixed root-owned authority store lock until restoration or exit.
+No packet, attribution, remote or model workers start in this command.
+
+The shared live bootstrap also reports unresolved/inaccessible authority records
+without performing rollback. See [resolver adapter scope and validation](resolver-adapter.md).
+
+## PR06 implementation update
+
+TUI and daemon use `runtime::bootstrap::start` for recovery inspection, worker
+startup/readiness and calling-thread policy, followed by common initial polls.
+Static CLI dispatch (`--help`, `--version`, `--generate-config`) returns before
+runtime bootstrap; config generation intentionally writes only its config file.
+
+Live recovery authority is explicitly `InspectOnly`. Legacy PID/path metadata
+cannot authorize a rollback: inspection does not open journal-supplied target or
+backup paths, and unresolved temporary entries block subsequent journal writes.
+TUI displays the persistent reason and exports it in Diagnose reports; daemon logs
+the same reason. Shutdown cancels pending applies and preserves legacy entries,
+including those whose PID happens to match the current process. Demo sessions skip
+recovery and skip saving their simulated baselines at shutdown.
+
+There are no eligible automatic rollback operations in the legacy format. PR07/08
+must establish durable ownership and a supported resolver authority before enabling
+rollback. No privileged helper or wider parser filesystem grant is introduced.
+Optional remote/logging/metrics services still start in shared CLI setup under the
+worker policy; recovery inspection precedes application collector startup.
+
 ## PR05 implementation update
 
 The inventory below records the PR04 baseline. PR05 changes the executable startup
