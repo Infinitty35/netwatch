@@ -152,7 +152,14 @@ impl Store {
         }
         Ok(store)
     }
-    #[cfg(test)]
+    // Only the Linux resolver's own tests call this (via
+    // `resolver::linux`, itself `target_os = "linux"`-gated); on any other
+    // unix `cfg(test)` alone leaves it unused and fails `-D warnings`
+    // clippy in CI (found on macOS after v0.31.1 — the release build
+    // itself never compiles the test profile, so it slipped past that).
+    // `unix.rs`'s own tests set `store.fault` directly (see below) and stay
+    // covered on every platform regardless of this method's cfg.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn fail_next_update_after_rename(&mut self) {
         self.fault = Some(Stage::Renamed);
     }
