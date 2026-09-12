@@ -18,51 +18,54 @@ use std::io;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
-    // Handle CLI flags before entering TUI mode
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("netwatch {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "netwatch {} — real-time network diagnostics in your terminal\n\n\
-             USAGE:\n    netwatch [OPTIONS]\n    sudo netwatch              Full mode (health probes + packet capture)\n    netwatch daemon [OPTIONS]  Headless agent (no TUI); streams to --remote\n\n\
-             RESOLVER: netwatch resolver status | set <IP> --unmanaged [--seconds 1..3600] | recover --unmanaged\n\n\
-             OPTIONS:\n    --generate-config         Write a default config file and exit\n    \
-             --remote <url>            Stream metrics to a NetWatch Core instance\n    \
-             --api-key <key>           API key for remote streaming\n    \
-             --demo                    Replay a recorded incident on the Diagnose tab
-    --lite                    Start in Lite view: one screen, fits 80×24\n    \
-             --view <full|lite|dense>  Start in a specific view (dense: four boxes, 130×44)\n    \
-             --no-sandbox              Disable the post-startup security sandbox\n    \
-             --sandbox-strict          Refuse to start if the sandbox can't be enforced\n    \
-             --metrics-addr <addr>     (daemon) Serve Prometheus /metrics + /healthz on addr\n    \
-             --metrics                 (daemon) Serve metrics on the default 127.0.0.1:9464\n    \
-             -h, --help                Print help\n    -V, --version             Print version\n\n\
-             KEYS (in TUI):\n    1-9,0 Switch tabs    9     Diagnose  /   Filter    q   Quit\n    \
-             V     Cycle view (full → lite → dense)\n    \
-             L     Toggle Lite view\n    \
-             Shift+R/F/E   Flight Recorder: arm / freeze / export",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--generate-config") {
-        let cfg = NetwatchConfig::default();
-        cfg.save()?;
-        match NetwatchConfig::path() {
-            Some(path) => println!("Config written to {}", path.display()),
-            None => println!("Config written (could not determine path)"),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let options = match netwatch::cli::parse(&args)? {
+        netwatch::cli::Command::Help => {
+            print!("{}", netwatch::cli::help());
+            return Ok(());
         }
-        return Ok(());
+        netwatch::cli::Command::Version => {
+            println!("netwatch {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        netwatch::cli::Command::GenerateConfig => {
+            NetwatchConfig::default().save()?;
+            println!(
+                "Config written to {}",
+                NetwatchConfig::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+            return Ok(());
+        }
+        netwatch::cli::Command::Resolver(args) => {
+            return netwatch::diagnose::remediation::resolver::command(&args)
+        }
+        netwatch::cli::Command::Doctor {
+            json,
+            check_capture,
+            interface,
+        } => return netwatch::runtime::capabilities::doctor(json, check_capture, interface),
+        netwatch::cli::Command::CaptureChild { interface, mode } => {
+            return netwatch::runtime::capabilities::capture_child(&interface, mode)
+        }
+        netwatch::cli::Command::Run(options) => options,
+    };
+    let config = NetwatchConfig::load();
+    let remote_url = options
+        .remote
+        .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
+    let api_key = options
+        .api_key
+        .or_else(|| std::env::var("NETWATCH_API_KEY").ok());
+    if remote_url.is_some() != api_key.is_some() {
+        anyhow::bail!("remote streaming requires both URL and API key");
     }
-
-    // Resolver authority commands never initialize capture, app workers or the
-    // parser sandbox. Their own typed CLI validates the fixed host resource.
-    if args.get(1).map(String::as_str) == Some("resolver") {
-        return netwatch::diagnose::remediation::resolver::command(&args[2..]);
-    }
+    let view = options.view;
+    let demo = options.demo;
+    let sandbox_mode = options
+        .sandbox
+        .unwrap_or_else(|| netwatch::sandbox::Mode::from_config(&config.sandbox));
 
     // Everything past this point can reach libpcap, so this is where Npcap has
     // to be resolved on Windows — after the flags that answer without it, so
@@ -75,53 +78,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Parse --remote and --api-key for optional metrics streaming. Fall back to
-    // env vars so the daemon (e.g. under systemd) can take its endpoint and key
-    // from an EnvironmentFile instead of argv — keeping the API key out of `ps`.
-    let remote_url = args
-        .windows(2)
-        .find(|w| w[0] == "--remote")
-        .map(|w| w[1].clone())
-        .or_else(|| std::env::var("NETWATCH_REMOTE_URL").ok());
-    let api_key = args
-        .windows(2)
-        .find(|w| w[0] == "--api-key")
-        .map(|w| w[1].clone())
-        .or_else(|| std::env::var("NETWATCH_API_KEY").ok());
-
-    // Lite is opt-in at every terminal size — we never auto-select it, since
-    // that would make the tabs unreachable on a small terminal with no
-    // obvious way back.
-    // Views are opt-in at every terminal size — we never auto-select one, since
-    // that would make the tabs unreachable on a small terminal with no obvious
-    // way back. `--view` is the general form; `--lite` predates it and stays.
-    let view = args
-        .iter()
-        .position(|a| a == "--view")
-        .and_then(|i| args.get(i + 1))
-        .map(|name| netwatch::app::ViewMode::by_name(name))
-        .or_else(|| {
-            args.iter()
-                .any(|a| a == "--lite")
-                .then_some(netwatch::app::ViewMode::Lite)
-        });
-
-    // Replay the recorded Diagnose scenario instead of the live network.
-    // Opens on the Diagnose tab and labels every frame as a demo.
-    let demo = args.iter().any(|a| a == "--demo");
-
-    let sandbox_mode = if args.iter().any(|a| a == "--no-sandbox") {
-        netwatch::sandbox::Mode::Disabled
-    } else if args.iter().any(|a| a == "--sandbox-strict") {
-        netwatch::sandbox::Mode::Strict
-    } else {
-        // No CLI flag — honor the persistent setting from
-        // ~/.config/netwatch/config.toml (Settings overlay → "Sandbox").
-        // `load()` already falls back to defaults on missing/malformed.
-        netwatch::sandbox::Mode::from_config(&NetwatchConfig::load().sandbox)
-    };
-
-    let sandbox_paths = netwatch::sandbox::SandboxPaths::from_config(&NetwatchConfig::load());
+    let sandbox_paths = netwatch::sandbox::SandboxPaths::from_config(&config);
     if !matches!(sandbox_mode, netwatch::sandbox::Mode::Disabled) {
         sandbox_paths.prepare()?;
     } else if let Some(exports) = &sandbox_paths.cwd {
@@ -150,10 +107,7 @@ fn main() -> Result<()> {
             publisher.start();
             Some(publisher)
         }
-        (Some(_), None) => {
-            eprintln!("error: --remote requires --api-key");
-            return Ok(());
-        }
+        (Some(_), None) => anyhow::bail!("--remote requires --api-key"),
         _ => None,
     };
 
@@ -166,22 +120,13 @@ fn main() -> Result<()> {
     // Headless daemon mode: `netwatch daemon` (or `--daemon`/`--headless`).
     // Runs the same collectors as the TUI with no rendering, streams to the
     // remote backend, and flushes its durable queue on SIGTERM before exiting.
-    let daemon_mode = args
-        .iter()
-        .skip(1)
-        .any(|a| a == "daemon" || a == "--daemon" || a == "--headless");
-    if daemon_mode {
-        // Optional Prometheus /metrics + /healthz endpoint (daemon only for now).
-        // `--metrics-addr <addr>`, or `--metrics` for the default, or the
-        // NETWATCH_METRICS_ADDR env var.
-        let metrics_addr = args
-            .windows(2)
-            .find(|w| w[0] == "--metrics-addr")
-            .map(|w| w[1].clone())
+    if options.daemon {
+        let metrics_addr = options
+            .metrics_addr
             .or_else(|| std::env::var("NETWATCH_METRICS_ADDR").ok())
             .or_else(|| {
-                args.iter()
-                    .any(|a| a == "--metrics")
+                options
+                    .metrics
                     .then(|| netwatch::metrics::DEFAULT_METRICS_ADDR.to_string())
             });
         let metrics = metrics_addr.map(|addr| {

@@ -4,6 +4,32 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-09-12
+
+### Added
+- Per-connection attribution evidence with observation time, process/flow identity,
+  unknown reasons and separate event corroboration. Connections, Processes and
+  Egress display flow and payload-byte coverage independently of backend readiness.
+- Independent-process Linux TCP/UDP IPv4/IPv6 polling matrix and deterministic
+  identity/freshness regressions. Broader capture/platform acceptance remains open.
+- `netwatch doctor` and `doctor --json` report setup capabilities without starting
+  collectors, contacting endpoints or changing recovery state. Optional
+  `--check-capture` opens/configures/closes capture in a subprocess with a five-second
+  deadline and reports its protection scope. CLI validation rejects missing values
+  and conflicting options before startup; existing daemon and view aliases remain.
+- A shared capability model supplies live startup/Settings summaries and doctor
+  reports, distinguishing unchecked, unavailable, disabled, degraded and stale data.
+
+### Fixed
+- Linux attribution validates protocol, socket inode, process start and namespace;
+  ambiguous and expired startup matches stay unknown. Destination-only eBPF and
+  PKTAP hints cannot overwrite polling owners. Cache freshness is checked on read.
+- New observed capture generations reset tuple state and rate baselines. Process
+  totals and CPU sampling no longer rely on PID alone. Platforms without process
+  start identity retain unverified polling names and omit unverified CPU values.
+- Unix recovery stores explicitly release their lock on owner drop, preventing a
+  concurrently inherited descriptor from delaying the next writer's acquisition.
+
 ## [0.31.1] - 2026-09-12
 
 ### Added

@@ -14,8 +14,9 @@
 //! - All four kprobes fire at connect-entry, where the destination (from the
 //!   `uaddr` arg) is valid but the socket's own source addr/port aren't yet
 //!   assigned. So `saddr`/`sport` are reported as 0 and we key the cache by
-//!   `(protocol, daddr, dport)`, accepting that two concurrent same-protocol
-//!   connections to the same `daddr:dport` would alias. Rare in practice.
+//!   `(protocol, daddr, dport)`. This is only a hint: concurrent connections
+//!   to one destination alias. The collector requires independently verified
+//!   socket ownership and never lets an event overwrite that owner.
 //!
 //! The SDK canonicalises v4-mapped IPv6 destinations (`::ffff:a.b.c.d`,
 //! i.e. IPv4 traffic on dual-stack sockets) to `IpAddr::V4` before they
@@ -52,7 +53,7 @@ pub struct EbpfAttribution {
 /// `sport` was never captured either. Protocol is part of the key so a TCP
 /// and a (connected) UDP flow to the same `daddr:dport` — e.g. both to
 /// `:443` — don't cross-attribute. Two same-protocol flows to the same
-/// `daddr:dport` concurrently still alias — rare in practice.
+/// `daddr:dport` concurrently still alias; callers must corroborate ownership.
 type AttrKey = (Protocol, IpAddr, u16);
 
 /// Hard cap on cached attributions, so a `connect()` storm can't grow the
@@ -72,7 +73,24 @@ impl EbpfAttributor {
     }
 
     pub fn lookup(&self, proto: Protocol, daddr: IpAddr, dport: u16) -> Option<EbpfAttribution> {
-        self.cache.lock().ok()?.get(&(proto, daddr, dport)).cloned()
+        self.cache
+            .lock()
+            .ok()?
+            .get(&(proto, daddr, dport))
+            .filter(|a| a.seen_at.elapsed() <= crate::collectors::attribution::MAX_MATCH_AGE)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&self, proto: Protocol, addr: IpAddr, port: u16, pid: u32) {
+        self.record(
+            (proto, addr, port),
+            EbpfAttribution {
+                pid,
+                comm: "test".into(),
+                seen_at: Instant::now(),
+            },
+        );
     }
 
     fn record(&self, key: AttrKey, attr: EbpfAttribution) {
@@ -291,5 +309,24 @@ mod live_tests {
                 .is_none(),
             "UDP connect must not alias into the TCP cache slot"
         );
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    #[test]
+    fn stopped_event_worker_cannot_keep_old_matches_alive() {
+        let a = EbpfAttributor::new();
+        let addr = "127.0.0.1".parse().unwrap();
+        a.record(
+            (Protocol::Tcp, addr, 443),
+            EbpfAttribution {
+                pid: 1,
+                comm: "old".into(),
+                seen_at: Instant::now() - Duration::from_secs(6),
+            },
+        );
+        assert!(a.lookup(Protocol::Tcp, addr, 443).is_none());
     }
 }

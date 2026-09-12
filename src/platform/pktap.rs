@@ -86,7 +86,10 @@ impl PktapAttributor {
 
     pub fn lookup(&self, key: &StreamKey) -> Option<Attribution> {
         let cache = self.cache.lock().ok()?;
-        cache.get(key).cloned()
+        cache
+            .get(key)
+            .filter(|a| a.seen_at.elapsed() <= crate::collectors::attribution::MAX_MATCH_AGE)
+            .cloned()
     }
 
     pub fn record(&self, key: StreamKey, attr: Attribution) {

@@ -715,13 +715,13 @@ impl App {
 
         let packet_collector = PacketCollector::new();
         let connection_collector =
-            ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker));
+            ConnectionCollector::new(Arc::clone(&packet_collector.stream_tracker))
+                .with_capture_stats(Arc::clone(&packet_collector.stats));
 
         // Capture a /proc attribution snapshot NOW — before the sandbox is
         // applied (app::run does that after explicit worker startup). Landlock's
-        // process-introspection (ptrace) scoping later blocks reading other
-        // processes' /proc/<pid>/fd, so connections that already exist must be
-        // attributed here; eBPF handles connections opened afterward. See #38.
+        // process-introspection scoping may block later validation. This snapshot
+        // is only a short-lived hint: unverified or expired entries remain unknown.
         #[cfg(target_os = "linux")]
         let connection_collector = {
             let snapshot = crate::collectors::connections::capture_proc_snapshot();
@@ -1034,7 +1034,10 @@ impl App {
         platform::link_speed_bps(&self.capture_interface)
     }
 
-    fn pick_capture_interface(info: &[InterfaceInfo], default_route_dev: Option<&str>) -> String {
+    pub(crate) fn pick_capture_interface(
+        info: &[InterfaceInfo],
+        default_route_dev: Option<&str>,
+    ) -> String {
         // Prefer the interface carrying the default route: on multi-NIC
         // machines enumeration order says nothing about which port has the
         // cable, so "first UP with an IPv4" can land on the idle port
@@ -2443,11 +2446,23 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
                     Tab::Processes => {
-                        if clicked_row > 0 {
-                            let visible_row = clicked_row - 1;
-                            let max = app.process_bandwidth.ranked().len().saturating_sub(1);
-                            let idx = (app.ui.scroll.process_scroll + visible_row).min(max);
-                            app.ui.scroll.process_scroll = idx;
+                        let inner = crate::ui::processes::table_inner_area(area);
+                        if mouse.row > inner.y && mouse.row < inner.bottom() {
+                            let total = app.process_bandwidth.ranked().len();
+                            let visible = inner.height.saturating_sub(1) as usize;
+                            let selected =
+                                app.ui.scroll.process_scroll.min(total.saturating_sub(1));
+                            let top = if selected < visible {
+                                0
+                            } else {
+                                selected
+                                    .saturating_sub(visible / 2)
+                                    .min(total.saturating_sub(visible))
+                            };
+                            let index = top + (mouse.row - inner.y - 1) as usize;
+                            if index < total {
+                                app.ui.scroll.process_scroll = index;
+                            }
                         }
                     }
                     Tab::Egress => {
@@ -3954,6 +3969,7 @@ mod tests {
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
@@ -4113,6 +4129,7 @@ mod tests {
             rx_rate: rx,
             tx_rate: tx,
             attribution: Default::default(),
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,

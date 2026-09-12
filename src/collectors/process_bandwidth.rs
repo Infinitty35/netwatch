@@ -7,7 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::attribution::ProcessIdentity;
 use super::connections::Connection;
+type ProcessKey = (String, Option<u32>, Option<ProcessIdentity>);
+#[derive(Clone)]
+struct CpuObservation {
+    value: f64,
+    identity: ProcessIdentity,
+    at: Instant,
+}
 use super::traffic::InterfaceTraffic;
 
 /// Drop a process's accumulated byte totals after this much inactivity.
@@ -43,14 +51,14 @@ pub struct ProcessBandwidthCollector {
     ranked: Vec<ProcessBandwidth>,
     /// CPU% per-pid cache, populated by a background `ps` thread on a slow
     /// tick. The mutex is short-lived; reads are O(1) lookups.
-    cpu_cache: Arc<Mutex<HashMap<u32, f64>>>,
+    cpu_cache: Arc<Mutex<HashMap<u32, CpuObservation>>>,
     cpu_busy: Arc<AtomicBool>,
-    /// Per-(process, pid) cumulative bytes, integrated from observed
+    /// Per-process-identity cumulative bytes, integrated from observed
     /// rates each tick (`bytes += rate * elapsed`). Survives ticks where
     /// the current rate is 0, so the Stats "TOP PROCESSES" panel keeps
     /// showing historical traffic instead of flashing empty every time
     /// a flow goes idle. Pruned after PROCESS_TOTALS_TTL of inactivity.
-    process_totals: HashMap<(String, Option<u32>), ProcessTotals>,
+    process_totals: HashMap<ProcessKey, ProcessTotals>,
     /// Timestamp of the previous `update()` call; used to integrate rate
     /// into bytes since the last tick. `None` on first call (no elapsed
     /// time to integrate over).
@@ -75,6 +83,8 @@ impl ProcessBandwidthCollector {
     }
 
     pub fn update(&mut self, connections: &[Connection], _interfaces: &[InterfaceTraffic]) {
+        self.process_totals
+            .retain(|(_, pid, identity), _| pid.is_none() || identity.is_some());
         let now = Instant::now();
         let elapsed = self
             .last_tick
@@ -82,14 +92,14 @@ impl ProcessBandwidthCollector {
             .unwrap_or(0.0);
         self.last_tick = Some(now);
 
-        // Aggregate per-(process, pid) state from the ESTABLISHED connections.
+        // Aggregate per-process-identity state from observed connections.
         // Rates come from the packet capture path (conn.rx_rate / tx_rate are
         // populated by RateState in connections.rs when a stream's bytes are
         // moving). RTT is the min across the process's TCP conns.
-        let mut process_conns: HashMap<(String, Option<u32>), u32> = HashMap::new();
-        let mut process_rx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
-        let mut process_tx_rate: HashMap<(String, Option<u32>), f64> = HashMap::new();
-        let mut process_rtt: HashMap<(String, Option<u32>), f64> = HashMap::new();
+        let mut process_conns: HashMap<ProcessKey, u32> = HashMap::new();
+        let mut process_rx_rate: HashMap<ProcessKey, f64> = HashMap::new();
+        let mut process_tx_rate: HashMap<ProcessKey, f64> = HashMap::new();
+        let mut process_rtt: HashMap<ProcessKey, f64> = HashMap::new();
         let mut total_active: u32 = 0;
 
         for conn in connections {
@@ -107,7 +117,7 @@ impl ProcessBandwidthCollector {
                 conn.process_name.as_deref(),
                 conn.pid,
             );
-            let key = (name, conn.pid);
+            let key = (name, conn.pid, conn.evidence.process.clone());
             *process_conns.entry(key.clone()).or_insert(0) += 1;
             total_active += 1;
             if let Some(rx) = conn.rx_rate {
@@ -180,8 +190,8 @@ impl ProcessBandwidthCollector {
 
         let mut ranked: Vec<ProcessBandwidth> = process_conns
             .into_iter()
-            .map(|((process_name, pid), count)| {
-                let key = (process_name.clone(), pid);
+            .map(|((process_name, pid, identity), count)| {
+                let key = (process_name.clone(), pid, identity.clone());
                 let rx_rate = process_rx_rate.get(&key).copied().unwrap_or(0.0);
                 let tx_rate = process_tx_rate.get(&key).copied().unwrap_or(0.0);
                 let (rx_bytes, tx_bytes) = self
@@ -190,7 +200,13 @@ impl ProcessBandwidthCollector {
                     .map(|t| (t.rx_bytes, t.tx_bytes))
                     .unwrap_or((0, 0));
                 let rtt_ms = process_rtt.get(&key).copied();
-                let cpu_percent = pid.and_then(|p| cpu_cache.get(&p).copied());
+                let cpu_percent = pid
+                    .and_then(|p| cpu_cache.get(&p))
+                    .filter(|sample| {
+                        Some(&sample.identity) == identity.as_ref()
+                            && sample.at.elapsed() < Duration::from_secs(10)
+                    })
+                    .map(|sample| sample.value);
                 ProcessBandwidth {
                     process_name,
                     pid,
@@ -229,12 +245,41 @@ impl ProcessBandwidthCollector {
         let cache = Arc::clone(&self.cpu_cache);
         let busy = Arc::clone(&self.cpu_busy);
         crate::sandbox::worker::spawn("process-cpu", move || {
-            if let Some(pid_cpu) = sample_cpu() {
-                *cache.lock().unwrap() = pid_cpu;
-            }
+            // Bracket ps with process identity reads so PID reuse cannot relabel CPU.
+            let before = cache_process_identities();
+            let samples = sample_cpu()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(pid, value)| {
+                    let identity = super::attribution::process_identity(pid)?;
+                    (before.get(&pid) == Some(&identity)).then_some((
+                        pid,
+                        CpuObservation {
+                            value,
+                            identity,
+                            at: Instant::now(),
+                        },
+                    ))
+                })
+                .collect();
+            *cache.lock().unwrap() = samples;
             busy.store(false, Ordering::SeqCst);
         });
     }
+}
+
+fn cache_process_identities() -> HashMap<u32, ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        return entries
+            .flatten()
+            .filter_map(|e| {
+                let pid = e.file_name().to_str()?.parse().ok()?;
+                Some((pid, super::attribution::process_identity(pid)?))
+            })
+            .collect();
+    }
+    HashMap::new()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -291,10 +336,35 @@ mod tests {
             rx_rate: rx,
             tx_rate: tx,
             attribution: Default::default(),
+            evidence: super::super::attribution::MatchEvidence {
+                process: Some(ProcessIdentity {
+                    session: "test".into(),
+                    pid,
+                    start_token: "1".into(),
+                    executable: None,
+                    network_namespace: None,
+                }),
+                unknown_reason: None,
+                observed_at: Some(Instant::now()),
+                ..Default::default()
+            },
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
         }
+    }
+
+    #[test]
+    fn reused_pid_does_not_inherit_process_totals() {
+        let mut collector = ProcessBandwidthCollector::new();
+        let mut conn = make_conn_rated("same-name", 42, "ESTABLISHED", Some(100.0), Some(0.0));
+        collector.last_tick = Some(Instant::now() - Duration::from_secs(1));
+        collector.update(&[conn.clone()], &[]);
+        assert!(collector.ranked()[0].rx_bytes >= 100);
+        conn.evidence.process.as_mut().unwrap().start_token = "new-process".into();
+        conn.rx_rate = Some(0.0);
+        collector.update(&[conn], &[]);
+        assert_eq!(collector.ranked()[0].rx_bytes, 0);
     }
 
     fn make_interface(rx_rate: f64, tx_rate: f64) -> InterfaceTraffic {

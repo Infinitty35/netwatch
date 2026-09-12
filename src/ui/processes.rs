@@ -47,19 +47,31 @@ pub fn sort(procs: &mut [ProcessBandwidth], column: usize, ascending: bool) {
     });
 }
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
+fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
+            Constraint::Length(5), // header and attribution coverage
             Constraint::Length(2), // sort chips
             Constraint::Min(8),    // table (`Min` so it grows on taller terminals)
             Constraint::Length(8), // drill-in panel — top-5 hosts + header + "others" + borders
             Constraint::Length(3), // footer
         ])
-        .split(area);
+        .split(area)
+}
 
-    widgets::render_header(f, app, chunks[0]);
+pub fn table_inner_area(area: Rect) -> Rect {
+    let table = layout_chunks(area)[2];
+    Rect::new(
+        table.x + 1,
+        table.y + 1,
+        table.width.saturating_sub(2),
+        table.height.saturating_sub(2),
+    )
+}
+pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = layout_chunks(area);
+    widgets::render_attribution_header(f, app, chunks[0], vec![]);
     render_sort_chips(f, app, chunks[1]);
 
     let mut ranked = app.process_bandwidth.ranked().to_vec();

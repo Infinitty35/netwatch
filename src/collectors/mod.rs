@@ -1,3 +1,4 @@
+pub mod attribution;
 pub mod config;
 pub mod connections;
 pub mod egress;

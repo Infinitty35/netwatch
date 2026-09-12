@@ -74,7 +74,7 @@ fn layout_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
+            Constraint::Length(5),  // header and attribution coverage
             Constraint::Length(2),  // chip row
             Constraint::Min(8),     // table
             Constraint::Length(10), // detail strip
@@ -246,7 +246,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    crate::ui::widgets::render_header_with_extra(f, app, area, extra);
+    crate::ui::widgets::render_attribution_header(f, app, area, extra);
 }
 
 fn active_connection_filter(app: &App) -> Option<String> {
@@ -1529,7 +1529,20 @@ fn render_detail_left(f: &mut Frame, app: &App, area: Rect, conn: &Connection) {
             ),
             Span::styled(format!("age {}", age), Style::default().fg(t.text_muted)),
         ]),
-        Line::from(""),
+        Line::from(format!(
+            "Match: {:?} · {}",
+            conn.attribution,
+            conn.evidence
+                .unknown_reason
+                .map(|r| format!("{r:?}"))
+                .unwrap_or_else(|| format!(
+                    "verified · {}ms old",
+                    conn.evidence
+                        .observed_at
+                        .map(|t| t.elapsed().as_millis())
+                        .unwrap_or(0)
+                ))
+        )),
         Line::from(vec![
             Span::styled("STATS  ", Style::default().fg(t.text_muted)),
             Span::styled(format!("RX {}", rx), Style::default().fg(t.rx_rate)),
@@ -1942,6 +1955,7 @@ mod tests {
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,

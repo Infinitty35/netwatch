@@ -1,6 +1,11 @@
 # Current capabilities and limits
 
-This matrix describes the local implementation audited on 11 September 2026,
+The [doctor command](doctor.md) reports setup capabilities as text or versioned
+JSON without starting collectors. Its optional bounded capture check reports only
+the isolated check's results. Live Settings and startup use the same capability
+model with runtime observations; static configuration is never a health verdict.
+
+This matrix describes the local implementation updated on 12 September 2026,
 including the unreleased diagnostic/remediation corrections. It is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
@@ -9,7 +14,7 @@ establish macOS or Windows runtime parity.
 | --- | --- | --- | --- |
 | Interface/configuration collection | Linux system counters and network tools | macOS network tools | PowerShell/network tools, with fallbacks |
 | Packet capture | libpcap; capture permission required | libpcap/BPF; access permission required | Npcap installation and capture access required |
-| Process attribution | Socket polling; SDK eBPF source disabled in sandboxed runs | `lsof` plus PKTAP where available | Windows socket/process polling |
+| Process attribution | Verified procfs socket ownership; eBPF hints require corroboration and are disabled in sandboxed runs | Unverified `lsof` observations; PKTAP hints cannot overwrite owners | Unverified socket/process polling |
 | Kernel TCP metrics | `NETLINK_INET_DIAG` | `net.inet.tcp.pcblist64` sysctl | Not implemented; collector returns no flows |
 | Diagnose | Shared detectors; available inputs determine coverage | Shared detectors; available inputs determine coverage | Shared detectors; absent TCP metrics limit socket rules |
 | Netwatch sandbox | Worker entry policy with prepared filesystem grants; privileged capture acceptance pending | No backend | No backend |
@@ -17,7 +22,8 @@ establish macOS or Windows runtime parity.
 | Resolver changes | Explicit root CLI for confirmed unmanaged regular file; TUI automatic edits disabled | Unavailable | Unavailable |
 | AI commentary | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint | Optional Ollama-compatible endpoint |
 
-Attribution may be unknown or stale. Polling can miss short-lived connections;
+See [attribution evidence and controlled results](attribution.md) for exact
+coverage denominators and pending platform acceptance. Attribution may be unknown or stale. Polling can miss short-lived connections;
 backend identity and visibility are constrained by permissions and the observed
 network scope. An `ebpf` build or granted capability alone does not prove that the
 kernel accepted a program or that every flow was attributed.

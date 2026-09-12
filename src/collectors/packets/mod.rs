@@ -251,6 +251,8 @@ impl Stream {
             total_payload_bytes: 0,
             handshake: None,
             last_seen_ns: first_seen_ns,
+            initial_syn_seq: None,
+            closed: false,
             app_protocol: None,
             app_protocol_attempted: false,
             quic_crypto_buf: Vec::new(),
@@ -371,6 +373,8 @@ pub struct Stream {
     /// Monotonic ns timestamp of the last packet seen on this flow. Drives LRU
     /// eviction when the tracker exceeds MAX_STREAMS.
     last_seen_ns: u64,
+    initial_syn_seq: Option<u32>,
+    closed: bool,
     /// Highest TCP `seq + payload_len` seen in each direction, used to
     /// classify subsequent segments as retransmits / out-of-order.
     /// Updated with proper 32-bit wraparound handling (a segment whose
@@ -528,6 +532,24 @@ impl StreamTracker {
     ) -> u32 {
         let key = StreamKey::new(protocol, src_ip, src_port, dst_ip, dst_port);
 
+        // A new handshake or an idle UDP observation starts a new generation.
+        // Same-sequence SYN retransmission stays in the original generation.
+        let new_syn = tcp_flags.is_some_and(|f| f & 0x02 != 0 && f & 0x10 == 0);
+        let replace = self
+            .streams
+            .get(&key)
+            .and_then(|i| self.all_streams.get(i))
+            .is_some_and(|s| {
+                (new_syn && (s.closed || (s.packet_count > 0 && s.initial_syn_seq != tcp_seq)))
+                    || (protocol == StreamProtocol::Udp
+                        && timestamp_ns.saturating_sub(s.last_seen_ns) > 60_000_000_000)
+            });
+        if replace {
+            if let Some(old) = self.streams.remove(&key) {
+                self.all_streams.remove(&old);
+                self.tls_keys.remove(&old);
+            }
+        }
         let stream_index = if let Some(&idx) = self.streams.get(&key) {
             idx
         } else {
@@ -546,6 +568,12 @@ impl StreamTracker {
             // this flow will allocate a fresh index.
             None => return stream_index,
         };
+        if new_syn {
+            stream.initial_syn_seq = tcp_seq;
+        }
+        if tcp_flags.is_some_and(|f| f & 0x05 != 0) {
+            stream.closed = true;
+        }
         stream.last_seen_ns = timestamp_ns;
         stream.packet_count += 1;
 
@@ -1153,6 +1181,13 @@ impl StreamTracker {
             .collect()
     }
 
+    pub fn snapshot_generations(&self) -> HashMap<StreamKey, u32> {
+        self.all_streams
+            .values()
+            .map(|s| (s.key.clone(), s.index))
+            .collect()
+    }
+
     /// Snapshot per-stream TCP anomaly counters (retransmits, out-of-order),
     /// summed across both directions. Used by the connection collector to
     /// attach a per-row count without holding the tracker lock through the
@@ -1216,7 +1251,7 @@ impl StreamTracker {
     pub fn clear(&mut self) {
         self.streams.clear();
         self.all_streams.clear();
-        self.next_index = 0;
+        self.tls_keys.clear();
     }
 }
 
@@ -1233,6 +1268,7 @@ pub struct CaptureStats {
     dropped: AtomicU64,
     /// Packets per second over the last poll interval.
     rate_pps: AtomicU64,
+    observed_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl CaptureStats {
@@ -1245,6 +1281,13 @@ impl CaptureStats {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    pub fn observed_drops(&self) -> Option<u64> {
+        self.observed_at
+            .lock()
+            .ok()?
+            .filter(|at| at.elapsed() <= crate::collectors::attribution::MAX_MATCH_AGE)
+            .map(|_| self.dropped())
+    }
     pub fn rate_pps(&self) -> u64 {
         self.rate_pps.load(Ordering::Relaxed)
     }
@@ -1255,12 +1298,13 @@ impl CaptureStats {
         self.received.store(0, Ordering::Relaxed);
         self.dropped.store(0, Ordering::Relaxed);
         self.rate_pps.store(0, Ordering::Relaxed);
+        *self.observed_at.lock().unwrap() = None;
     }
 }
 
 /// Open/configure capture resources without reading or decoding traffic.
 /// Called inside the worker for startup and every capture restart.
-fn prepare_capture(
+pub(crate) fn prepare_capture(
     interface: &str,
     bpf: Option<&str>,
 ) -> Result<pcap::Capture<pcap::Active>, String> {
@@ -1419,6 +1463,7 @@ impl PacketCollector {
             while capturing.load(Ordering::Relaxed) {
                 if last_poll.elapsed() >= STATS_POLL {
                     if let Ok(s) = cap.stats() {
+                        *stats.observed_at.lock().unwrap() = Some(std::time::Instant::now());
                         let received = s.received as u64;
                         let elapsed = last_poll.elapsed().as_secs_f64();
                         // pcap's counter is monotonic within a capture, but a
@@ -3460,6 +3505,78 @@ mod tests {
         assert_eq!(hs.syn_ack_ns, Some(2_000_000));
         assert_eq!(hs.ack_ns, Some(3_000_000));
     }
+    #[test]
+    fn reused_tuple_and_capture_clear_get_new_generations() {
+        let mut tracker = StreamTracker::new();
+        let mut packet = |flags, seq, ns| {
+            tracker.track_packet(
+                "127.0.0.1",
+                42000,
+                "127.0.0.1",
+                80,
+                StreamProtocol::Tcp,
+                b"",
+                1,
+                "t",
+                Some(flags),
+                Some(seq),
+                ns,
+            )
+        };
+        let initial = packet(2, 10, 1);
+        assert_eq!(initial, packet(2, 10, 2), "SYN retransmission");
+        let reused = packet(2, 99, 3);
+        assert_ne!(initial, reused);
+        assert_ne!(reused, packet(2, 100, 4));
+        tracker.clear();
+        let after_clear = tracker.track_packet(
+            "127.0.0.1",
+            42000,
+            "127.0.0.1",
+            80,
+            StreamProtocol::Tcp,
+            b"",
+            1,
+            "t",
+            Some(2),
+            Some(100),
+            5,
+        );
+        assert!(after_clear > reused);
+    }
+    #[test]
+    fn idle_udp_tuple_gets_new_generation() {
+        let mut tracker = StreamTracker::new();
+        let a = tracker.track_packet(
+            "127.0.0.1",
+            42000,
+            "127.0.0.1",
+            53,
+            StreamProtocol::Udp,
+            b"hello",
+            1,
+            "t",
+            None,
+            None,
+            1,
+        );
+        let b = tracker.track_packet(
+            "127.0.0.1",
+            42000,
+            "127.0.0.1",
+            53,
+            StreamProtocol::Udp,
+            b"hello",
+            2,
+            "t",
+            None,
+            None,
+            61_000_000_001,
+        );
+        assert_ne!(a, b);
+        assert_eq!(tracker.snapshot_bytes().values().next(), Some(&(0, 5)));
+    }
+
     #[test]
     fn test_stream_tracker_clear() {
         let mut tracker = StreamTracker::new();

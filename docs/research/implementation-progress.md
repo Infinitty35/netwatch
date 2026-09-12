@@ -3,7 +3,10 @@
 Release update: PR01–PR05 core and the RTT timeline fixes shipped in **v0.31.0**
 (`805cf71`). CI passed on Linux, macOS and Windows. The dated entries below retain
 their original implementation-stage status; PR05 privileged/interactive acceptance
-remains pending despite release. Current work continues with PR06 below.
+remains pending despite release. PR06–08 subsequently shipped in v0.31.1;
+PR09 and PR10 core changes are included in the local v0.31.2 commit/tag.
+Publication and platform/privileged acceptance remain pending. Their entries below
+retain the original implementation-stage status and validation evidence.
 
 ## PR01 — Initial remediation corrections
 
@@ -317,3 +320,89 @@ unavailable. See [the adapter contract](../resolver-adapter.md).
 
 Next implementation: **PR09 — Unified capability snapshot, CLI and doctor**, while
 retaining the outstanding PR05/07/08 privileged and platform acceptance work.
+
+## PR09 — Unified capability snapshot, CLI and doctor
+
+Implemented locally on the v0.31.1 release plus CI fix (`897b349`); not committed
+or released. Earlier entries' local/unreleased descriptions are historical:
+PR06–08 subsequently shipped in v0.31.1.
+
+- Added a serializable capability model with explicit states, reason codes and
+  next checks. Static reports distinguish configuration from observation; live
+  startup and Settings consume capture, attribution, probe completion, TCP
+  freshness and per-component protection reports. Networking remains unrestricted.
+- Added `doctor` and `doctor --json` before Npcap/runtime initialization. Static
+  mode avoids capture, collectors, probes, external endpoints, recovery inspection
+  and configuration/state writes. Malformed configuration reports omit raw values.
+- Added optional `--check-capture` and interface override. An isolated subprocess
+  uses normal interface selection and configured filtering, opens/closes without
+  reading packets, reports its protection scope and has a five-second deadline.
+- Replaced top-level ad hoc argument routing with typed commands and a common
+  option catalogue. Existing daemon/headless/view aliases remain; missing values,
+  duplicate/conflicting options and incomplete remote credentials fail early.
+- Found and fixed a Unix store-lock lifetime race exposed by concurrent subprocess
+  tests: owner drop now explicitly unlocks even while an inherited descriptor
+  temporarily references the same open-file description.
+
+Validation: **1031 tests passed, 3 ignored**, including three Linux doctor
+integration tests. Added coverage exercises CLI aliases/errors, snapshot JSON,
+80-column plain text, capture-child timeout, invalid interfaces, endpoint traps,
+unchanged configuration/recovery state, secret suppression and inherited lock
+descriptors. Clippy with warnings denied, no-default-features checking, formatting
+and diff checks passed. The actual static doctor command ran successfully against
+this host's configuration. See [the doctor contract](../doctor.md).
+
+Limits: privileged capture success, live protection acceptance, and macOS/Windows
+runtime checks remain outstanding. Static Windows DLL detection does not prove
+driver usability. An isolated capture open is not packet delivery, attribution or
+live-worker enforcement. Doctor JSON is a separate process's snapshot, not an
+inspection API for a running TUI. Endpoint-trap tests do not constitute a platform
+network syscall audit.
+
+Next implementation: **PR10 — Attribution identity and freshness**, alongside
+the outstanding privileged and platform acceptance work.
+
+## PR10 — Attribution identity, freshness and coverage
+
+Core changes implemented locally after PR09; neither phase is committed or
+released. The broader attribution acceptance gate remains open.
+
+- Linux socket ownership now joins protocol and endpoints to unambiguous inodes,
+  verifies the owning descriptor and process start/executable identity, and scopes
+  the join to the observer's network namespace. Startup snapshots expire after
+  five seconds and require live revalidation. Ambiguous, blocked, changed and
+  stale ownership stays unknown.
+- Added per-match observation time, stable unknown reason, process identity and
+  session flow generations. eBPF destination-only and PKTAP events can corroborate
+  polling evidence but cannot supply or overwrite an owner. Event caches enforce
+  freshness on lookup. Late executable lookup requires process-start identity.
+- TCP handshake reuse, observed close/reopen, idle UDP reuse and capture clear
+  distinguish capture generations. Rate baselines reset across generations;
+  process totals and CPU samples are separated by identity rather than PID alone.
+- Connections, Processes and Egress show flow and payload-byte coverage on separate
+  rows, with capture-drop availability reported independently. Runtime capability
+  snapshots carry structured coverage. Zero eligible payload flows and stale
+  snapshots are not measured; unknown flows remain in the denominator.
+- Added independent child workloads with PID/start/protocol/endpoint/time logs.
+  Linux TCP/UDP × IPv4/IPv6 each produced **4/4 correct observations, 0 wrong,
+  0 unknown** across two live owners and two polls. A third socket in each group
+  closed before polling and retained no owner. This is socket-polling evidence,
+  not a capture accuracy claim. Published results and reproducible commands are
+  in [the attribution contract](../attribution.md).
+
+Validation: **1045 tests passed, 3 ignored** (1042 library tests and three doctor
+integration tests). Fourteen added tests cover independent workloads, PID/flow
+reuse, conflicting coverage owners, unknown bytes, expiry, destination collisions,
+process totals, TCP/UDP generations and capture clear. Clippy with warnings denied,
+no-default-features checking, formatting and diff checks passed.
+
+Limits: no overall 95% attribution claim. Sustained and short-lived capture tests,
+privileged/missing-authority eBPF, actual sandbox restart and namespace/shared-socket
+workloads, macOS PKTAP and Windows polling remain acceptance work. macOS/Windows
+start-identity support is not implemented: polling names remain unverified and
+unverified CPU values are omitted. Reuse between polls without an observed TCP
+handshake, and UDP reuse within the idle window, remain visibility limits.
+Cgroup/workload identity is deferred; executable file identity is not a binary hash.
+
+Next implementation: **PR11 — Shared incident schema, snapshot/export and legacy
+reader**, while retaining the outstanding PR05/07/08/10 acceptance work.

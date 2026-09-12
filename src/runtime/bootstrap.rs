@@ -46,6 +46,10 @@ pub fn start(app: &mut App, kind: SessionKind, mode: sandbox::Mode) -> anyhow::R
     }
     tracing::info!(target: "netwatch::sandbox", summary = %report.summary(), "sandbox applied");
     app.sandbox_report = report;
+    if app.diagnose.journal.blocked_reason().is_none() && kind != SessionKind::Demo {
+        app.diagnose
+            .set_status(crate::runtime::capabilities::CapabilitySnapshot::live(app).compact());
+    }
     Ok(())
 }
 

@@ -608,6 +608,7 @@ mod tests {
             rx_rate: None,
             tx_rate: None,
             attribution: Default::default(),
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,

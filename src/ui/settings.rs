@@ -191,7 +191,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .min(area.width.saturating_sub(4));
     // +9 accounts for: 1 blank line, 1 sandbox-info row, 1 blank, 1 status
     // message row, 1 footer hint row + borders/padding.
-    let popup_height = (SETTINGS_COUNT as u16 + 9).min(area.height.saturating_sub(4));
+    let popup_height = (SETTINGS_COUNT as u16 + 14).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup = Rect::new(x, y, popup_width, popup_height);
@@ -259,24 +259,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // Landlock / cap-drop / Seatbelt actually applied so users can
     // confirm enforcement at runtime rather than trusting the README.
     lines.push(Line::raw(""));
-    let sandbox_summary = format!(
-        "{} · {}",
-        app.sandbox_report.summary(),
-        crate::sandbox::worker::summary()
-    );
-    let sandbox_color = if app.sandbox_report.mode.effective == Some("disabled") {
-        app.theme.text_muted
-    } else if crate::sandbox::worker::all_verified()
-        && app.sandbox_report.mode.warnings.is_empty()
-        && (app.sandbox_report.platform.landlock_abi > 0
-            || app.sandbox_report.platform.macos_seatbelt
-            || app.sandbox_report.platform.windows_restricted
-            || !app.sandbox_report.platform.caps_dropped.is_empty())
-    {
-        app.theme.status_good
-    } else {
-        app.theme.text_muted
-    };
+    let capabilities = crate::runtime::capabilities::CapabilitySnapshot::live(app);
+    let sandbox_summary = capabilities.get("sandbox").detail.clone();
+    let sandbox_color =
+        if capabilities.get("sandbox").state == crate::runtime::capabilities::State::Ready {
+            app.theme.status_good
+        } else {
+            app.theme.text_muted
+        };
     lines.push(Line::from(vec![
         Span::styled(
             format!("  {:<width$}", "Sandbox", width = label_width + 2),
@@ -301,6 +291,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_else(|| state.report.as_ref().unwrap().mode.warnings.join("; "));
         lines.push(Line::raw(format!("  {name}: {reason}")));
     }
+
+    lines.push(Line::raw(format!("  {}", capabilities.compact())));
+    lines.push(Line::raw("  Setup details: netwatch doctor --json"));
 
     // Status message
     lines.push(Line::raw(""));

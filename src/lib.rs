@@ -31,6 +31,7 @@
 #![allow(clippy::vec_init_then_push)]
 
 pub mod app;
+pub mod cli;
 pub mod clipboard;
 pub mod collectors;
 pub mod config;

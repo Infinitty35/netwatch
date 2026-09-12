@@ -21,7 +21,7 @@ use ratatui::{
 
 const SPARK: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Rows of chrome above the table body: tab bar (3) + table border + header.
-const HEADER_ROWS: u16 = 3;
+const HEADER_ROWS: u16 = 5;
 
 /// A destination paired with its display label and policy verdict.
 type ScoredDest<'a> = (&'a str, &'a EgressDest, Verdict);
@@ -329,11 +329,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),        // header
-            Constraint::Min(5),           // tree
-            Constraint::Length(detail_h), // detail pane (d)
-            Constraint::Length(warn_h),   // warnings
-            Constraint::Length(3),        // footer
+            Constraint::Length(HEADER_ROWS), // header and attribution coverage
+            Constraint::Min(5),              // tree
+            Constraint::Length(detail_h),    // detail pane (d)
+            Constraint::Length(warn_h),      // warnings
+            Constraint::Length(3),           // footer
         ])
         .split(area);
 
@@ -431,7 +431,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(t.text_muted),
         ));
     }
-    widgets::render_header_with_extra(f, app, area, extra);
+    widgets::render_attribution_header(f, app, area, extra);
 }
 
 /// The attention counts, shared by the header line and the panel title so

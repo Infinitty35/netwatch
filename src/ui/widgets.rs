@@ -649,6 +649,33 @@ pub fn render_header_with_extra(f: &mut Frame, app: &App, area: Rect, extra: Vec
     f.render_widget(header, area);
 }
 
+/// Keep coverage on its own rows so narrow terminals do not lose it after tabs.
+pub fn render_attribution_header(f: &mut Frame, app: &App, area: Rect, extra: Vec<Span<'static>>) {
+    render_header_with_extra(
+        f,
+        app,
+        Rect::new(area.x, area.y, area.width, area.height.min(3)),
+        extra,
+    );
+    if area.height > 3 {
+        let coverage = app.connection_collector.coverage();
+        let drops = coverage
+            .capture_drops
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "not measured".into());
+        let lines = vec![
+            Line::raw(coverage.summary()),
+            Line::raw(format!(
+                "Capture drops: {drops} · polling can miss short-lived flows"
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect::new(area.x, area.y + 3, area.width, area.height - 3),
+        );
+    }
+}
+
 /// Given a click column within the header row, return which tab was clicked (if any).
 pub fn tab_at_column(col: u16) -> Option<Tab> {
     let mut x = TAB_BAR_ORIGIN;

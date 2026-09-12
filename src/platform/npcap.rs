@@ -55,6 +55,12 @@ fn system_directory() -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(&buf[..len])))
 }
 
+/// Static file-presence check. Does not load the DLL or contact a driver.
+pub fn installed() -> bool {
+    system_directory()
+        .is_some_and(|p| p.join("Npcap/wpcap.dll").is_file() || p.join("wpcap.dll").is_file())
+}
+
 /// Add Npcap's install directory to the DLL search path, returning it when it
 /// was found and accepted.
 ///

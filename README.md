@@ -105,6 +105,8 @@ SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exp
 | | |
 |---|---|
 | [Capability matrix](docs/CAPABILITIES.md) | Platform differences, diagnostic limits and verification scope |
+| [Attribution evidence](docs/attribution.md) | Identity, freshness, coverage denominators and controlled results |
+| [Doctor command](docs/doctor.md) | Read-only setup report, JSON capabilities and optional capture check |
 | [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions, security |
 | [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
 | [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |

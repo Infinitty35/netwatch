@@ -116,6 +116,15 @@ pub struct Store {
     #[cfg(test)]
     fault: Option<Stage>,
 }
+impl Drop for Store {
+    fn drop(&mut self) {
+        // A concurrent fork can temporarily inherit the open-file description
+        // until exec closes O_CLOEXEC descriptors. Explicit unlock prevents that
+        // unrelated child from extending this owner's lease after Store drops.
+        let _ = self._lock.unlock();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
     BackupPartial,
@@ -406,6 +415,19 @@ mod tests {
                 b"installed",
             )
             .unwrap()
+    }
+
+    #[test]
+    fn dropping_owner_releases_lease_even_with_an_inherited_descriptor() {
+        let temp = Temp::new();
+        let store = Store::open(&temp.store()).unwrap();
+        let inherited = store._lock.try_clone().unwrap();
+        drop(store);
+        let next_owner = Store::open(&temp.store()).unwrap();
+        drop(inherited);
+        assert!(Store::open(&temp.store()).is_err());
+        drop(next_owner);
+        assert!(Store::open(&temp.store()).is_ok());
     }
 
     #[test]

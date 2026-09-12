@@ -9,18 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-/// Where the (pid, process_name) on a Connection came from.
-///
-/// `Lsof` is the userspace fallback (lsof/ss/netstat polling). `Pktap`
-/// means the attribution came from the macOS PKTAP kernel-level capture
-/// path. `Ebpf` means it came from netwatch-sdk's tcp_v4_connect kprobe
-/// on Linux. Both kernel paths catch short-lived flows that lsof misses
-/// and report the *thread* comm rather than the parent binary's name.
+/// Source of the socket-owner match. Kernel-event hints are recorded separately
+/// in MatchEvidence; backend readiness never changes an individual match's source.
+/// Pktap/Ebpf variants remain for serialized compatibility with historical rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AttributionSource {
     #[default]
     Lsof,
+    Procfs,
     Pktap,
     Ebpf,
 }
@@ -46,6 +43,7 @@ pub struct Connection {
     pub tx_rate: Option<f64>,
     #[serde(default)]
     pub attribution: AttributionSource,
+    pub evidence: super::attribution::MatchEvidence,
     /// Application-layer protocol detected by `crate::dpi` from the
     /// first non-trivial payload seen on this flow. `None` when capture
     /// isn't running, the flow hasn't been seen, or no classifier
@@ -182,6 +180,8 @@ struct RateState {
     prev: HashMap<StreamKey, (u64, u64)>,
     prev_time: Instant,
     rates: HashMap<StreamKey, (f64, f64)>,
+    generations: HashMap<StreamKey, u32>,
+    initialized: bool,
 }
 
 impl RateState {
@@ -190,6 +190,8 @@ impl RateState {
             prev: HashMap::new(),
             prev_time: Instant::now(),
             rates: HashMap::new(),
+            generations: HashMap::new(),
+            initialized: false,
         }
     }
 
@@ -230,6 +232,9 @@ pub struct ConnectionCollector {
     busy: Arc<AtomicBool>,
     stream_tracker: Arc<Mutex<StreamTracker>>,
     rate_state: Arc<Mutex<RateState>>,
+    flow_registry: Arc<Mutex<super::attribution::FlowRegistry>>,
+    coverage: Arc<RwLock<super::attribution::Coverage>>,
+    capture_stats: Option<Arc<super::packets::CaptureStats>>,
     #[cfg(target_os = "macos")]
     pktap: Option<Arc<PktapAttributor>>,
     #[cfg(feature = "ebpf")]
@@ -247,6 +252,9 @@ impl ConnectionCollector {
             busy: Arc::new(AtomicBool::new(false)),
             stream_tracker,
             rate_state: Arc::new(Mutex::new(RateState::new())),
+            flow_registry: Arc::new(Mutex::new(Default::default())),
+            coverage: Arc::new(RwLock::new(Default::default())),
+            capture_stats: None,
             #[cfg(target_os = "macos")]
             pktap: None,
             #[cfg(feature = "ebpf")]
@@ -260,7 +268,24 @@ impl ConnectionCollector {
     /// refcount bump regardless of connection count — the returned `Arc`
     /// derefs to `&Vec<Connection>` so call sites work with it like a slice.
     pub fn connections(&self) -> Arc<Vec<Connection>> {
-        Arc::clone(&safe_read(&self.snapshot, "connections::snapshot"))
+        let snapshot = Arc::clone(&safe_read(&self.snapshot, "connections::snapshot"));
+        if snapshot.iter().any(|c| !c.evidence.fresh()) {
+            let mut rows = (*snapshot).clone();
+            for row in &mut rows {
+                if !row.evidence.fresh() {
+                    row.pid = None;
+                    row.process_name = None;
+                    row.evidence.process = None;
+                    row.evidence.unknown_reason =
+                        Some(super::attribution::UnknownReason::StaleSnapshot);
+                    row.rx_rate = None;
+                    row.tx_rate = None;
+                }
+            }
+            Arc::new(rows)
+        } else {
+            snapshot
+        }
     }
 
     /// Attach a PKTAP attribution cache. When set, `update()` will overlay
@@ -273,9 +298,7 @@ impl ConnectionCollector {
     }
 
     /// Attach the eBPF attribution cache (Linux). When set, `update()` will
-    /// overlay (pid, comm) from the SDK's `tcp_v4_connect` kprobe onto
-    /// matching ss/lsof-discovered connections — same shape as the PKTAP
-    /// overlay on macOS.
+    /// retain corroborating hints from the SDK without replacing verified owners.
     #[cfg(feature = "ebpf")]
     pub fn with_ebpf(mut self, ebpf: Arc<crate::ebpf::conn_tracker::EbpfAttributor>) -> Self {
         self.ebpf = Some(ebpf);
@@ -293,12 +316,22 @@ impl ConnectionCollector {
     }
 
     /// Attach the pre-sandbox `/proc` attribution snapshot. Set in `App::prepare`
-    /// before `sandbox::apply` so pre-existing connections stay attributable
-    /// even after Landlock blocks live `/proc/<pid>/fd` reads.
+    /// before `sandbox::apply`. Reuse still requires current socket and identity
+    /// validation; blocked or expired entries remain unknown.
     #[cfg(target_os = "linux")]
     pub fn with_proc_snapshot(mut self, snapshot: Arc<ProcSnapshot>) -> Self {
         self.proc_snapshot = Some(snapshot);
         self
+    }
+
+    pub fn with_capture_stats(mut self, stats: Arc<super::packets::CaptureStats>) -> Self {
+        self.capture_stats = Some(stats);
+        self
+    }
+    pub fn coverage(&self) -> super::attribution::Coverage {
+        let mut coverage = safe_read(&self.coverage, "connections::coverage").clone();
+        coverage.capture_drops = self.capture_stats.as_ref().and_then(|s| s.observed_drops());
+        coverage
     }
 
     pub fn update(&self) {
@@ -312,6 +345,8 @@ impl ConnectionCollector {
         let busy = Arc::clone(&self.busy);
         let stream_tracker = Arc::clone(&self.stream_tracker);
         let rate_state = Arc::clone(&self.rate_state);
+        let flow_registry = Arc::clone(&self.flow_registry);
+        let coverage = Arc::clone(&self.coverage);
         #[cfg(target_os = "macos")]
         let pktap = self.pktap.clone();
         #[cfg(feature = "ebpf")]
@@ -328,16 +363,36 @@ impl ConnectionCollector {
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             let mut result: Vec<Connection> = Vec::new();
 
-            let (stream_bytes, app_protos, anomalies, handshake_rtts) = {
+            let (stream_bytes, app_protos, anomalies, handshake_rtts, generations) = {
                 let tracker = stream_tracker.lock().unwrap();
                 (
                     tracker.snapshot_bytes(),
                     tracker.snapshot_app_protocols(),
                     tracker.snapshot_anomalies(),
                     tracker.snapshot_handshake_rtts(),
+                    tracker.snapshot_generations(),
                 )
             };
             let mut state = rate_state.lock().unwrap();
+            // Never diff bytes across a reused tuple's capture generation.
+            let previous_generations = state.generations.clone();
+            state
+                .prev
+                .retain(|key, _| previous_generations.get(key) == generations.get(key));
+            let increments = stream_bytes
+                .iter()
+                .filter_map(|(key, &(a, b))| {
+                    let (pa, pb) = state
+                        .prev
+                        .get(key)
+                        .copied()
+                        .unwrap_or(if state.initialized { (0, 0) } else { (a, b) });
+                    let bytes = a.saturating_sub(pa).saturating_add(b.saturating_sub(pb));
+                    (bytes > 0).then(|| (key.clone(), bytes))
+                })
+                .collect::<HashMap<_, _>>();
+            state.initialized = true;
+            state.generations = generations.clone();
             state.tick(stream_bytes, Instant::now());
             for conn in &mut result {
                 if let Some((key, side)) = connection_stream_key(conn) {
@@ -397,12 +452,70 @@ impl ConnectionCollector {
             // corrects PKTAP and eBPF names too, not just lsof's.
             canonicalize_process_names(&mut result);
 
+            #[cfg(not(target_os = "linux"))]
+            for conn in &mut result {
+                conn.evidence.observe();
+                if conn.pid.is_some() {
+                    conn.evidence.unknown_reason =
+                        Some(super::attribution::UnknownReason::IdentityUnavailable);
+                }
+            }
+            flow_registry.lock().unwrap().reconcile(&mut result);
+            for conn in &mut result {
+                let capture_generation =
+                    connection_stream_key(conn).and_then(|(key, _)| generations.get(&key).copied());
+                if let Some(flow) = conn.evidence.flow.as_mut() {
+                    flow.capture_generation = capture_generation;
+                }
+            }
+            *safe_write(&coverage, "connections::coverage") =
+                measure_coverage(&result, &increments);
             let count = result.len();
             *safe_write(&snapshot, "connections::publish") = Arc::new(result);
             tracing::trace!(target: "netwatch::connections", count, "published connection snapshot");
             busy.store(false, Ordering::SeqCst);
         });
     }
+}
+
+fn measure_coverage(
+    connections: &[Connection],
+    increments: &HashMap<StreamKey, u64>,
+) -> super::attribution::Coverage {
+    let mut owners: HashMap<StreamKey, Option<super::attribution::ProcessIdentity>> =
+        HashMap::new();
+    for conn in connections {
+        if let Some((key, _)) = connection_stream_key(conn) {
+            let owner = conn
+                .evidence
+                .verified()
+                .then(|| conn.evidence.process.clone())
+                .flatten();
+            owners
+                .entry(key)
+                .and_modify(|old| {
+                    if *old != owner {
+                        *old = None;
+                    }
+                })
+                .or_insert(owner);
+        }
+    }
+    let mut coverage = super::attribution::Coverage {
+        completed_at: Some(Instant::now()),
+        completed_at_utc_ms: Some(super::attribution::utc_ms()),
+        ..Default::default()
+    };
+    for (key, bytes) in increments {
+        coverage.eligible_flows += 1;
+        coverage.eligible_payload_bytes = coverage.eligible_payload_bytes.saturating_add(*bytes);
+        if owners.get(key).is_some_and(Option::is_some) {
+            coverage.attributed_flows += 1;
+            coverage.attributed_payload_bytes =
+                coverage.attributed_payload_bytes.saturating_add(*bytes);
+        }
+    }
+    coverage
 }
 
 /// Replace each connection's process name with the identity derived from the
@@ -415,53 +528,73 @@ impl ConnectionCollector {
 /// version-installed tools is the version itself — Claude Code appeared under
 /// eight different "process names", one per release it had run.
 ///
-/// Resolution is per-tick cached by pid: a few hundred connections typically
-/// share a few dozen processes, and a pid cannot be recycled inside one
-/// snapshot. Nothing is cached across ticks, so a recycled pid can never
-/// inherit the previous occupant's name.
-///
-/// A pid the kernel won't answer for keeps whatever name it already had —
-/// this only ever upgrades attribution, never erases it.
+/// Resolution is cached within a poll by PID and process identity. Identity
+/// changes invalidate names rather than promoting old event names to a new PID.
 fn canonicalize_process_names(connections: &mut [Connection]) {
-    use std::collections::hash_map::Entry;
-    let mut cache: HashMap<u32, Option<String>> = HashMap::new();
+    let mut cache: HashMap<(u32, Option<super::attribution::ProcessIdentity>), Option<String>> =
+        HashMap::new();
     for conn in connections {
         let Some(pid) = conn.pid else {
             continue;
         };
-        let resolved = match cache.entry(pid) {
-            Entry::Occupied(e) => e.get().clone(),
-            Entry::Vacant(e) => e
-                .insert(crate::platform::procname::stable_name(pid))
-                .clone(),
-        };
-        if let Some(name) = resolved {
-            conn.process_name = Some(name);
+        let before = super::attribution::process_identity(pid);
+        // A later executable lookup without a start token could name a recycled
+        // PID. Retain the original polling observation without upgrading it.
+        if before.is_none() && conn.evidence.process.is_none() {
+            continue;
+        }
+        if conn
+            .evidence
+            .process
+            .as_ref()
+            .is_some_and(|expected| before.as_ref() != Some(expected))
+        {
+            conn.pid = None;
+            conn.process_name = None;
+            conn.evidence.process = None;
+            conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::IdentityChanged);
+            continue;
+        }
+        let resolved = cache
+            .entry((pid, before.clone()))
+            .or_insert_with(|| crate::platform::procname::stable_name(pid))
+            .clone();
+        let after = super::attribution::process_identity(pid);
+        if before == after {
+            if let Some(name) = resolved {
+                conn.process_name = Some(name);
+            }
+        } else {
+            conn.pid = None;
+            conn.process_name = None;
+            conn.evidence.process = None;
+            conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::IdentityChanged);
         }
     }
 }
 
-/// For each lsof-discovered connection whose 5-tuple appears in the PKTAP
-/// cache, replace the userspace-scraped (pid, process_name) with the
-/// kernel-attributed values and flip `attribution` to `Pktap`. Connections
-/// not present in the cache are left untouched.
+/// A recent PKTAP event may corroborate a polling PID but cannot replace it.
+/// Without platform start identity this remains an unverified polling observation.
 #[cfg(target_os = "macos")]
 fn overlay_pktap_attribution(connections: &mut [Connection], pktap: &PktapAttributor) {
     for conn in connections {
         if let Some((key, _)) = connection_stream_key(conn) {
             if let Some(attr) = pktap.lookup(&key) {
-                conn.pid = Some(attr.pid);
-                conn.process_name = Some(attr.comm);
-                conn.attribution = AttributionSource::Pktap;
+                if conn.pid != Some(attr.pid)
+                    || attr.seen_at.elapsed() > super::attribution::MAX_MATCH_AGE
+                {
+                    continue;
+                }
+                conn.evidence.corroborated_by = Some("pktap".into());
+                conn.evidence.event_age_at_match_ms =
+                    Some(attr.seen_at.elapsed().as_millis() as u64);
             }
         }
     }
 }
 
-/// Overlay (pid, comm) from netwatch-sdk's `tcp_v4_connect`/`tcp_v6_connect`
-/// kprobes onto matching connections. Cache key is `(daddr, dport)` — the
-/// kprobes can't read the socket's source addr/port at connect-entry. Only
-/// TCP rows are candidates; everything else is left untouched.
+/// Destination-only eBPF events are hints, never independent socket ownership.
+/// Retain polling evidence and annotate corroboration only for the same verified PID.
 #[cfg(feature = "ebpf")]
 fn overlay_ebpf_attribution(
     connections: &mut [Connection],
@@ -485,9 +618,15 @@ fn overlay_ebpf_attribution(
             continue;
         };
         if let Some(attr) = ebpf.lookup(proto, daddr, dport) {
-            conn.pid = Some(attr.pid);
-            conn.process_name = Some(attr.comm);
-            conn.attribution = AttributionSource::Ebpf;
+            if conn.pid != Some(attr.pid) || !conn.evidence.verified() {
+                if conn.pid.is_none() {
+                    conn.evidence.unknown_reason =
+                        Some(super::attribution::UnknownReason::IncompleteEventKey);
+                }
+                continue;
+            }
+            conn.evidence.corroborated_by = Some("ebpf_destination_hint".into());
+            conn.evidence.event_age_at_match_ms = Some(attr.seen_at.elapsed().as_millis() as u64);
         }
     }
 }
@@ -698,6 +837,7 @@ fn parse_lsof() -> Vec<Connection> {
                 rx_rate: None,
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
+                evidence: Default::default(),
                 app_protocol: None,
                 retransmits: 0,
                 out_of_order: 0,
@@ -829,6 +969,7 @@ fn parse_linux_connections() -> Vec<Connection> {
                 rx_rate: None,
                 tx_rate: None,
                 attribution: AttributionSource::Lsof,
+                evidence: Default::default(),
                 app_protocol: None,
                 retransmits: 0,
                 out_of_order: 0,
@@ -916,16 +1057,26 @@ fn read_proc_comm(pid: u32) -> String {
         .unwrap_or_else(|| format!("pid:{pid}"))
 }
 
-/// socket inode → (pid, comm), built by scanning `/proc/<pid>/fd/*` for
-/// `socket:[<inode>]` symlinks. Only sees PIDs the current uid is allowed to
-/// inspect — that's the kernel's call, and it's strictly more than `ss -p`
-/// surfaces for an unprivileged caller (which is nothing).
+/// Socket ownership is retained only when start/executable identity is stable
+/// across descriptor enumeration. Shared sockets are explicitly ambiguous.
 #[cfg(target_os = "linux")]
-fn socket_inode_owners() -> HashMap<u64, (u32, String)> {
-    let mut map: HashMap<u64, (u32, String)> = HashMap::new();
+#[derive(Clone)]
+struct SocketOwner {
+    identity: super::attribution::ProcessIdentity,
+    comm: String,
+    fd: std::path::PathBuf,
+}
+#[cfg(target_os = "linux")]
+fn socket_inode_owners() -> HashMap<u64, Option<SocketOwner>> {
+    let mut map: HashMap<u64, Option<SocketOwner>> = HashMap::new();
     let Ok(proc) = std::fs::read_dir("/proc") else {
         return map;
     };
+    let our_namespace =
+        super::attribution::process_identity(std::process::id()).and_then(|p| p.network_namespace);
+    if our_namespace.is_none() {
+        return map;
+    }
     for entry in proc.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -934,10 +1085,17 @@ fn socket_inode_owners() -> HashMap<u64, (u32, String)> {
         else {
             continue;
         };
+        let Some(identity) = super::attribution::process_identity(pid) else {
+            continue;
+        };
+        if identity.network_namespace != our_namespace {
+            continue;
+        }
         let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
             continue;
         };
-        let mut comm: Option<String> = None;
+        let comm = read_proc_comm(pid);
+        let mut sockets = Vec::new();
         for fd in fds.flatten() {
             let Ok(target) = std::fs::read_link(fd.path()) else {
                 continue;
@@ -950,138 +1108,187 @@ fn socket_inode_owners() -> HashMap<u64, (u32, String)> {
             else {
                 continue;
             };
-            let name = comm.get_or_insert_with(|| read_proc_comm(pid)).clone();
-            map.entry(inode).or_insert((pid, name));
+            sockets.push((inode, fd.path()));
+        }
+        if super::attribution::process_identity(pid).as_ref() != Some(&identity) {
+            continue;
+        }
+        for (inode, fd) in sockets {
+            map.entry(inode)
+                .and_modify(|owner| {
+                    if owner.as_ref().is_some_and(|o| o.identity != identity) {
+                        *owner = None;
+                    }
+                })
+                .or_insert_with(|| {
+                    Some(SocketOwner {
+                        identity: identity.clone(),
+                        comm: comm.clone(),
+                        fd,
+                    })
+                });
         }
     }
     map
 }
-
-/// Index of the kernel socket tables: a 5-tuple map for precise matches and a
-/// local-endpoint map as a fallback for sockets with no distinct peer (UDP,
-/// LISTEN). Values are socket inodes joined against `socket_inode_owners()`.
-/// `(address, port)` — one end of a socket as `/proc/net/*` reports it.
 #[cfg(target_os = "linux")]
 type Endpoint = (std::net::IpAddr, u16);
-
+#[cfg(target_os = "linux")]
+type SocketKey = (StreamProtocol, Endpoint, Endpoint);
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct ProcNetIndex {
-    by_pair: HashMap<(Endpoint, Endpoint), u64>,
-    by_local: HashMap<Endpoint, u64>,
+    by_pair: HashMap<SocketKey, u64>,
 }
-
 #[cfg(target_os = "linux")]
 fn proc_net_inode_index() -> ProcNetIndex {
     let mut idx = ProcNetIndex::default();
-    for path in [
-        "/proc/net/tcp",
-        "/proc/net/tcp6",
-        "/proc/net/udp",
-        "/proc/net/udp6",
+    for (path, protocol) in [
+        ("/proc/net/tcp", StreamProtocol::Tcp),
+        ("/proc/net/tcp6", StreamProtocol::Tcp),
+        ("/proc/net/udp", StreamProtocol::Udp),
+        ("/proc/net/udp6", StreamProtocol::Udp),
     ] {
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         for line in text.lines().skip(1) {
-            // sl local rem st tx:rx tr:when retrnsmt uid timeout inode ...
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 10 {
                 continue;
             }
-            let Some(local) = parse_proc_net_hex(cols[1]) else {
-                continue;
-            };
-            let Ok(inode) = cols[9].parse::<u64>() else {
+            let (Some(local), Some(remote), Ok(inode)) = (
+                parse_proc_net_hex(cols[1]),
+                parse_proc_net_hex(cols[2]),
+                cols[9].parse::<u64>(),
+            ) else {
                 continue;
             };
             if inode == 0 {
                 continue;
             }
-            if let Some(remote) = parse_proc_net_hex(cols[2]) {
-                idx.by_pair.entry((local, remote)).or_insert(inode);
-            }
-            idx.by_local.entry(local).or_insert(inode);
+            // SO_REUSEPORT and shared endpoints must not select an arbitrary owner.
+            idx.by_pair
+                .entry((protocol, local, remote))
+                .and_modify(|old| {
+                    if *old != inode {
+                        *old = 0;
+                    }
+                })
+                .or_insert(inode);
         }
     }
     idx
 }
-
-/// Fill `process_name`/`pid` on any connection `ss` left nameless, using the
-/// native `/proc` join. No-op (and no `/proc` scan) when everything is already
-/// attributed — the common privileged case where `ss -p` worked.
+#[cfg(target_os = "linux")]
+fn socket_key(conn: &Connection) -> Option<SocketKey> {
+    let protocol = stream_protocol(&conn.protocol)?;
+    let local = normalize_addr(&conn.local_addr)?;
+    let remote = normalize_addr(&conn.remote_addr).or_else(|| {
+        // Wildcard peer is legitimate for an unconnected UDP or listening socket.
+        (conn.remote_addr == "*:*" || conn.remote_addr.ends_with(":*")).then(|| {
+            (
+                if local.0.is_ipv4() {
+                    std::net::IpAddr::from([0, 0, 0, 0])
+                } else {
+                    std::net::IpAddr::from([0u16; 8])
+                },
+                0,
+            )
+        })
+    })?;
+    Some((protocol, local, remote))
+}
+#[cfg(target_os = "linux")]
+fn owner_still_valid(owner: &SocketOwner, inode: u64) -> bool {
+    let target = format!("socket:[{inode}]");
+    std::fs::read_link(&owner.fd)
+        .ok()
+        .is_some_and(|p| p == std::path::Path::new(&target))
+        && super::attribution::process_identity(owner.identity.pid).as_ref()
+            == Some(&owner.identity)
+}
+#[cfg(target_os = "linux")]
+fn apply_owner(conn: &mut Connection, owner: &SocketOwner) {
+    conn.attribution = AttributionSource::Procfs;
+    conn.pid = Some(owner.identity.pid);
+    conn.process_name = Some(owner.comm.clone());
+    conn.evidence.process = Some(owner.identity.clone());
+    conn.evidence.unknown_reason = None;
+    conn.evidence.observe();
+}
+/// Revalidate every Linux polling match, including ss-provided PIDs. A PID name
+/// alone cannot establish that the socket still belongs to that process.
 #[cfg(target_os = "linux")]
 fn overlay_proc_attribution(connections: &mut [Connection]) {
-    if connections.iter().all(|c| c.process_name.is_some()) {
-        return;
-    }
     let index = proc_net_inode_index();
     let owners = socket_inode_owners();
-    if owners.is_empty() {
-        return;
-    }
-    for conn in connections.iter_mut() {
-        if conn.process_name.is_some() {
-            continue;
+    for conn in connections {
+        conn.pid = None;
+        conn.process_name = None;
+        conn.evidence.observe();
+        let inode = socket_key(conn).and_then(|key| index.by_pair.get(&key).copied());
+        if inode == Some(0) {
+            conn.evidence.unknown_reason =
+                Some(super::attribution::UnknownReason::AmbiguousEndpoint);
         }
-        let Some(local) = normalize_addr(&conn.local_addr) else {
-            continue;
-        };
-        let inode = normalize_addr(&conn.remote_addr)
-            .and_then(|remote| index.by_pair.get(&(local, remote)).copied())
-            .or_else(|| index.by_local.get(&local).copied());
-        if let Some((pid, comm)) = inode.and_then(|i| owners.get(&i)) {
-            conn.pid = Some(*pid);
-            conn.process_name = Some(comm.clone());
+        if let Some((inode, owner)) =
+            inode.and_then(|i| owners.get(&i).and_then(|o| o.as_ref()).map(|o| (i, o)))
+        {
+            if owner_still_valid(owner, inode) {
+                apply_owner(conn, owner);
+            } else {
+                conn.evidence.unknown_reason =
+                    Some(super::attribution::UnknownReason::IdentityChanged);
+            }
         }
     }
 }
-
-/// Pre-sandbox `/proc` attribution snapshot: `(local, remote) → (pid, comm)`
-/// for every socket visible at capture time. Built ONCE at startup, *before*
-/// the Landlock sandbox is applied — Landlock's process-introspection scoping
-/// otherwise blocks reading other processes' `/proc/<pid>/fd`, so this is the
-/// only way to attribute connections that predate netwatch when sandboxed.
-/// (eBPF covers connections opened after startup.)
+/// Pre-sandbox evidence is a hint, never authority based on endpoint reuse.
 #[cfg(target_os = "linux")]
-pub type ProcSnapshot = HashMap<((std::net::IpAddr, u16), (std::net::IpAddr, u16)), (u32, String)>;
-
-/// Capture the snapshot. Must be called before `sandbox::apply`. As root this
-/// sees every process; unprivileged it sees the caller's own — same visibility
-/// rules as `ss`/`/proc`.
+pub struct ProcSnapshot {
+    entries: HashMap<SocketKey, (u64, SocketOwner)>,
+    captured_at: Instant,
+}
 #[cfg(target_os = "linux")]
 pub fn capture_proc_snapshot() -> ProcSnapshot {
     let index = proc_net_inode_index();
     let owners = socket_inode_owners();
-    let mut out = HashMap::new();
-    for (pair, inode) in index.by_pair {
-        if let Some(owner) = owners.get(&inode) {
-            out.insert(pair, owner.clone());
-        }
+    let entries = index
+        .by_pair
+        .into_iter()
+        .filter_map(|(key, inode)| {
+            owners
+                .get(&inode)
+                .and_then(|o| o.clone())
+                .map(|o| (key, (inode, o)))
+        })
+        .collect();
+    ProcSnapshot {
+        entries,
+        captured_at: Instant::now(),
     }
-    out
 }
-
-/// Fill nameless connections from the pre-sandbox snapshot — sandbox-safe
-/// (no live `/proc` read). Matches on the full `(local, remote)` 5-tuple.
 #[cfg(target_os = "linux")]
 fn overlay_proc_snapshot(connections: &mut [Connection], snap: &ProcSnapshot) {
-    if snap.is_empty() {
-        return;
-    }
-    for conn in connections.iter_mut() {
-        if conn.process_name.is_some() {
+    let index = proc_net_inode_index();
+    for conn in connections {
+        if conn.pid.is_some() {
             continue;
         }
-        let (Some(local), Some(remote)) = (
-            normalize_addr(&conn.local_addr),
-            normalize_addr(&conn.remote_addr),
-        ) else {
+        let Some(key) = socket_key(conn) else {
             continue;
         };
-        if let Some((pid, comm)) = snap.get(&(local, remote)) {
-            conn.pid = Some(*pid);
-            conn.process_name = Some(comm.clone());
+        let Some((inode, owner)) = snap.entries.get(&key) else {
+            continue;
+        };
+        if snap.captured_at.elapsed() > super::attribution::MAX_MATCH_AGE {
+            conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::StaleSnapshot);
+        } else if index.by_pair.get(&key) == Some(inode) && owner_still_valid(owner, *inode) {
+            apply_owner(conn, owner);
+        } else {
+            conn.evidence.unknown_reason =
+                Some(super::attribution::UnknownReason::IdentityUnavailable);
         }
     }
 }
@@ -1206,6 +1413,7 @@ fn parse_windows_connections() -> Vec<Connection> {
             rx_rate: None,
             tx_rate: None,
             attribution: AttributionSource::Lsof,
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
@@ -1279,7 +1487,7 @@ mod tests {
     /// Unix only: Windows has no executable-path resolver, so `stable_name`
     /// returns None there by design and names are left as scraped — asserted
     /// separately in `canonicalize_is_inert_without_a_resolver`.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonicalize_replaces_the_scraped_name_for_a_live_pid() {
         let mut conns = vec![make_conn(
@@ -1320,7 +1528,7 @@ mod tests {
 
     /// On a platform with no executable-path resolver, canonicalisation is
     /// a no-op rather than a name-eraser — the scraped name is all there is.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn canonicalize_is_inert_without_a_resolver() {
         let mut conns = vec![make_conn(
@@ -1355,7 +1563,7 @@ mod tests {
     /// Two connections from one process resolve to the same name — the
     /// per-tick cache must not diverge between rows. Unix only, for the same
     /// reason as above.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn canonicalize_is_consistent_across_rows_of_one_process() {
         let me = std::process::id();
@@ -1371,6 +1579,299 @@ mod tests {
         assert_eq!(conns[0].process_name, conns[1].process_name);
     }
 
+    #[test]
+    fn coverage_counts_unknown_capture_flows_and_bytes_separately() {
+        let mut c = make_conn("TCP", "127.0.0.1:100", "127.0.0.1:200", "ESTABLISHED", 1);
+        c.evidence.process = Some(super::super::attribution::ProcessIdentity {
+            session: "test".into(),
+            pid: 1,
+            start_token: "one".into(),
+            executable: None,
+            network_namespace: None,
+        });
+        c.evidence.unknown_reason = None;
+        c.evidence.observe();
+        let key = connection_stream_key(&c).unwrap().0;
+        let unknown = StreamKey::new(StreamProtocol::Udp, "127.0.0.1", 300, "127.0.0.1", 400);
+        let increments = HashMap::from([(key, 100), (unknown, 900)]);
+        let coverage = measure_coverage(&[c.clone()], &increments);
+        assert_eq!((coverage.attributed_flows, coverage.eligible_flows), (1, 2));
+        assert_eq!(
+            (
+                coverage.attributed_payload_bytes,
+                coverage.eligible_payload_bytes
+            ),
+            (100, 1000)
+        );
+        let mut conflict = c.clone();
+        conflict.evidence.process.as_mut().unwrap().start_token = "reused".into();
+        assert_eq!(
+            measure_coverage(&[c.clone(), conflict], &increments).attributed_flows,
+            0
+        );
+        c.evidence.observed_at = Some(Instant::now() - std::time::Duration::from_secs(10));
+        assert_eq!(measure_coverage(&[c], &increments).attributed_flows, 0);
+    }
+    #[test]
+    fn reused_pid_or_missing_poll_starts_new_flow_generation() {
+        let mut registry = super::super::attribution::FlowRegistry::default();
+        let mut rows = vec![make_conn(
+            "TCP",
+            "127.0.0.1:100",
+            "127.0.0.1:200",
+            "ESTABLISHED",
+            1,
+        )];
+        rows[0].evidence.process = Some(super::super::attribution::ProcessIdentity {
+            session: "test".into(),
+            pid: 1,
+            start_token: "one".into(),
+            executable: Some("binary1".into()),
+            network_namespace: None,
+        });
+        registry.reconcile(&mut rows);
+        let first = rows[0].evidence.flow.as_ref().unwrap().generation;
+        registry.reconcile(&mut rows);
+        assert_eq!(first, rows[0].evidence.flow.as_ref().unwrap().generation);
+        rows[0].evidence.process.as_mut().unwrap().start_token = "two".into();
+        registry.reconcile(&mut rows);
+        let reused = rows[0].evidence.flow.as_ref().unwrap().generation;
+        assert_ne!(first, reused);
+        registry.reconcile(&mut []);
+        registry.reconcile(&mut rows);
+        assert_ne!(reused, rows[0].evidence.flow.as_ref().unwrap().generation);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_identity_cannot_name_a_reused_pid() {
+        let mut c = make_conn(
+            "TCP",
+            "127.0.0.1:100",
+            "127.0.0.1:200",
+            "ESTABLISHED",
+            std::process::id(),
+        );
+        let mut identity = super::super::attribution::process_identity(std::process::id()).unwrap();
+        identity.start_token = "wrong-start".into();
+        c.evidence.process = Some(identity);
+        canonicalize_process_names(std::slice::from_mut(&mut c));
+        assert!(c.pid.is_none());
+        assert!(c.process_name.is_none());
+        assert_eq!(
+            c.evidence.unknown_reason,
+            Some(super::super::attribution::UnknownReason::IdentityChanged)
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_snapshot_expires_and_revalidates_socket_identity() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect("127.0.0.1:45678").unwrap();
+        let mut snap = capture_proc_snapshot();
+        let mut c = make_conn(
+            "UDP",
+            &socket.local_addr().unwrap().to_string(),
+            "127.0.0.1:45678",
+            "",
+            1,
+        );
+        c.pid = None;
+        c.process_name = None;
+        overlay_proc_snapshot(std::slice::from_mut(&mut c), &snap);
+        assert_eq!(c.pid, Some(std::process::id()));
+        c.pid = None;
+        c.process_name = None;
+        c.evidence = Default::default();
+        snap.captured_at = Instant::now() - std::time::Duration::from_secs(10);
+        overlay_proc_snapshot(std::slice::from_mut(&mut c), &snap);
+        assert!(c.pid.is_none());
+        assert_eq!(
+            c.evidence.unknown_reason,
+            Some(super::super::attribution::UnknownReason::StaleSnapshot)
+        );
+        snap.captured_at = Instant::now();
+        drop(socket);
+        overlay_proc_snapshot(std::slice::from_mut(&mut c), &snap);
+        assert!(c.pid.is_none());
+    }
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn destination_event_never_overwrites_an_independent_owner() {
+        let ebpf = crate::ebpf::conn_tracker::EbpfAttributor::new();
+        ebpf.record_for_test(
+            netwatch_sdk::ebpf::Protocol::Tcp,
+            "127.0.0.1".parse().unwrap(),
+            443,
+            98765,
+        );
+        let mut c = make_conn(
+            "TCP",
+            "127.0.0.1:100",
+            "127.0.0.1:443",
+            "ESTABLISHED",
+            12345,
+        );
+        overlay_ebpf_attribution(std::slice::from_mut(&mut c), &ebpf);
+        assert_eq!(c.pid, Some(12345));
+        c.pid = None;
+        c.process_name = None;
+        overlay_ebpf_attribution(std::slice::from_mut(&mut c), &ebpf);
+        assert!(c.pid.is_none());
+        assert_eq!(
+            c.evidence.unknown_reason,
+            Some(super::super::attribution::UnknownReason::IncompleteEventKey)
+        );
+    }
+
+    /// Independent child emits its own endpoints/start token. No collector code
+    /// participates in generating expected ownership. Used by the controlled matrix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controlled_workload_child() {
+        use std::io::Write;
+        let Ok(remote) = std::env::var("NETWATCH_ATTR_REMOTE") else {
+            return;
+        };
+        let protocol = std::env::var("NETWATCH_ATTR_PROTOCOL").unwrap();
+        let short = std::env::var("NETWATCH_ATTR_SHORT").is_ok();
+        let pid = std::process::id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let start = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap();
+        let (local, socket): (String, Box<dyn std::any::Any>) = if protocol == "TCP" {
+            let mut socket = std::net::TcpStream::connect(&remote).unwrap();
+            socket
+                .write_all(b"independent attribution workload")
+                .unwrap();
+            (socket.local_addr().unwrap().to_string(), Box::new(socket))
+        } else {
+            let socket = std::net::UdpSocket::bind(if remote.starts_with('[') {
+                "[::1]:0"
+            } else {
+                "127.0.0.1:0"
+            })
+            .unwrap();
+            socket.connect(&remote).unwrap();
+            socket.send(b"independent attribution workload").unwrap();
+            (socket.local_addr().unwrap().to_string(), Box::new(socket))
+        };
+        let socket = if short {
+            drop(socket);
+            None
+        } else {
+            Some(socket)
+        };
+        println!(
+            "ATTR_EXPECTED {}",
+            serde_json::json!({"pid":pid,"start":start,"protocol":protocol,"local":local,"remote":remote,"short":short,"logged_at_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()})
+        );
+        std::io::stdout().flush().unwrap();
+        // Parent owns lifetime and always kills/reaps this test subprocess.
+        let _keep_open = socket;
+        loop {
+            std::thread::park();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controlled_polling_matrix_matches_independent_processes() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for ipv6 in [false, true] {
+            for protocol in ["TCP", "UDP"] {
+                let bind = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+                let (remote, _server): (String, Box<dyn std::any::Any>) = if protocol == "TCP" {
+                    let listener = std::net::TcpListener::bind(bind).unwrap();
+                    (
+                        listener.local_addr().unwrap().to_string(),
+                        Box::new(listener),
+                    )
+                } else {
+                    let socket = std::net::UdpSocket::bind(bind).unwrap();
+                    (socket.local_addr().unwrap().to_string(), Box::new(socket))
+                };
+                let mut children = Vec::new();
+                let mut expected = Vec::new();
+                // Two independent owners sharing a destination plus a flow closed
+                // before the poll: incorrect and unknown must remain separate.
+                for short in [false, false, true] {
+                    let mut cmd = Command::new(std::env::current_exe().unwrap());
+                    cmd.args([
+                        "--exact",
+                        "collectors::connections::tests::controlled_workload_child",
+                        "--nocapture",
+                    ])
+                    .env("NETWATCH_ATTR_REMOTE", &remote)
+                    .env("NETWATCH_ATTR_PROTOCOL", protocol)
+                    .env_remove("NETWATCH_ATTR_SHORT")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit());
+                    if short {
+                        cmd.env("NETWATCH_ATTR_SHORT", "1");
+                    }
+                    let mut child = Child(cmd.spawn().unwrap());
+                    let stdout = child.0.stdout.take().unwrap();
+                    let record = BufReader::new(stdout)
+                        .lines()
+                        .map(Result::unwrap)
+                        .find_map(|line| line.strip_prefix("ATTR_EXPECTED ").map(str::to_owned))
+                        .expect("child record");
+                    println!("ATTR_EXPECTED {record}");
+                    expected.push(serde_json::from_str::<serde_json::Value>(&record).unwrap());
+                    children.push(child);
+                }
+                // These sockets predate collection and remain open over repeat polls.
+                for poll in 0..2 {
+                    let actual = parse_linux_connections();
+                    let (mut correct, mut wrong, mut unknown) = (0, 0, 0);
+                    for expected in &expected {
+                        let row = actual.iter().find(|c| {
+                            c.protocol == protocol
+                                && c.local_addr == expected["local"].as_str().unwrap()
+                                && c.remote_addr == remote
+                        });
+                        if expected["short"].as_bool().unwrap() {
+                            assert!(
+                                row.is_none_or(|r| r.pid.is_none()),
+                                "closed flow must not retain an owner: {row:?}"
+                            );
+                            continue;
+                        }
+                        match row.and_then(|c| c.evidence.process.as_ref()) {
+                            Some(identity)
+                                if identity.pid == expected["pid"].as_u64().unwrap() as u32
+                                    && identity.start_token
+                                        == expected["start"].as_str().unwrap() =>
+                            {
+                                correct += 1
+                            }
+                            Some(_) => wrong += 1,
+                            None => unknown += 1,
+                        }
+                    }
+                    println!(
+                        "ATTR_RESULT {}",
+                        serde_json::json!({"platform":"linux","backend":"procfs_polling","protocol":protocol,"family":if ipv6 {"ipv6"} else {"ipv4"},"poll":poll,"eligible":2,"correct":correct,"wrong":wrong,"unknown":unknown,"closed_before_poll":1})
+                    );
+                    assert_eq!((correct, wrong, unknown), (2, 0, 0));
+                }
+                drop(children);
+            }
+        }
+    }
+
     fn make_conn(proto: &str, local: &str, remote: &str, state: &str, pid: u32) -> Connection {
         Connection {
             protocol: proto.into(),
@@ -1383,6 +1884,7 @@ mod tests {
             rx_rate: None,
             tx_rate: None,
             attribution: AttributionSource::Lsof,
+            evidence: Default::default(),
             app_protocol: None,
             retransmits: 0,
             out_of_order: 0,
