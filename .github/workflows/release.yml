@@ -214,7 +214,7 @@ jobs:
             export CC_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-gcc
             export AR_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-ar
             export LIBPCAP_LIBDIR=/tmp/pcap-out/lib
-            # pcap can't read the version of an ARM library from this
+            # pcap cannot read the version of an ARM library from this
             # x86_64 host, so pin it like the musl builds do.
             export LIBPCAP_VER=${LIBPCAP_VERSION}
             cd /work
