@@ -10,6 +10,8 @@
 //! Every threshold that isn't a physical constant comes from [`Thresholds`],
 //! so a user ruleset can retune the engine without touching this file.
 
+use serde::{Deserialize, Serialize};
+
 use super::baseline::BaselineStore;
 use super::issue::{
     Action, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject, Verify,
@@ -75,7 +77,7 @@ impl Default for Thresholds {
 }
 
 /// One socket's kernel state, as `tcp_info` reports it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SocketObs {
     pub local: String,
     pub remote: String,
@@ -178,7 +180,7 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
 }
 
 /// One hop of a traced path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HopObs {
     pub number: u8,
     pub ip: Option<String>,
@@ -192,7 +194,7 @@ pub struct HopObs {
     pub silent: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathObs {
     pub target: String,
     pub hops: Vec<HopObs>,
@@ -201,7 +203,7 @@ pub struct PathObs {
     pub traced_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IfaceObs {
     pub name: String,
     pub carrier: bool,
@@ -235,7 +237,7 @@ impl IfaceObs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DnsObs {
     pub resolver: String,
     pub rtt_p50_ms: Option<f64>,
@@ -260,7 +262,7 @@ pub struct DnsObs {
 
 /// A public name asked of the configured resolver and of a validating
 /// reference, and whether they agreed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DnsCross {
     pub name: String,
     pub local: Vec<String>,
@@ -274,13 +276,13 @@ pub struct DnsCross {
 }
 
 /// What STUN said about the NAT in front of us.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NatObs {
     pub mappings: Vec<(String, String)>,
     pub symmetric: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayObs {
     pub addr: Option<String>,
     pub rtt_ms: Option<f64>,
@@ -301,7 +303,10 @@ pub struct GatewayObs {
 }
 
 /// Everything a detector pass gets to look at.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Serialisable so an episode can store exactly what the detectors saw and
+/// replay it. `default` keeps older recordings loadable as fields are added.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Observations {
     pub now: String,
     pub iface: Option<IfaceObs>,
@@ -364,7 +369,37 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out.extend(detect_sockets(obs, t));
     out.extend(detect_bufferbloat_local(obs, t));
     out.extend(detect_nat(obs));
+    debug_assert!(
+        out.iter().all(|d| ids_are_valid(d).is_ok()),
+        "{:?}",
+        out.iter()
+            .filter_map(|d| ids_are_valid(d).err())
+            .collect::<Vec<_>>()
+    );
     out
+}
+
+/// Every cause id valid and unique within its detection, every check id valid
+/// and unique within its cause. Checked on every `detect` in debug builds, so
+/// any test that reaches a detector branch also checks the ids it emits.
+fn ids_are_valid(d: &Detection) -> Result<(), String> {
+    let mut causes = std::collections::HashSet::new();
+    for c in &d.causes {
+        if !Cause::valid_id(&c.id) || !causes.insert(c.id.as_str()) {
+            return Err(format!("{}: bad or duplicate cause id {:?}", d.rule, c.id));
+        }
+        let mut checks = std::collections::HashSet::new();
+        for k in &c.checks {
+            if !Cause::valid_id(&k.id) || !checks.insert(k.id.as_str()) {
+                return Err(format!(
+                    "{}: bad or duplicate check id {:?}",
+                    c.key(d.rule),
+                    k.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- link
@@ -386,12 +421,19 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             .push(Evidence::new("iface.carrier", 0.0, "").with_window(1, 1));
         d.causes = vec![
             Cause::new(
+                "unplugged_or_port_down",
                 "cable unplugged or the port is down",
-                vec![CheckResult::fail("carrier", "no carrier on the interface")],
+                vec![CheckResult::fail(
+                    "carrier",
+                    "carrier",
+                    "no carrier on the interface",
+                )],
             ),
             Cause::new(
+                "wifi_disassociated",
                 "wifi disassociated",
                 vec![CheckResult::skipped(
+                    "wireless",
                     "wireless",
                     "no wireless statistics for this interface",
                 )],
@@ -432,9 +474,11 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
         );
         d.causes = vec![
             Cause::new(
+                "ring_buffer_small",
                 "ring buffer too small for the offered rate",
                 vec![if iface.drops_per_min > iface.errors_per_min {
                     CheckResult::pass(
+                        "drops_dominate",
                         "drops dominate",
                         format!(
                             "{} drops vs {} errors",
@@ -443,6 +487,7 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
                     )
                 } else {
                     CheckResult::fail(
+                        "drops_dominate",
                         "drops dominate",
                         format!(
                             "{} drops vs {} errors",
@@ -452,14 +497,17 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
                 }],
             ),
             Cause::new(
+                "bad_cable_or_duplex",
                 "bad cable or duplex mismatch",
                 vec![if iface.errors_per_min > iface.drops_per_min {
                     CheckResult::pass(
+                        "errors_dominate",
                         "errors dominate",
                         format!("{} errors this window", iface.errors_per_min),
                     )
                 } else {
                     CheckResult::fail(
+                        "errors_dominate",
                         "errors dominate",
                         format!("only {} errors this window", iface.errors_per_min),
                     )
@@ -496,36 +544,59 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             }
             d.causes = vec![
                 Cause::new(
+                    "weak_signal",
                     "too far from the access point, or something in the way",
                     vec![match iface.signal_dbm {
                         Some(s) if weak => CheckResult::pass(
+                            "signal_weak",
                             "signal weak",
                             format!("{s} dBm, at or below {:.0}", t.wifi_rssi_dbm),
                         ),
-                        Some(s) => CheckResult::fail("signal weak", format!("{s} dBm is fine")),
-                        None => CheckResult::skipped("signal weak", "no signal level reported"),
+                        Some(s) => CheckResult::fail(
+                            "signal_weak",
+                            "signal weak",
+                            format!("{s} dBm is fine"),
+                        ),
+                        None => CheckResult::skipped(
+                            "signal_weak",
+                            "signal weak",
+                            "no signal level reported",
+                        ),
                     }],
                 ),
                 Cause::new(
+                    "congested_channel",
                     "a congested channel — retries with a healthy signal",
                     vec![
                         match iface.tx_retry_pct {
                             Some(r) if retrying => CheckResult::pass(
+                                "retries_high",
                                 "retries high",
                                 format!("{r:.0}% of frames retried"),
                             ),
                             Some(r) => CheckResult::fail(
+                                "retries_high",
                                 "retries high",
                                 format!("{r:.0}% of frames retried"),
                             ),
-                            None => CheckResult::skipped("retries high", "no retry counter"),
+                            None => CheckResult::skipped(
+                                "retries_high",
+                                "retries high",
+                                "no retry counter",
+                            ),
                         },
                         match iface.signal_dbm {
                             Some(s) if !weak => {
-                                CheckResult::pass("signal fine", format!("{s} dBm"))
+                                CheckResult::pass("signal_fine", "signal fine", format!("{s} dBm"))
                             }
-                            Some(s) => CheckResult::fail("signal fine", format!("{s} dBm")),
-                            None => CheckResult::skipped("signal fine", "no signal level"),
+                            Some(s) => {
+                                CheckResult::fail("signal_fine", "signal fine", format!("{s} dBm"))
+                            }
+                            None => CheckResult::skipped(
+                                "signal_fine",
+                                "signal fine",
+                                "no signal level",
+                            ),
                         },
                     ],
                 ),
@@ -559,8 +630,10 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             d.evidence
                 .push(Evidence::new("iface.utilisation", util, "%").with_window(30, 30));
             d.causes = vec![Cause::new(
+                "link_at_capacity",
                 "the link is carrying as much as it can",
                 vec![CheckResult::pass(
+                    "utilisation",
                     "utilisation",
                     format!("{util:.0}% of link rate"),
                 )],
@@ -595,16 +668,19 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
         .push(Evidence::new("gateway.loss", gw.loss_pct, "%").with_window(30, 30));
     let corroboration = match gw.internet_reachable {
         Some(false) => CheckResult::pass(
+            "nothing_beyond_the_gateway_answers_either",
             "nothing beyond the gateway answers either",
             "the internet probe also failed, so this is not just a quiet router",
         )
         .weighted(3.0),
         Some(true) => CheckResult::fail(
+            "nothing_beyond_the_gateway_answers_either",
             "nothing beyond the gateway answers either",
             "the internet is reachable through this gateway",
         )
         .weighted(3.0),
         None => CheckResult::skipped(
+            "nothing_beyond_the_gateway_answers_either",
             "nothing beyond the gateway answers either",
             "no internet probe has completed yet",
         )
@@ -613,24 +689,38 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
 
     d.causes = vec![
         Cause::new(
+            "icmp_filtered",
             "gateway is up but not answering icmp",
             vec![
                 if gw.arp_ok {
-                    CheckResult::pass("arp resolves", "the gateway answered arp")
+                    CheckResult::pass("arp_resolves", "arp resolves", "the gateway answered arp")
                 } else {
-                    CheckResult::fail("arp resolves", "no arp reply from the gateway")
+                    CheckResult::fail(
+                        "arp_resolves",
+                        "arp resolves",
+                        "no arp reply from the gateway",
+                    )
                 },
-                CheckResult::fail("icmp reaches the gateway", "no icmp echo reply"),
+                CheckResult::fail(
+                    "icmp_reaches_the_gateway",
+                    "icmp reaches the gateway",
+                    "no icmp echo reply",
+                ),
                 corroboration.clone(),
             ],
         ),
         Cause::new(
+            "wrong_vlan_or_address_conflict",
             "wrong vlan or an address conflict",
             vec![
                 if !gw.arp_ok {
-                    CheckResult::pass("arp fails", "no arp reply — we may not be on its segment")
+                    CheckResult::pass(
+                        "arp_fails",
+                        "arp fails",
+                        "no arp reply — we may not be on its segment",
+                    )
                 } else {
-                    CheckResult::fail("arp fails", "arp resolved normally")
+                    CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
                 },
                 corroboration,
             ],
@@ -675,8 +765,10 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
         .push(Evidence::new("gateway.rtt_sigma", sigma, "σ").with_window(30, 30));
     d.causes = vec![
         Cause::new(
+            "local_network_congested",
             "the local network or access point is congested",
             vec![CheckResult::pass(
+                "gateway_rtt_above_baseline",
                 "gateway rtt above baseline",
                 format!(
                     "{rtt:.1}ms against a {:.1}ms baseline ({sigma:.1}σ)",
@@ -685,8 +777,10 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
             )],
         ),
         Cause::new(
+            "gateway_loaded",
             "the gateway itself is loaded",
             vec![CheckResult::skipped(
+                "gateway_cpu",
                 "gateway cpu",
                 "netwatch cannot see inside the gateway",
             )],
@@ -726,25 +820,35 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         );
         d.causes = vec![
             Cause::new(
+                "resolver_down",
                 "resolver is down",
                 vec![match dns.icmp_rtt_ms {
-                    None => {
-                        CheckResult::pass("resolver unreachable", "no icmp reply from the resolver")
-                    }
+                    None => CheckResult::pass(
+                        "resolver_unreachable",
+                        "resolver unreachable",
+                        "no icmp reply from the resolver",
+                    ),
                     Some(rtt) => CheckResult::fail(
+                        "resolver_unreachable",
                         "resolver unreachable",
                         format!("resolver answers icmp in {rtt:.1}ms"),
                     ),
                 }],
             ),
             Cause::new(
+                "udp53_filtered",
                 "resolver reachable but not answering queries",
                 vec![match dns.icmp_rtt_ms {
                     Some(rtt) => CheckResult::pass(
+                        "resolver_reachable",
                         "resolver reachable",
                         format!("icmp {rtt:.1}ms but queries fail — udp/53 may be filtered"),
                     ),
-                    None => CheckResult::fail("resolver reachable", "no icmp reply either"),
+                    None => CheckResult::fail(
+                        "resolver_reachable",
+                        "resolver reachable",
+                        "no icmp reply either",
+                    ),
                 }],
             ),
         ];
@@ -770,15 +874,19 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         );
         d.causes = vec![
             Cause::new(
+                "no_edns",
                 "the resolver is not offering EDNS, so anything over 512 bytes truncates",
                 vec![CheckResult::pass(
+                    "truncated_replies",
                     "truncated replies",
                     format!("{} of {} replies carried TC", dns.truncated, dns.queries),
                 )],
             ),
             Cause::new(
+                "middlebox_clamps_udp",
                 "a middlebox strips EDNS or clamps UDP replies",
                 vec![CheckResult::skipped(
+                    "edns_through_the_path",
                     "edns through the path",
                     "not probed — compare a direct query against the resolver's",
                 )],
@@ -826,15 +934,18 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             };
             d.causes = vec![
                 Cause::new(
+                    "interceptor",
                     "a captive portal or interceptor answering for every name",
                     vec![if cross.private_answer {
                         CheckResult::pass(
+                            "private_answer_for_a_public_name",
                             "private answer for a public name",
                             format!("{} → {local}", cross.name),
                         )
                         .weighted(2.0)
                     } else {
                         CheckResult::fail(
+                            "private_answer_for_a_public_name",
                             "private answer for a public name",
                             format!("{} → {local}", cross.name),
                         )
@@ -842,10 +953,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                     }],
                 ),
                 Cause::new(
+                    "forged_records",
                     "the resolver returns records the validating reference does not",
                     vec![
                         if forged {
                             CheckResult::pass(
+                                "disagrees_with_reference",
                                 "disagrees with reference",
                                 format!(
                                     "{local} here, {reference} from {}",
@@ -855,6 +968,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                             .weighted(2.0)
                         } else {
                             CheckResult::fail(
+                                "disagrees_with_reference",
                                 "disagrees with reference",
                                 format!("{local} agrees with {}", cross.reference_resolver),
                             )
@@ -862,11 +976,13 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         },
                         if cross.validated {
                             CheckResult::pass(
+                                "reference_validated",
                                 "reference validated",
                                 format!("{} set AD on its answer", cross.reference_resolver),
                             )
                         } else {
                             CheckResult::skipped(
+                                "reference_validated",
                                 "reference validated",
                                 "reference did not validate the answer",
                             )
@@ -874,14 +990,17 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                     ],
                 ),
                 Cause::new(
+                    "split_horizon",
                     "split-horizon dns on this network, by design",
                     vec![if cross.private_answer {
                         CheckResult::fail(
+                            "public_name_public_answer",
                             "public name, public answer",
                             "a private answer for a public name is not split horizon",
                         )
                     } else {
                         CheckResult::skipped(
+                            "public_name_public_answer",
                             "public name, public answer",
                             "cannot tell an interceptor from an intentional override",
                         )
@@ -958,92 +1077,132 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
 
     d.causes = vec![
         Cause::new(
+            "upstream_slow",
             "the resolver's upstream forwarder is slow",
             vec![
                 match (dns.alt_resolver.as_deref(), dns.alt_rtt_ms) {
                     (Some(alt), Some(rtt)) if alt_fast => CheckResult::pass(
+                        "alt_resolver_is_fast",
                         "alt resolver is fast",
                         format!("{alt} answered in {rtt:.1}ms"),
                     )
                     .weighted(2.0),
                     (Some(alt), Some(rtt)) => CheckResult::fail(
+                        "alt_resolver_is_fast",
                         "alt resolver is fast",
                         format!("{alt} is also slow at {rtt:.1}ms"),
                     )
                     .weighted(2.0),
-                    _ => {
-                        CheckResult::skipped("alt resolver is fast", "no alternate resolver probed")
-                            .weighted(2.0)
-                    }
+                    _ => CheckResult::skipped(
+                        "alt_resolver_is_fast",
+                        "alt resolver is fast",
+                        "no alternate resolver probed",
+                    )
+                    .weighted(2.0),
                 },
                 match (icmp_normal, dns.icmp_rtt_ms) {
                     (Some(true), Some(rtt)) => CheckResult::pass(
+                        "resolver_itself_is_reachable",
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms — the box is fine, its answers are not"),
                     ),
                     (Some(false), Some(rtt)) => CheckResult::fail(
+                        "resolver_itself_is_reachable",
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms is slow too"),
                     ),
-                    _ => CheckResult::skipped("resolver itself is reachable", "no icmp probe"),
+                    _ => CheckResult::skipped(
+                        "resolver_itself_is_reachable",
+                        "resolver itself is reachable",
+                        "no icmp probe",
+                    ),
                 },
                 match (cached_fast, dns.cached_rtt_ms) {
                     (true, Some(c)) => CheckResult::pass(
+                        "cached_names_still_fast",
                         "cached names still fast",
                         format!("cache hits answer in {c:.1}ms — only recursion is slow"),
                     ),
                     (false, Some(c)) => CheckResult::fail(
+                        "cached_names_still_fast",
                         "cached names still fast",
                         format!("even cache hits take {c:.1}ms"),
                     ),
-                    _ => CheckResult::skipped("cached names still fast", "no cache probe"),
+                    _ => CheckResult::skipped(
+                        "cached_names_still_fast",
+                        "cached names still fast",
+                        "no cache probe",
+                    ),
                 },
             ],
         ),
         Cause::new(
+            "resolver_overloaded",
             "the resolver is overloaded",
             vec![
                 match (icmp_normal, dns.icmp_rtt_ms) {
                     (Some(false), Some(rtt)) => CheckResult::pass(
+                        "icmp_rtt_raised",
                         "icmp rtt raised",
                         format!("icmp to the resolver is {rtt:.1}ms"),
                     ),
                     (Some(true), Some(rtt)) => CheckResult::fail(
+                        "icmp_rtt_raised",
                         "icmp rtt raised",
                         format!("icmp is normal at {rtt:.1}ms"),
                     ),
-                    _ => CheckResult::skipped("icmp rtt raised", "no icmp probe"),
+                    _ => {
+                        CheckResult::skipped("icmp_rtt_raised", "icmp rtt raised", "no icmp probe")
+                    }
                 },
                 if dns.failed > 0 || dns.truncated > 0 {
                     CheckResult::pass(
+                        "timeouts_or_servfail_present",
                         "timeouts or servfail present",
                         format!("{} failed, {} truncated", dns.failed, dns.truncated),
                     )
                 } else {
-                    CheckResult::fail("timeouts or servfail present", "no failures, only latency")
+                    CheckResult::fail(
+                        "timeouts_or_servfail_present",
+                        "timeouts or servfail present",
+                        "no failures, only latency",
+                    )
                 },
             ],
         ),
         Cause::new(
+            "local_udp_path",
             "local: conntrack, udp buffers or nftables",
             vec![
                 if alt_fast {
                     CheckResult::fail(
+                        "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
                         "the alternate resolver is fast over the same path",
                     )
                 } else {
                     CheckResult::pass(
+                        "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
                         "both resolvers are slow — the problem may be local",
                     )
                 },
                 match obs.iface.as_ref().map(|i| i.drops_per_min) {
-                    Some(d) if d > 0 => {
-                        CheckResult::pass("interface drops", format!("{d} drops this window"))
-                    }
-                    Some(_) => CheckResult::fail("interface drops", "no drops on the interface"),
-                    None => CheckResult::skipped("interface drops", "no interface counters"),
+                    Some(d) if d > 0 => CheckResult::pass(
+                        "interface_drops",
+                        "interface drops",
+                        format!("{d} drops this window"),
+                    ),
+                    Some(_) => CheckResult::fail(
+                        "interface_drops",
+                        "interface drops",
+                        "no drops on the interface",
+                    ),
+                    None => CheckResult::skipped(
+                        "interface_drops",
+                        "interface drops",
+                        "no interface counters",
+                    ),
                 },
             ],
         ),
@@ -1152,32 +1311,45 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
         .push(Evidence::new("path.rtt_sigma", sigma, "σ").with_window(60, 60));
     d.causes = vec![
         Cause::new(
+            "hop_adds_latency",
             match worst_jump {
                 Some((hop, _)) => format!("latency enters the path at hop {hop}"),
                 None => "latency is spread across the path".to_string(),
             },
             vec![match worst_jump {
                 Some((hop, delta)) => CheckResult::pass(
+                    "one_hop_dominates",
                     "one hop dominates",
                     format!("hop {hop} adds {delta:.0}ms over its predecessor"),
                 ),
                 None => CheckResult::skipped(
+                    "one_hop_dominates",
                     "one hop dominates",
                     "not enough per-hop timing to attribute the increase",
                 ),
             }],
         ),
         Cause::new(
+            "route_change",
             "a route change moved the traffic",
             vec![match &path.previous {
                 Some(prev) => match first_hop_change(prev, &path.hops) {
                     Some(hop) => CheckResult::pass(
+                        "the_path_changed",
                         "the path changed",
                         format!("hop {hop} differs from the previous trace"),
                     ),
-                    None => CheckResult::fail("the path changed", "the route is unchanged"),
+                    None => CheckResult::fail(
+                        "the_path_changed",
+                        "the path changed",
+                        "the route is unchanged",
+                    ),
                 },
-                None => CheckResult::skipped("the path changed", "no previous trace to compare"),
+                None => CheckResult::skipped(
+                    "the_path_changed",
+                    "the path changed",
+                    "no previous trace to compare",
+                ),
             }],
         ),
     ];
@@ -1243,6 +1415,7 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
     let asn_changed = prev.asn != cur.asn;
     d.causes = vec![
         Cause::new(
+            "provider_reroute",
             if asn_changed {
                 "the traffic moved to a different provider"
             } else {
@@ -1251,6 +1424,7 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
             vec![
                 if asn_changed {
                     CheckResult::pass(
+                        "asn_changed",
                         "asn changed",
                         format!(
                             "hop {hop_no}: {} → {}",
@@ -1260,6 +1434,7 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
                     )
                 } else {
                     CheckResult::pass(
+                        "asn_unchanged",
                         "asn unchanged",
                         format!(
                             "hop {hop_no} stayed in {}",
@@ -1268,6 +1443,7 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
                     )
                 },
                 CheckResult::pass(
+                    "hop_address_changed",
                     "hop address changed",
                     format!(
                         "{} → {}",
@@ -1278,11 +1454,17 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
             ],
         ),
         Cause::new(
+            "local_route_change",
             "a local route or interface changed",
             vec![if hop_no <= 2 {
-                CheckResult::pass("change is at hop 1 or 2", "the change is on our side")
+                CheckResult::pass(
+                    "change_is_at_hop_1_or_2",
+                    "change is at hop 1 or 2",
+                    "the change is on our side",
+                )
             } else {
                 CheckResult::fail(
+                    "change_is_at_hop_1_or_2",
                     "change is at hop 1 or 2",
                     format!("the change is at hop {hop_no}, upstream of us"),
                 )
@@ -1333,19 +1515,23 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
         .push(Evidence::new("path.hop_loss", hop.loss_pct, "%").with_window(60, 1));
     d.causes = vec![
         Cause::new(
+            "hop_dropping",
             format!(
                 "hop {} ({}) is dropping traffic",
                 hop.number,
                 hop.ip.as_deref().unwrap_or("unknown")
             ),
             vec![CheckResult::pass(
+                "loss_propagates_to_later_hops",
                 "loss propagates to later hops",
                 format!("{:.0}% at hop {} and beyond", hop.loss_pct, hop.number),
             )],
         ),
         Cause::new(
+            "icmp_rate_limit",
             "the hop is rate-limiting icmp rather than losing traffic",
             vec![CheckResult::fail(
+                "later_hops_are_clean",
                 "later hops are clean",
                 "later hops lose packets too, so this is real loss",
             )],
@@ -1411,20 +1597,24 @@ fn socket_detection(
                 .push(Evidence::new("tcp.retrans", s.retrans as f64, "").with_window(30, 30));
             d.causes = vec![
                 Cause::new(
+                    "receiver_queueing",
                     "the receiver is queueing — its buffer, not ours",
                     vec![
                         match link_test_passed {
                             Some(true) => CheckResult::pass(
+                                "link_level_bufferbloat_test_passed",
                                 "link-level bufferbloat test passed",
                                 "our uplink stays responsive under load",
                             )
                             .weighted(2.0),
                             Some(false) => CheckResult::fail(
+                                "link_level_bufferbloat_test_passed",
                                 "link-level bufferbloat test passed",
                                 "our own uplink bloats under load too",
                             )
                             .weighted(2.0),
                             None => CheckResult::skipped(
+                                "link_level_bufferbloat_test_passed",
                                 "link-level bufferbloat test passed",
                                 "no loaded-rtt test has run",
                             )
@@ -1432,15 +1622,21 @@ fn socket_detection(
                         },
                         if s.tx_bps > 0.0 {
                             CheckResult::pass(
+                                "rtt_tracks_this_socket_s_own_tx",
                                 "rtt tracks this socket's own tx",
                                 format!("{} in flight while rtt is {rtt:.0}ms", rate(s.tx_bps)),
                             )
                         } else {
-                            CheckResult::fail("rtt tracks this socket's own tx", "socket is idle")
+                            CheckResult::fail(
+                                "rtt_tracks_this_socket_s_own_tx",
+                                "rtt tracks this socket's own tx",
+                                "socket is idle",
+                            )
                         },
                     ],
                 ),
                 Cause::new(
+                    "path_loss",
                     "loss on the path",
                     // Retransmit count is *not* the discriminator here: a
                     // bufferbloated socket retransmits because the queue
@@ -1470,8 +1666,10 @@ fn socket_detection(
                 Evidence::new("tcp.retrans_rate", s.retrans as f64, "/min").with_window(60, 60),
             );
             d.causes = vec![Cause::new(
+                "packet_loss",
                 "packet loss between here and the peer",
                 vec![CheckResult::pass(
+                    "retransmits_observed",
                     "retransmits observed",
                     format!("{} retransmits on this socket", s.retrans),
                 )],
@@ -1487,8 +1685,10 @@ fn socket_detection(
             d.evidence
                 .push(Evidence::new("tcp.rwnd", 0.0, "B").with_window(30, 30));
             d.causes = vec![Cause::new(
+                "peer_not_reading",
                 "the peer application is not reading its socket",
                 vec![CheckResult::pass(
+                    "rwnd_is_zero",
                     "rwnd is zero",
                     "the receive window has closed",
                 )],
@@ -1507,8 +1707,10 @@ fn socket_detection(
                 Evidence::new("tcp.rwnd", s.rwnd.unwrap_or(0) as f64, "B").with_window(30, 30),
             );
             d.causes = vec![Cause::new(
+                "peer_reading_slowly",
                 "the peer is reading slower than we can send",
                 vec![CheckResult::pass(
+                    "cwnd_exceeds_rwnd",
                     "cwnd exceeds rwnd",
                     format!(
                         "cwnd {} × mss {} is more than twice rwnd {}",
@@ -1559,12 +1761,19 @@ fn detect_nat(obs: &Observations) -> Vec<Detection> {
         .join(", ");
     d.causes = vec![
         Cause::new(
+            "address_dependent_nat",
             "a carrier-grade or enterprise nat with address-dependent mapping",
-            vec![CheckResult::pass("mapping depends on destination", seen)],
+            vec![CheckResult::pass(
+                "mapping_depends_on_destination",
+                "mapping depends on destination",
+                seen,
+            )],
         ),
         Cause::new(
+            "router_symmetric_nat",
             "the router's nat set to symmetric or 'strict'",
             vec![CheckResult::skipped(
+                "single_nat_layer",
                 "single nat layer",
                 "cannot tell the router from a carrier nat behind it",
             )],
@@ -1590,16 +1799,19 @@ fn path_loss_check(remote: &str, obs: &Observations) -> CheckResult {
     let host = remote.rsplit_once(':').map(|(h, _)| h).unwrap_or(remote);
     let Some(path) = obs.paths.iter().find(|p| p.target == host) else {
         return CheckResult::skipped(
+            "the_path_to_this_peer_is_losing_packets",
             "the path to this peer is losing packets",
             format!("no trace to {host} — press t to run one"),
         );
     };
     match path.hops.iter().find(|h| !h.silent && h.loss_pct >= 5.0) {
         Some(hop) => CheckResult::pass(
+            "the_path_to_this_peer_is_losing_packets",
             "the path to this peer is losing packets",
             format!("hop {} loses {:.0}%", hop.number, hop.loss_pct),
         ),
         None => CheckResult::fail(
+            "the_path_to_this_peer_is_losing_packets",
             "the path to this peer is losing packets",
             "every hop on the traced path is clean",
         ),
@@ -1628,8 +1840,10 @@ fn detect_bufferbloat_local(obs: &Observations, t: &Thresholds) -> Vec<Detection
     d.evidence
         .push(Evidence::new("tcp.loaded_rtt_delta", delta, "ms").with_window(30, 30));
     d.causes = vec![Cause::new(
+        "no_aqm_upstream",
         "no queue management on the upstream device",
         vec![CheckResult::pass(
+            "rtt_rises_under_our_own_load",
             "rtt rises under our own load",
             format!("idle {idle:.0}ms → loaded {loaded:.0}ms"),
         )],
@@ -2359,5 +2573,109 @@ mod tests {
             }
         }
         assert!(applies > 0, "the dns rule should offer something to apply");
+    }
+
+    #[test]
+    fn id_validation_rejects_bad_and_duplicate_ids() {
+        assert!(Cause::valid_id("upstream_slow"));
+        assert!(Cause::valid_id("udp53_filtered"));
+        for bad in [
+            "",
+            "Upstream",
+            "has space",
+            "_lead",
+            "trail_",
+            "double__underscore",
+            "9lives",
+        ] {
+            assert!(!Cause::valid_id(bad), "{bad:?} should be rejected");
+        }
+        let mut d = Detection::new("dns.slow_resolver", Subject::Host);
+        d.causes = vec![
+            Cause::new("same", "a", vec![]),
+            Cause::new("same", "b", vec![]),
+        ];
+        assert!(ids_are_valid(&d).is_err());
+        d.causes = vec![Cause::new(
+            "one",
+            "a",
+            vec![
+                CheckResult::pass("x", "x", ""),
+                CheckResult::fail("x", "x again", ""),
+            ],
+        )];
+        assert!(ids_are_valid(&d).is_err());
+    }
+
+    /// The debug assertion in `detect` only sees branches some test reaches.
+    /// This reads the source so a cause or check on an untested branch still
+    /// has to carry a literal, valid id.
+    #[test]
+    fn every_id_in_the_detector_source_is_a_valid_literal() {
+        let src = include_str!("detectors.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let mut causes = 0;
+        for (needle, is_cause) in [
+            ("Cause::new(", true),
+            ("CheckResult::pass(", false),
+            ("CheckResult::fail(", false),
+            ("CheckResult::skipped(", false),
+        ] {
+            for (at, _) in body.match_indices(needle) {
+                let rest = body[at + needle.len()..].trim_start();
+                let lit = rest
+                    .strip_prefix('"')
+                    .and_then(|r| r.split_once('"'))
+                    .map(|(id, _)| id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{needle} without a literal id: {}",
+                            &rest[..rest.len().min(60)]
+                        )
+                    });
+                assert!(Cause::valid_id(lit), "{needle} has invalid id {lit:?}");
+                causes += usize::from(is_cause);
+            }
+        }
+        assert!(
+            causes >= 35,
+            "found only {causes} causes; did the scan break?"
+        );
+    }
+
+    #[test]
+    fn observations_round_trip_through_json() {
+        let obs = Observations {
+            now: "2026-09-14 10:00:00".into(),
+            gateway: Some(GatewayObs {
+                addr: Some("192.168.8.1".into()),
+                rtt_ms: Some(1.4),
+                loss_pct: 0.0,
+                arp_ok: true,
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            paths: vec![PathObs {
+                target: "1.1.1.1".into(),
+                hops: vec![HopObs {
+                    number: 1,
+                    ip: Some("192.168.8.1".into()),
+                    asn: None,
+                    rtt_p50_ms: Some(1.1),
+                    rtt_p95_ms: None,
+                    loss_pct: 0.0,
+                    silent: false,
+                }],
+                previous: None,
+                traced_at: "2026-09-14 09:59:30".into(),
+            }],
+            idle_rtt_ms: Some(18.0),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        assert_eq!(serde_json::from_str::<Observations>(&json).unwrap(), obs);
+        // A recording from before a field existed still loads.
+        let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
+        assert_eq!(old.now, "2026-09-14 10:00:00");
     }
 }

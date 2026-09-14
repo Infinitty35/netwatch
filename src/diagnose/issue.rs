@@ -231,6 +231,11 @@ pub fn round_for_display(v: f64) -> String {
 /// and must not count against the cause.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckResult {
+    /// Stable snake_case identity, unique within its cause. Labels, features
+    /// and recorded episodes key on this, never on `name`, so rewording a
+    /// check for the screen doesn't orphan the data collected under it.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub passed: Option<bool>,
     /// Short factual detail, e.g. "alt resolver 1.1.1.1 answered in 1.4ms".
@@ -245,8 +250,9 @@ fn one() -> f64 {
 }
 
 impl CheckResult {
-    pub fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn pass(id: &str, name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
+            id: id.to_string(),
             name: name.into(),
             passed: Some(true),
             detail: detail.into(),
@@ -254,8 +260,9 @@ impl CheckResult {
         }
     }
 
-    pub fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn fail(id: &str, name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
+            id: id.to_string(),
             name: name.into(),
             passed: Some(false),
             detail: detail.into(),
@@ -264,8 +271,9 @@ impl CheckResult {
     }
 
     /// Check couldn't run. Neither evidence for nor against.
-    pub fn skipped(name: impl Into<String>, why: impl Into<String>) -> Self {
+    pub fn skipped(id: &str, name: impl Into<String>, why: impl Into<String>) -> Self {
         Self {
+            id: id.to_string(),
             name: name.into(),
             passed: None,
             detail: why.into(),
@@ -317,16 +325,38 @@ impl Confidence {
 /// A ranked explanation for an issue, with the checks that put it there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cause {
+    /// Stable snake_case identity, unique within its rule. The full key is
+    /// [`Cause::key`]; labels can be built at runtime ("hop 3 is dropping
+    /// traffic") and are for display only.
+    #[serde(default)]
+    pub id: String,
     pub label: String,
     pub checks: Vec<CheckResult>,
 }
 
 impl Cause {
-    pub fn new(label: impl Into<String>, checks: Vec<CheckResult>) -> Self {
+    pub fn new(id: &str, label: impl Into<String>, checks: Vec<CheckResult>) -> Self {
         Self {
+            id: id.to_string(),
             label: label.into(),
             checks,
         }
+    }
+
+    /// `"dns.slow_resolver/upstream_slow"` — what labels and model classes use.
+    pub fn key(&self, rule: &str) -> String {
+        format!("{rule}/{}", self.id)
+    }
+
+    /// True when `id` is non-empty snake_case: lowercase ascii, digits and
+    /// single underscores, starting with a letter.
+    pub fn valid_id(id: &str) -> bool {
+        id.starts_with(|c: char| c.is_ascii_lowercase())
+            && !id.ends_with('_')
+            && !id.contains("__")
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     }
 
     /// Weighted fraction of *runnable* checks that passed, 0..=1.
@@ -827,11 +857,12 @@ mod tests {
     #[test]
     fn skipped_checks_do_not_count_against_a_cause() {
         let all_pass = Cause::new(
+            "all_pass",
             "c",
             vec![
-                CheckResult::pass("a", ""),
-                CheckResult::pass("b", ""),
-                CheckResult::skipped("c", "no data"),
+                CheckResult::pass("a", "a", ""),
+                CheckResult::pass("b", "b", ""),
+                CheckResult::skipped("c", "c", "no data"),
             ],
         );
         assert_eq!(all_pass.score(), Some(1.0));
@@ -841,7 +872,7 @@ mod tests {
 
     #[test]
     fn a_cause_with_no_runnable_checks_is_untested_not_certain() {
-        let c = Cause::new("c", vec![CheckResult::skipped("a", "no data")]);
+        let c = Cause::new("c", "c", vec![CheckResult::skipped("a", "a", "no data")]);
         assert_eq!(c.score(), None);
         assert_eq!(c.confidence(), Confidence::Untested);
     }
@@ -850,10 +881,18 @@ mod tests {
     fn untested_causes_rank_below_tested_ones() {
         let mut issue = test_issue();
         issue.causes = vec![
-            Cause::new("untested", vec![CheckResult::skipped("a", "")]),
+            Cause::new(
+                "untested",
+                "untested",
+                vec![CheckResult::skipped("a", "a", "")],
+            ),
             Cause::new(
                 "half",
-                vec![CheckResult::pass("a", ""), CheckResult::fail("b", "")],
+                "half",
+                vec![
+                    CheckResult::pass("a", "a", ""),
+                    CheckResult::fail("b", "b", ""),
+                ],
             ),
         ];
         issue.rank_causes();
