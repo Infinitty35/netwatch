@@ -649,7 +649,8 @@ pub fn load(path: &Path) -> std::io::Result<Episode> {
     Ok(episode)
 }
 
-/// Every episode file under `root`, oldest first by modification time.
+/// Every saved episode (`*.json.gz`) under `root`, oldest first by
+/// modification time.
 pub fn list(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -661,9 +662,10 @@ pub fn list(root: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.to_string_lossy().ends_with(".json.gz")
-                || path.extension().is_some_and(|e| e == "json")
-            {
+            } else if path.to_string_lossy().ends_with(".json.gz") {
+                // Only what `save` writes. `prune` deletes from this list, so
+                // a schema.json or notes file beside the episodes must never
+                // appear in it.
                 out.push(path);
             }
         }
@@ -744,20 +746,6 @@ impl ReplayReport {
 /// Run an episode's frames through a fresh engine, exactly as the live tick
 /// did: evaluate at the recorded clock and probe ages, then learn.
 pub fn replay(episode: &Episode) -> ReplayReport {
-    let clock = std::sync::Arc::new(FixedClock::at(
-        episode
-            .frames
-            .first()
-            .map(|f| f.ts.as_str())
-            .unwrap_or("1970-01-01 00:00:00"),
-    ));
-    let mut engine = Engine::new(Box::new(clock.clone())).with_settings(episode.settings);
-    let mut store: Option<BaselineStore> = None;
-    // Real instants, offset by recorded time. Nothing here sleeps, so these
-    // are only ever compared with each other.
-    let base = Instant::now() + Duration::from_secs(86_400);
-    let t0 = episode.frames.first().map(|f| f.at).unwrap_or(0.0);
-
     let mut report = ReplayReport {
         episode: episode.id.clone(),
         frames: episode.frames.len(),
@@ -772,22 +760,9 @@ pub fn replay(episode: &Episode) -> ReplayReport {
     let mut spans: Vec<IssueSpan> = Vec::new();
     let mut was_open: HashSet<String> = HashSet::new();
 
-    for (n, frame) in episode.frames.iter().enumerate() {
-        clock.set(&frame.ts);
-        if let Some(snap) = &frame.baselines {
-            match store.as_mut() {
-                Some(s) => s.restore(snap),
-                None => store = Some(BaselineStore::from_snapshot(snap)),
-            }
-        }
-        let Some(store) = store.as_mut() else {
-            continue;
-        };
-        let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
-        let times = frame.ages.to_times(now);
-        engine.observe_live_at(&frame.obs, store, &times, now);
-
-        let open: Vec<OpenIssue> = engine.primary().into_iter().map(open_issue).collect();
+    drive(episode, |step| {
+        let (n, frame) = (step.index, step.frame);
+        let open: Vec<OpenIssue> = step.engine.primary().into_iter().map(open_issue).collect();
         if sorted(&open) != sorted(&frame.open) {
             report.divergences.push(Divergence {
                 frame: n,
@@ -824,14 +799,65 @@ pub fn replay(episode: &Episode) -> ReplayReport {
             }
         }
         was_open = now_open;
+    });
+    report.issues = spans;
+    report
+}
+
+/// The engine's state right after evaluating one recorded frame, before that
+/// frame's readings are learned.
+pub struct Step<'a> {
+    pub index: usize,
+    pub frame: &'a Frame,
+    pub engine: &'a Engine,
+    pub baselines: &'a BaselineStore,
+}
+
+/// Run an episode's frames through a fresh engine exactly as the live tick
+/// did — evaluate at the recorded clock and probe ages, then learn — calling
+/// `on_step` between the two.
+pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
+    let clock = std::sync::Arc::new(FixedClock::at(
+        episode
+            .frames
+            .first()
+            .map(|f| f.ts.as_str())
+            .unwrap_or("1970-01-01 00:00:00"),
+    ));
+    let mut engine = Engine::new(Box::new(clock.clone())).with_settings(episode.settings);
+    let mut store: Option<BaselineStore> = None;
+    // Real instants, offset by recorded time. Nothing here sleeps, so these
+    // are only ever compared with each other.
+    let base = Instant::now() + Duration::from_secs(86_400);
+    let t0 = episode.frames.first().map(|f| f.at).unwrap_or(0.0);
+
+    for (index, frame) in episode.frames.iter().enumerate() {
+        clock.set(&frame.ts);
+        if let Some(snap) = &frame.baselines {
+            match store.as_mut() {
+                Some(s) => s.restore(snap),
+                None => store = Some(BaselineStore::from_snapshot(snap)),
+            }
+        }
+        let Some(store) = store.as_mut() else {
+            continue;
+        };
+        let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
+        let times = frame.ages.to_times(now);
+        engine.observe_live_at(&frame.obs, store, &times, now);
+
+        on_step(Step {
+            index,
+            frame,
+            engine: &engine,
+            baselines: store,
+        });
 
         store.set_gate_sigma(engine.settings().thresholds.sigma_k);
         for r in &frame.readings {
             store.observe(&r.subject, &r.metric, r.value, r.at);
         }
     }
-    report.issues = spans;
-    report
 }
 
 fn sorted(open: &[OpenIssue]) -> Vec<OpenIssue> {
@@ -898,8 +924,9 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some("features") => super::features::command(&args[1..]),
         _ => anyhow::bail!(
-            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>..."
+            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>..."
         ),
     }
 }

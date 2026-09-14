@@ -20,11 +20,13 @@
 //! disagree. See [`issue`] for why no rendered number is ever stored.
 
 pub mod baseline;
+pub mod causes;
 pub mod coverage;
 pub mod demo;
 pub mod detectors;
 pub mod engine;
 pub mod episode;
+pub mod features;
 pub mod fixture;
 pub mod issue;
 pub mod live;

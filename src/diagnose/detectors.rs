@@ -379,14 +379,20 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out
 }
 
-/// Every cause id valid and unique within its detection, every check id valid
-/// and unique within its cause. Checked on every `detect` in debug builds, so
+/// Every cause id valid, unique within its detection and catalogued under its
+/// rule; every check id valid, unique within its cause and catalogued. Checked on every `detect` in debug builds, so
 /// any test that reaches a detector branch also checks the ids it emits.
 fn ids_are_valid(d: &Detection) -> Result<(), String> {
     let mut causes = std::collections::HashSet::new();
     for c in &d.causes {
         if !Cause::valid_id(&c.id) || !causes.insert(c.id.as_str()) {
             return Err(format!("{}: bad or duplicate cause id {:?}", d.rule, c.id));
+        }
+        if !super::causes::is_catalogued(d.rule, c) {
+            return Err(format!(
+                "{} or one of its checks is missing from causes::CAUSES",
+                c.key(d.rule)
+            ));
         }
         let mut checks = std::collections::HashSet::new();
         for k in &c.checks {

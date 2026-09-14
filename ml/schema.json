@@ -1,0 +1,801 @@
+{
+  "check_encoding": {
+    "failed": -1,
+    "not_run": 0,
+    "other_rule": "empty",
+    "passed": 1
+  },
+  "features": [
+    {
+      "group": "observation",
+      "name": "gateway.rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "gateway.loss_pct"
+    },
+    {
+      "group": "observation",
+      "name": "gateway.arp_ok"
+    },
+    {
+      "group": "observation",
+      "name": "gateway.icmp_ok"
+    },
+    {
+      "group": "observation",
+      "name": "gateway.internet_reachable"
+    },
+    {
+      "group": "observation",
+      "name": "dns.rtt_p50_ms"
+    },
+    {
+      "group": "observation",
+      "name": "dns.rtt_p95_ms"
+    },
+    {
+      "group": "observation",
+      "name": "dns.failure_rate_pct"
+    },
+    {
+      "group": "observation",
+      "name": "dns.truncation_rate_pct"
+    },
+    {
+      "group": "observation",
+      "name": "dns.queries"
+    },
+    {
+      "group": "observation",
+      "name": "dns.alt_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "dns.icmp_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "dns.cached_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "dns.alt_over_p50"
+    },
+    {
+      "group": "observation",
+      "name": "dns.cached_over_p50"
+    },
+    {
+      "group": "observation",
+      "name": "dns.cross_mismatch_pct"
+    },
+    {
+      "group": "observation",
+      "name": "dns.cross_private_answer"
+    },
+    {
+      "group": "observation",
+      "name": "dns.cross_validated"
+    },
+    {
+      "group": "observation",
+      "name": "iface.carrier"
+    },
+    {
+      "group": "observation",
+      "name": "iface.wireless"
+    },
+    {
+      "group": "observation",
+      "name": "iface.errors_per_min"
+    },
+    {
+      "group": "observation",
+      "name": "iface.drops_per_min"
+    },
+    {
+      "group": "observation",
+      "name": "iface.signal_dbm"
+    },
+    {
+      "group": "observation",
+      "name": "iface.tx_retry_pct"
+    },
+    {
+      "group": "observation",
+      "name": "iface.utilisation_pct"
+    },
+    {
+      "group": "observation",
+      "name": "iface.rx_bps"
+    },
+    {
+      "group": "observation",
+      "name": "iface.tx_bps"
+    },
+    {
+      "group": "observation",
+      "name": "path.last_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "path.last_loss_pct"
+    },
+    {
+      "group": "observation",
+      "name": "path.max_hop_loss_pct"
+    },
+    {
+      "group": "observation",
+      "name": "path.hops"
+    },
+    {
+      "group": "observation",
+      "name": "path.first_changed_hop"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.count"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.bufferbloat"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.retrans_burst"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.zero_window"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.receiver_limited"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.congestion"
+    },
+    {
+      "group": "observation",
+      "name": "sockets.max_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "load.idle_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "load.loaded_rtt_ms"
+    },
+    {
+      "group": "observation",
+      "name": "nat.symmetric"
+    },
+    {
+      "group": "observation",
+      "name": "captive.portal"
+    },
+    {
+      "group": "baseline",
+      "name": "dns.rtt_p50.sigma"
+    },
+    {
+      "group": "baseline",
+      "name": "dns.rtt_p50.multiple"
+    },
+    {
+      "group": "baseline",
+      "name": "gateway.rtt.sigma"
+    },
+    {
+      "group": "baseline",
+      "name": "gateway.rtt.multiple"
+    },
+    {
+      "group": "baseline",
+      "name": "path.rtt.sigma"
+    },
+    {
+      "group": "baseline",
+      "name": "path.rtt.multiple"
+    },
+    {
+      "group": "check",
+      "name": "check.link.down.unplugged_or_port_down.carrier"
+    },
+    {
+      "group": "check",
+      "name": "check.link.down.wifi_disassociated.wireless"
+    },
+    {
+      "group": "check",
+      "name": "check.iface.errors.ring_buffer_small.drops_dominate"
+    },
+    {
+      "group": "check",
+      "name": "check.iface.errors.bad_cable_or_duplex.errors_dominate"
+    },
+    {
+      "group": "check",
+      "name": "check.wifi.weak_signal.weak_signal.signal_weak"
+    },
+    {
+      "group": "check",
+      "name": "check.wifi.weak_signal.congested_channel.retries_high"
+    },
+    {
+      "group": "check",
+      "name": "check.wifi.weak_signal.congested_channel.signal_fine"
+    },
+    {
+      "group": "check",
+      "name": "check.iface.saturated.link_at_capacity.utilisation"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.unreachable.icmp_filtered.arp_resolves"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.unreachable.icmp_filtered.icmp_reaches_the_gateway"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.unreachable.icmp_filtered.nothing_beyond_the_gateway_answers_either"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.unreachable.wrong_vlan_or_address_conflict.arp_fails"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.unreachable.wrong_vlan_or_address_conflict.nothing_beyond_the_gateway_answers_either"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.rtt_spike.local_network_congested.gateway_rtt_above_baseline"
+    },
+    {
+      "group": "check",
+      "name": "check.gateway.rtt_spike.gateway_loaded.gateway_cpu"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.failing.resolver_down.resolver_unreachable"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.failing.udp53_filtered.resolver_reachable"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.truncation_retry.no_edns.truncated_replies"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.truncation_retry.middlebox_clamps_udp.edns_through_the_path"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.hijack_suspect.interceptor.private_answer_for_a_public_name"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.hijack_suspect.forged_records.disagrees_with_reference"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.hijack_suspect.forged_records.reference_validated"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.hijack_suspect.split_horizon.public_name_public_answer"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.upstream_slow.alt_resolver_is_fast"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.upstream_slow.resolver_itself_is_reachable"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.upstream_slow.cached_names_still_fast"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.resolver_overloaded.icmp_rtt_raised"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.resolver_overloaded.timeouts_or_servfail_present"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.local_udp_path.alt_resolver_over_the_same_path_is_also_slow"
+    },
+    {
+      "group": "check",
+      "name": "check.dns.slow_resolver.local_udp_path.interface_drops"
+    },
+    {
+      "group": "check",
+      "name": "check.path.rtt_spike.hop_adds_latency.one_hop_dominates"
+    },
+    {
+      "group": "check",
+      "name": "check.path.rtt_spike.route_change.the_path_changed"
+    },
+    {
+      "group": "check",
+      "name": "check.path.changed.provider_reroute.asn_changed"
+    },
+    {
+      "group": "check",
+      "name": "check.path.changed.provider_reroute.asn_unchanged"
+    },
+    {
+      "group": "check",
+      "name": "check.path.changed.provider_reroute.hop_address_changed"
+    },
+    {
+      "group": "check",
+      "name": "check.path.changed.local_route_change.change_is_at_hop_1_or_2"
+    },
+    {
+      "group": "check",
+      "name": "check.path.high_loss.hop_dropping.loss_propagates_to_later_hops"
+    },
+    {
+      "group": "check",
+      "name": "check.path.high_loss.icmp_rate_limit.later_hops_are_clean"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_remote.receiver_queueing.link_level_bufferbloat_test_passed"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_remote.receiver_queueing.rtt_tracks_this_socket_s_own_tx"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_remote.path_loss.the_path_to_this_peer_is_losing_packets"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.retrans_burst.packet_loss.retransmits_observed"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.zero_window.peer_not_reading.rwnd_is_zero"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.zero_window.peer_reading_slowly.cwnd_exceeds_rwnd"
+    },
+    {
+      "group": "check",
+      "name": "check.nat.symmetric.address_dependent_nat.mapping_depends_on_destination"
+    },
+    {
+      "group": "check",
+      "name": "check.nat.symmetric.router_symmetric_nat.single_nat_layer"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_local.no_aqm_upstream.rtt_rises_under_our_own_load"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.slow_resolver.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.slow_resolver.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.slow_resolver.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.slow_resolver.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.failing.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.failing.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.failing.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.failing.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.truncation_retry.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.truncation_retry.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.truncation_retry.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.truncation_retry.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.hijack_suspect.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.hijack_suspect.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.hijack_suspect.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.dns.hijack_suspect.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.unreachable.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.unreachable.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.unreachable.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.unreachable.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.link.down.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.link.down.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.link.down.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.link.down.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.rtt_spike.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.rtt_spike.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.rtt_spike.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.gateway.rtt_spike.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.errors.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.errors.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.errors.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.errors.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.saturated.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.saturated.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.saturated.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.iface.saturated.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.wifi.weak_signal.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.wifi.weak_signal.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.wifi.weak_signal.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.wifi.weak_signal.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.changed.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.changed.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.changed.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.changed.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.high_loss.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.high_loss.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.high_loss.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.high_loss.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.rtt_spike.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.rtt_spike.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.rtt_spike.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.path.rtt_spike.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_local.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_local.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_local.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_local.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_remote.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_remote.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_remote.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.bufferbloat_remote.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.retrans_burst.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.retrans_burst.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.retrans_burst.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.retrans_burst.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.zero_window.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.zero_window.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.zero_window.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.zero_window.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.nat.symmetric.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.nat.symmetric.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.nat.symmetric.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.nat.symmetric.stale"
+    },
+    {
+      "group": "context",
+      "name": "context.capability_root"
+    },
+    {
+      "group": "context",
+      "name": "context.switched_network"
+    },
+    {
+      "group": "context",
+      "name": "context.baselines_ready"
+    },
+    {
+      "group": "context",
+      "name": "context.severity"
+    },
+    {
+      "group": "context",
+      "name": "context.recurrence"
+    },
+    {
+      "group": "context",
+      "name": "context.consequences"
+    },
+    {
+      "group": "context",
+      "name": "context.secs_since_onset"
+    },
+    {
+      "group": "context",
+      "name": "context.rule_top_score"
+    },
+    {
+      "group": "co_open",
+      "name": "open.dns.slow_resolver"
+    },
+    {
+      "group": "co_open",
+      "name": "open.dns.failing"
+    },
+    {
+      "group": "co_open",
+      "name": "open.dns.truncation_retry"
+    },
+    {
+      "group": "co_open",
+      "name": "open.dns.hijack_suspect"
+    },
+    {
+      "group": "co_open",
+      "name": "open.gateway.unreachable"
+    },
+    {
+      "group": "co_open",
+      "name": "open.link.down"
+    },
+    {
+      "group": "co_open",
+      "name": "open.gateway.rtt_spike"
+    },
+    {
+      "group": "co_open",
+      "name": "open.iface.errors"
+    },
+    {
+      "group": "co_open",
+      "name": "open.iface.saturated"
+    },
+    {
+      "group": "co_open",
+      "name": "open.wifi.weak_signal"
+    },
+    {
+      "group": "co_open",
+      "name": "open.path.changed"
+    },
+    {
+      "group": "co_open",
+      "name": "open.path.high_loss"
+    },
+    {
+      "group": "co_open",
+      "name": "open.path.rtt_spike"
+    },
+    {
+      "group": "co_open",
+      "name": "open.tcp.bufferbloat_local"
+    },
+    {
+      "group": "co_open",
+      "name": "open.tcp.bufferbloat_remote"
+    },
+    {
+      "group": "co_open",
+      "name": "open.tcp.retrans_burst"
+    },
+    {
+      "group": "co_open",
+      "name": "open.tcp.zero_window"
+    },
+    {
+      "group": "co_open",
+      "name": "open.nat.symmetric"
+    }
+  ],
+  "hash": "c58ffc853e893cbc",
+  "meta_columns": [
+    "episode",
+    "source",
+    "os",
+    "trigger",
+    "ts",
+    "issue",
+    "rule",
+    "rule_top_cause",
+    "label",
+    "label_source"
+  ],
+  "missing": "empty field (NaN)",
+  "schema_version": 1
+}
