@@ -21,14 +21,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Default EWMA smoothing factor. At one sample/second this puts the
-/// half-life at roughly 35 samples, so a baseline tracks slow drift (a
-/// congested evening) without absorbing the spike it is supposed to detect.
-pub const DEFAULT_ALPHA: f64 = 0.02;
+/// EWMA time constant. Smoothing is defined in seconds, not samples: probes
+/// arrive once per `HEALTH_PROBE_TICKS` refresh ticks and the refresh rate is
+/// user-configurable (100ms–5s), so a per-sample factor gave a half-life
+/// anywhere from ~90s to ~15min. Thirty minutes (half-life ≈ 21min) tracks a
+/// congested evening without absorbing an incident while it is happening.
+pub const DEFAULT_TAU_SECS: f64 = 1_800.0;
 
-/// Samples required before a metric's baseline may be used by a rule.
-/// 30 minutes at one sample/second, matching the spec's minimum.
-pub const DEFAULT_MIN_SAMPLES: u32 = 1_800;
+/// Observed time required before a metric's baseline may be used by a rule.
+pub const DEFAULT_MIN_OBSERVED_SECS: f64 = 1_800.0;
+
+/// Samples also required, so thirty minutes of one sample every 60s (a
+/// sleeping laptop, a stalled prober) can't produce a "ready" baseline.
+pub const DEFAULT_MIN_SAMPLES: u32 = 60;
+
+/// Longest gap credited to one update. A laptop waking after a night asleep
+/// must not let its first sample replace the baseline, nor count the night
+/// as observation time.
+pub const MAX_STEP_SECS: f64 = 60.0;
+
+/// Step assumed when a baseline has no previous timestamp (first update after
+/// migrating a v1 file). Matches the default probe cadence.
+pub const NOMINAL_STEP_SECS: f64 = 5.0;
+
+/// A reading this many σ above a ready baseline is not learned. Matches the
+/// detectors' default `sigma_k`, so any sample that can hold an issue open is
+/// also one the baseline refuses to normalise.
+pub const DEFAULT_GATE_SIGMA: f64 = 3.0;
+
+/// How long a baseline may refuse readings before it concedes the network has
+/// changed underneath it (a new ISP with the same gateway) and resumes
+/// learning, clamped to the gate so the move is gradual.
+pub const MAX_HOLD_SECS: f64 = 6.0 * 3_600.0;
+
+/// Seconds credited per sample when migrating a v1 file, which counted
+/// samples only. One probe every 5 ticks at the default 1s refresh.
+const V1_SECS_PER_SAMPLE: f64 = 5.0;
+
+const PERSISTED_VERSION: u32 = 2;
 
 /// Identity of the network a baseline was learned on. Two runs on the same
 /// network produce the same fingerprint; changing any component produces a
@@ -94,15 +124,40 @@ pub struct Baseline {
     pub samples: u32,
     /// Highest value ever accepted into the baseline, for context in reports.
     pub max_seen: f64,
+    /// Observation time credited so far, gaps capped at [`MAX_STEP_SECS`].
+    #[serde(default)]
+    pub observed_secs: f64,
+    /// Unix time of the last reading, learned or gated.
+    #[serde(default)]
+    pub last_at: Option<f64>,
+    /// Consecutive time readings have been gated out. Reset by any reading
+    /// the gate accepts.
+    #[serde(default)]
+    pub held_secs: f64,
+}
+
+/// What [`BaselineStore::observe`] did with a reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Learned {
+    Accepted,
+    /// Above the gate on a ready baseline; not learned.
+    Gated,
+    /// Gated for longer than [`MAX_HOLD_SECS`]; learned, clamped to the gate.
+    Clamped,
+    /// NaN or infinite.
+    Rejected,
 }
 
 impl Baseline {
-    fn new(first: f64) -> Self {
+    fn new(first: f64, at: f64) -> Self {
         Self {
             mean: first,
             variance: 0.0,
             samples: 1,
             max_seen: first,
+            observed_secs: 0.0,
+            last_at: Some(at),
+            held_secs: 0.0,
         }
     }
 
@@ -122,7 +177,21 @@ impl Baseline {
         }
     }
 
-    fn update(&mut self, value: f64, alpha: f64) {
+    /// Seconds since the previous reading, capped, and advance the clock.
+    fn step(&mut self, at: f64) -> f64 {
+        let dt = match self.last_at {
+            Some(last) => (at - last).clamp(0.0, MAX_STEP_SECS),
+            None => NOMINAL_STEP_SECS,
+        };
+        if self.last_at.is_none_or(|last| at > last) {
+            self.last_at = Some(at);
+        }
+        dt
+    }
+
+    fn update(&mut self, value: f64, dt: f64, tau_secs: f64) {
+        let alpha = 1.0 - (-dt / tau_secs).exp();
+        self.observed_secs += dt;
         let delta = value - self.mean;
         self.mean += alpha * delta;
         // EWMA variance (West's incremental form): tracks the same window as
@@ -141,10 +210,10 @@ impl Baseline {
 pub enum Readiness {
     /// Never seen on this network.
     Unknown,
-    /// Seen, but fewer than `min_samples`. Rules must not fire.
+    /// Seen, but not for long enough. Rules must not fire.
     Learning {
-        samples: u32,
-        need: u32,
+        observed_secs: u64,
+        need_secs: u64,
     },
     Ready,
 }
@@ -154,15 +223,26 @@ impl Readiness {
         matches!(self, Readiness::Ready)
     }
 
-    /// `"learning 412/1800"` — what the Diagnose header shows so a user is
+    /// `"learning 7m/30m"` — what the Diagnose header shows so a user is
     /// never left wondering why nothing has fired yet.
     pub fn label(self) -> String {
         match self {
             Readiness::Unknown => "no baseline".to_string(),
-            Readiness::Learning { samples, need } => format!("learning {samples}/{need}"),
+            Readiness::Learning {
+                observed_secs,
+                need_secs,
+            } => format!(
+                "learning {}/{}",
+                minutes_label(observed_secs),
+                minutes_label(need_secs)
+            ),
             Readiness::Ready => "ready".to_string(),
         }
     }
+}
+
+fn minutes_label(secs: u64) -> String {
+    format!("{}m", secs / 60)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -186,8 +266,10 @@ fn encode(subject: &str, metric: &str) -> String {
 pub struct BaselineStore {
     networks: HashMap<String, NetworkBaselines>,
     current: NetworkFingerprint,
-    alpha: f64,
+    tau_secs: f64,
+    min_observed_secs: f64,
     min_samples: u32,
+    gate_sigma: f64,
     /// Set when `current` changed since load — the UI says so, and rules stay
     /// quiet until the new network's baselines are ready.
     switched: bool,
@@ -199,8 +281,10 @@ impl BaselineStore {
         Self {
             networks: HashMap::new(),
             current,
-            alpha: DEFAULT_ALPHA,
+            tau_secs: DEFAULT_TAU_SECS,
+            min_observed_secs: DEFAULT_MIN_OBSERVED_SECS,
             min_samples: DEFAULT_MIN_SAMPLES,
+            gate_sigma: DEFAULT_GATE_SIGMA,
             switched: false,
             dirty: false,
         }
@@ -211,9 +295,20 @@ impl BaselineStore {
         self
     }
 
-    pub fn with_alpha(mut self, alpha: f64) -> Self {
-        self.alpha = alpha;
+    pub fn with_min_observed_secs(mut self, secs: f64) -> Self {
+        self.min_observed_secs = secs;
         self
+    }
+
+    pub fn with_tau_secs(mut self, tau_secs: f64) -> Self {
+        self.tau_secs = tau_secs;
+        self
+    }
+
+    /// Keep the learning gate in step with the detectors' `sigma_k`, which a
+    /// user can change in settings.
+    pub fn set_gate_sigma(&mut self, sigma: f64) {
+        self.gate_sigma = sigma;
     }
 
     pub fn fingerprint(&self) -> &NetworkFingerprint {
@@ -240,10 +335,25 @@ impl BaselineStore {
         self.dirty = true;
     }
 
-    /// Record a sample for the current network.
-    pub fn observe(&mut self, subject: &str, metric: &str, value: f64) {
-        if !value.is_finite() {
-            return;
+    fn is_ready(&self, b: &Baseline) -> bool {
+        b.samples >= self.min_samples && b.observed_secs >= self.min_observed_secs
+    }
+
+    /// Record a reading taken at `at` (unix seconds) for the current network.
+    ///
+    /// ## Why a ready baseline refuses outliers
+    ///
+    /// An incident is exactly the period a baseline must not learn from. With
+    /// plain EWMA a sustained slowdown pulls the mean up until the detector
+    /// stops firing, and the issue auto-closes while the user is still
+    /// suffering it. So once a baseline is ready, a reading at or above
+    /// `gate_sigma` is not learned. If that lasts longer than
+    /// [`MAX_HOLD_SECS`] the network has most likely changed for good, and
+    /// readings are learned again but clamped to the gate, so the baseline
+    /// walks toward the new level instead of jumping to it.
+    pub fn observe(&mut self, subject: &str, metric: &str, value: f64, at: f64) -> Learned {
+        if !value.is_finite() || !at.is_finite() {
+            return Learned::Rejected;
         }
         let key = self.current.key();
         let label = self.current.label();
@@ -254,12 +364,34 @@ impl BaselineStore {
                 metrics: HashMap::new(),
                 label,
             });
-        let alpha = self.alpha;
-        net.metrics
-            .entry(encode(subject, metric))
-            .and_modify(|b| b.update(value, alpha))
-            .or_insert_with(|| Baseline::new(value));
         self.dirty = true;
+        let (tau, gate, min_samples, min_secs) = (
+            self.tau_secs,
+            self.gate_sigma,
+            self.min_samples,
+            self.min_observed_secs,
+        );
+        let Some(b) = net.metrics.get_mut(&encode(subject, metric)) else {
+            net.metrics
+                .insert(encode(subject, metric), Baseline::new(value, at));
+            return Learned::Accepted;
+        };
+
+        let dt = b.step(at);
+        let ready = b.samples >= min_samples && b.observed_secs >= min_secs;
+        let over_gate = ready && b.sigma_above(value).is_some_and(|s| s >= gate);
+        if !over_gate {
+            b.held_secs = 0.0;
+            b.update(value, dt, tau);
+            return Learned::Accepted;
+        }
+        b.held_secs += dt;
+        if b.held_secs <= MAX_HOLD_SECS {
+            return Learned::Gated;
+        }
+        let ceiling = b.mean + gate * b.sigma();
+        b.update(value.min(ceiling), dt, tau);
+        Learned::Clamped
     }
 
     /// Baseline for a metric, **only if it is usable**. Returns `None` while
@@ -271,7 +403,7 @@ impl BaselineStore {
             .get(&self.current.key())?
             .metrics
             .get(&encode(subject, metric))?;
-        (b.samples >= self.min_samples).then_some(b)
+        self.is_ready(b).then_some(b)
     }
 
     pub fn readiness(&self, subject: &str, metric: &str) -> Readiness {
@@ -281,11 +413,15 @@ impl BaselineStore {
             .and_then(|n| n.metrics.get(&encode(subject, metric)))
         {
             None => Readiness::Unknown,
-            Some(b) if b.samples >= self.min_samples => Readiness::Ready,
-            Some(b) => Readiness::Learning {
-                samples: b.samples,
-                need: self.min_samples,
-            },
+            Some(b) if self.is_ready(b) => Readiness::Ready,
+            Some(b) => self.learning(b.observed_secs),
+        }
+    }
+
+    fn learning(&self, observed_secs: f64) -> Readiness {
+        Readiness::Learning {
+            observed_secs: observed_secs.min(self.min_observed_secs) as u64,
+            need_secs: self.min_observed_secs as u64,
         }
     }
 
@@ -295,22 +431,25 @@ impl BaselineStore {
         let Some(net) = self.networks.get(&self.current.key()) else {
             return Readiness::Unknown;
         };
-        if net.metrics.is_empty() {
-            return Readiness::Unknown;
-        }
-        let min = net.metrics.values().map(|b| b.samples).min().unwrap_or(0);
-        if min >= self.min_samples {
-            Readiness::Ready
-        } else {
-            Readiness::Learning {
-                samples: min,
-                need: self.min_samples,
-            }
-        }
+        let Some(least) = net
+            .metrics
+            .values()
+            .filter(|b| !self.is_ready(b))
+            .map(|b| b.observed_secs)
+            .reduce(f64::min)
+        else {
+            return if net.metrics.is_empty() {
+                Readiness::Unknown
+            } else {
+                Readiness::Ready
+            };
+        };
+        self.learning(least)
     }
 
     /// Seed a ready-made baseline. Used by the fixture and by tests; nothing
-    /// on the live path calls it.
+    /// on the live path calls it. `samples` is credited as observation time at
+    /// the v1 cadence so seeded fixtures stay ready.
     pub fn seed(&mut self, subject: &str, metric: &str, mean: f64, sigma: f64, samples: u32) {
         let key = self.current.key();
         let label = self.current.label();
@@ -328,6 +467,9 @@ impl BaselineStore {
                 variance: sigma * sigma,
                 samples,
                 max_seen: mean + 3.0 * sigma,
+                observed_secs: samples as f64 * V1_SECS_PER_SAMPLE,
+                last_at: None,
+                held_secs: 0.0,
             },
         );
         self.dirty = true;
@@ -339,7 +481,17 @@ impl BaselineStore {
             return store;
         };
         match serde_json::from_str::<Persisted>(&text) {
-            Ok(p) => {
+            Ok(mut p) => {
+                if p.version < 2 {
+                    // v1 counted samples, not time. Credit each at the
+                    // default probe cadence so a baseline that was ready
+                    // stays ready, and let its first update use a nominal step.
+                    for b in p.networks.values_mut().flat_map(|n| n.metrics.values_mut()) {
+                        b.observed_secs = b.samples as f64 * V1_SECS_PER_SAMPLE;
+                        b.last_at = None;
+                    }
+                    store.dirty = true;
+                }
                 store.networks = p.networks;
                 // A run that comes up on a different network than the one last
                 // written is exactly the case this whole module exists for.
@@ -363,7 +515,7 @@ impl BaselineStore {
             std::fs::create_dir_all(dir)?;
         }
         let payload = Persisted {
-            version: 1,
+            version: PERSISTED_VERSION,
             last_network: Some(self.current.key()),
             networks: self.networks.clone(),
         };
@@ -414,6 +566,30 @@ mod tests {
         )
     }
 
+    /// Feed `value` every `step` seconds for `secs`, starting at `from`.
+    /// Returns the time after the last reading.
+    fn feed(s: &mut BaselineStore, value: f64, from: f64, step: f64, secs: f64) -> f64 {
+        let mut t = from;
+        while t < from + secs {
+            s.observe("r", "m", value, t);
+            t += step;
+        }
+        t
+    }
+
+    /// A baseline with some natural variation around `mean`, ready to judge.
+    fn ready_noisy(s: &mut BaselineStore, mean: f64, from: f64, step: f64, secs: f64) -> f64 {
+        let mut t = from;
+        let mut i = 0u64;
+        while t < from + secs {
+            let jitter = if i.is_multiple_of(2) { -0.5 } else { 0.5 };
+            s.observe("r", "m", mean + jitter, t);
+            t += step;
+            i += 1;
+        }
+        t
+    }
+
     #[test]
     fn fingerprint_ignores_resolver_order() {
         let a =
@@ -424,30 +600,133 @@ mod tests {
     }
 
     #[test]
-    fn baseline_is_withheld_until_it_has_enough_samples() {
-        let mut s = BaselineStore::new(office()).with_min_samples(10);
-        for _ in 0..5 {
-            s.observe("169.254.1.1", "dns.rtt_p50", 1.2);
-        }
-        assert!(s.get("169.254.1.1", "dns.rtt_p50").is_none());
+    fn baseline_is_withheld_until_it_has_observed_long_enough() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(10)
+            .with_min_observed_secs(100.0);
+        let t = feed(&mut s, 1.2, 0.0, 5.0, 50.0);
+        assert!(s.get("r", "m").is_none());
         assert_eq!(
-            s.readiness("169.254.1.1", "dns.rtt_p50"),
+            s.readiness("r", "m"),
             Readiness::Learning {
-                samples: 5,
-                need: 10
+                observed_secs: 45,
+                need_secs: 100
             }
         );
-        for _ in 0..5 {
-            s.observe("169.254.1.1", "dns.rtt_p50", 1.2);
+        feed(&mut s, 1.2, t, 5.0, 60.0);
+        assert!(s.get("r", "m").is_some());
+    }
+
+    #[test]
+    fn few_samples_over_a_long_time_are_not_ready() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(60)
+            .with_min_observed_secs(1_800.0);
+        // One reading a minute for an hour: plenty of time, too few samples.
+        feed(&mut s, 1.2, 0.0, 60.0, 3_000.0);
+        assert!(s.get("r", "m").is_none());
+    }
+
+    #[test]
+    fn a_long_gap_is_neither_observation_time_nor_a_big_step() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(5)
+            .with_min_observed_secs(1_000.0);
+        feed(&mut s, 10.0, 0.0, 5.0, 100.0);
+        // Laptop asleep overnight, wakes on a slow network.
+        s.observe("r", "m", 500.0, 100.0 + 8.0 * 3_600.0);
+        let b = &s.networks[&office().key()].metrics[&encode("r", "m")];
+        assert!(b.observed_secs <= 95.0 + MAX_STEP_SECS + 0.01);
+        assert!(
+            b.mean < 30.0,
+            "one sample after a gap moved the mean to {}",
+            b.mean
+        );
+    }
+
+    #[test]
+    fn half_life_does_not_depend_on_sample_rate() {
+        // Same 20 minutes of a +10 step, sampled every 1s and every 25s.
+        let mean_after = |step: f64| {
+            let mut s = BaselineStore::new(office())
+                .with_min_samples(u32::MAX) // never ready: no gating
+                .with_tau_secs(DEFAULT_TAU_SECS);
+            let t = feed(&mut s, 0.0, 0.0, step, 600.0);
+            feed(&mut s, 10.0, t, step, 1_200.0);
+            s.networks[&office().key()].metrics[&encode("r", "m")].mean
+        };
+        let fast = mean_after(1.0);
+        let slow = mean_after(25.0);
+        let expected = 10.0 * (1.0 - (-1_200.0 / DEFAULT_TAU_SECS).exp());
+        assert!(
+            (fast - expected).abs() / expected < 0.05,
+            "1s: {fast} vs {expected}"
+        );
+        assert!(
+            (fast - slow).abs() / fast < 0.10,
+            "1s gave {fast}, 25s gave {slow}"
+        );
+    }
+
+    #[test]
+    fn a_sustained_incident_is_not_learned() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(60)
+            .with_min_observed_secs(1_800.0);
+        let t = ready_noisy(&mut s, 10.0, 0.0, 5.0, 3_600.0);
+        let before = s.get("r", "m").unwrap().clone();
+
+        // +80ms for 25 minutes, far above 3σ of a ±0.5 metric.
+        let mut at = t;
+        while at < t + 1_500.0 {
+            assert_eq!(s.observe("r", "m", 90.0, at), Learned::Gated);
+            at += 5.0;
         }
-        assert!(s.get("169.254.1.1", "dns.rtt_p50").is_some());
+        let after = s.get("r", "m").unwrap();
+        assert_eq!(after.mean, before.mean);
+        assert!(after.sigma_above(90.0).unwrap() >= DEFAULT_GATE_SIGMA);
+    }
+
+    #[test]
+    fn a_permanent_shift_is_eventually_learned_gradually() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(60)
+            .with_min_observed_secs(1_800.0);
+        let t = ready_noisy(&mut s, 10.0, 0.0, 5.0, 3_600.0);
+        let before = s.get("r", "m").unwrap().clone();
+        let t = feed(&mut s, 40.0, t, 5.0, MAX_HOLD_SECS);
+        assert_eq!(
+            s.get("r", "m").unwrap().mean,
+            before.mean,
+            "held for six hours"
+        );
+
+        assert_eq!(s.observe("r", "m", 40.0, t), Learned::Clamped);
+        let b = s.get("r", "m").unwrap();
+        let ceiling = before.mean + DEFAULT_GATE_SIGMA * before.sigma();
+        assert!(
+            b.mean > before.mean,
+            "a clamped reading still moves the mean"
+        );
+        assert!(b.mean < ceiling, "clamped step moved mean to {}", b.mean);
+    }
+
+    #[test]
+    fn improvement_is_always_learned() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(60)
+            .with_min_observed_secs(1_800.0);
+        let t = ready_noisy(&mut s, 10.0, 0.0, 5.0, 3_600.0);
+        assert_eq!(s.observe("r", "m", 1.0, t), Learned::Accepted);
     }
 
     #[test]
     fn moving_networks_does_not_leak_the_old_baseline() {
-        let mut s = BaselineStore::new(office()).with_min_samples(3);
-        for _ in 0..10 {
-            s.observe("resolver", "dns.rtt_p50", 1.2);
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(3)
+            .with_min_observed_secs(10.0);
+        for i in 0..10 {
+            s.observe("resolver", "dns.rtt_p50", 1.2, i as f64 * 5.0);
         }
         assert!(s.get("resolver", "dns.rtt_p50").is_some());
 
@@ -462,13 +741,15 @@ mod tests {
 
     #[test]
     fn returning_to_a_known_network_restores_its_baseline() {
-        let mut s = BaselineStore::new(office()).with_min_samples(3);
-        for _ in 0..10 {
-            s.observe("resolver", "dns.rtt_p50", 1.2);
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(3)
+            .with_min_observed_secs(10.0);
+        for i in 0..10 {
+            s.observe("resolver", "dns.rtt_p50", 1.2, i as f64 * 5.0);
         }
         s.set_network(hotspot());
-        for _ in 0..10 {
-            s.observe("resolver", "dns.rtt_p50", 45.0);
+        for i in 10..20 {
+            s.observe("resolver", "dns.rtt_p50", 45.0, i as f64 * 5.0);
         }
         s.set_network(office());
         let b = s
@@ -483,10 +764,10 @@ mod tests {
 
     #[test]
     fn sigma_is_none_for_a_metric_that_never_varied() {
-        let mut s = BaselineStore::new(office()).with_min_samples(2);
-        for _ in 0..10 {
-            s.observe("r", "m", 5.0);
-        }
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(2)
+            .with_min_observed_secs(10.0);
+        feed(&mut s, 5.0, 0.0, 5.0, 50.0);
         let b = s.get("r", "m").unwrap();
         assert_eq!(b.sigma_above(500.0), None);
     }
@@ -494,12 +775,17 @@ mod tests {
     #[test]
     fn variance_tracks_a_noisy_metric() {
         let mut s = BaselineStore::new(office())
-            .with_min_samples(2)
-            .with_alpha(0.2);
+            .with_min_samples(u32::MAX)
+            .with_tau_secs(50.0);
         for i in 0..200 {
-            s.observe("r", "m", if i % 2 == 0 { 8.0 } else { 12.0 });
+            s.observe(
+                "r",
+                "m",
+                if i % 2 == 0 { 8.0 } else { 12.0 },
+                i as f64 * 5.0,
+            );
         }
-        let b = s.get("r", "m").unwrap();
+        let b = &s.networks[&office().key()].metrics[&encode("r", "m")];
         assert!((b.mean - 10.0).abs() < 1.0, "mean {}", b.mean);
         assert!(
             b.sigma() > 0.5,
@@ -516,13 +802,15 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("baselines.json");
 
-        let mut s = BaselineStore::new(office()).with_min_samples(3);
-        for _ in 0..10 {
-            s.observe("r", "m", 1.2);
-        }
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(3)
+            .with_min_observed_secs(10.0);
+        feed(&mut s, 1.2, 0.0, 5.0, 50.0);
         s.save(&path).unwrap();
 
-        let back = BaselineStore::load(&path, office()).with_min_samples(3);
+        let back = BaselineStore::load(&path, office())
+            .with_min_samples(3)
+            .with_min_observed_secs(10.0);
         assert!(back.get("r", "m").is_some());
         assert!(!back.switched_network());
 
@@ -531,6 +819,32 @@ mod tests {
         assert!(moved.get("r", "m").is_none());
         assert!(moved.switched_network());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v1_file_keeps_its_readiness() {
+        let dir = std::env::temp_dir().join(format!("nw-baseline-v1-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("baselines.json");
+        let key = office().key();
+        let mut metrics = serde_json::Map::new();
+        metrics.insert(
+            encode("r", "m"),
+            serde_json::json!({ "mean": 1.2, "variance": 0.04, "samples": 1800, "max_seen": 3.0 }),
+        );
+        let mut networks = serde_json::Map::new();
+        networks.insert(
+            key.clone(),
+            serde_json::json!({ "label": "eth0 via 192.168.8.1", "metrics": metrics }),
+        );
+        let v1 = serde_json::json!({ "version": 1, "last_network": key, "networks": networks });
+        std::fs::write(&path, v1.to_string()).unwrap();
+
+        let s = BaselineStore::load(&path, office());
+        let b = s.get("r", "m").expect("a ready v1 baseline stays ready");
+        assert_eq!(b.samples, 1_800);
+        assert_eq!(b.observed_secs, 9_000.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -830,12 +830,13 @@ impl App {
         self.whois_cache.start();
     }
 
-    /// One diagnose pass: learn, sample, evaluate.
+    /// One diagnose pass: sample, evaluate, then learn.
     ///
-    /// Order matters. Baselines are updated from this tick's readings
-    /// *before* the detectors run, but the store withholds a baseline until
-    /// it has enough samples, so a metric can never be judged against a mean
-    /// that consists mostly of itself.
+    /// Order matters. The detectors judge this tick's readings against the
+    /// baseline as it stood *before* those readings, so a reading can never
+    /// soften the comparison it is part of. Learning afterwards is also gated
+    /// at the detectors' σ threshold, so a sustained incident is not absorbed
+    /// into "normal" while it is still open.
     fn tick_diagnose(&mut self) {
         // Demo mode: the recorded scenario drives the engine, nothing is
         // sampled from the host, and nothing is persisted.
@@ -861,18 +862,19 @@ impl App {
 
         let mut sampler = std::mem::take(&mut self.diagnose.sampler);
         let readings = sampler.readings(self);
-        crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
 
         let thresholds = self.diagnose.engine.settings().thresholds;
         let observations = sampler.sample(self, &thresholds);
         self.diagnose.sampler = sampler;
 
-        let baselines = self.diagnose.baselines.clone();
         self.diagnose.engine.observe_live(
             &observations,
-            &baselines,
+            &self.diagnose.baselines,
             &self.diagnose.sampler.completed,
         );
+
+        self.diagnose.baselines.set_gate_sigma(thresholds.sigma_k);
+        crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
 
         // Keep the cursor on a real row as issues open and close.
         let open = self.diagnose.engine.open_count();

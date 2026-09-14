@@ -35,6 +35,37 @@ pub const BASELINED_METRICS: &[(&str, &str)] = &[
     ("path.rtt", "path.rtt_spike"),
 ];
 
+/// One probe result destined for the baseline store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub subject: String,
+    pub metric: &'static str,
+    pub value: f64,
+    /// When the probe completed, as unix seconds. Baselines smooth over time,
+    /// so this is the probe's time, not the tick that noticed it.
+    pub at: f64,
+}
+
+impl Reading {
+    pub fn new(subject: impl Into<String>, metric: &'static str, value: f64, at: f64) -> Self {
+        Self {
+            subject: subject.into(),
+            metric,
+            value,
+            at,
+        }
+    }
+}
+
+/// Wall-clock unix seconds for a monotonic instant in the recent past.
+fn unix_secs(at: Instant) -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    now - at.elapsed().as_secs_f64()
+}
+
 #[derive(Default)]
 pub struct LiveSampler {
     interface_sample: Option<(Instant, IfaceObs)>,
@@ -126,39 +157,44 @@ impl LiveSampler {
     /// the store, and so the set of baselined metrics is inspectable — a
     /// metric learned under one name and verified under another would be a
     /// silent dead end, and [`BASELINED_METRICS`] is asserted against the rules.
-    pub fn readings(&mut self, app: &App) -> Vec<(String, &'static str, f64)> {
+    pub fn readings(&mut self, app: &App) -> Vec<Reading> {
         let health = app.health_prober.status();
         let cfg = &app.config_collector.config;
         let mut out = Vec::new();
 
         if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), health.dns_rtt_ms) {
-            if health.completed.dns_target.as_ref() == Some(&resolver)
-                && self.fresh_reading("dns", health.completed.dns)
-            {
-                out.push((resolver, "dns.rtt_p50", rtt));
+            if health.completed.dns_target.as_ref() == Some(&resolver) {
+                if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
+                    out.push(Reading::new(resolver, "dns.rtt_p50", rtt, at));
+                }
             }
         }
         if let (Some(gw), Some(rtt)) = (cfg.gateway.clone(), health.gateway_rtt_ms) {
-            if health.completed.gateway_target.as_ref() == Some(&gw)
-                && self.fresh_reading("gateway", health.completed.gateway)
-            {
-                out.push((gw, "gateway.rtt", rtt));
+            if health.completed.gateway_target.as_ref() == Some(&gw) {
+                if let Some(at) = self.fresh_reading("gateway", health.completed.gateway) {
+                    out.push(Reading::new(gw, "gateway.rtt", rtt, at));
+                }
             }
         }
         if let Some(rtt) = health.internet_rtt_ms {
-            if self.fresh_reading("internet", health.completed.internet) {
-                out.push(("internet".to_string(), "path.rtt", rtt));
+            if let Some(at) = self.fresh_reading("internet", health.completed.internet) {
+                out.push(Reading::new("internet", "path.rtt", rtt, at));
             }
         }
         out
     }
 
-    fn fresh_reading(&mut self, source: &str, completed: Option<Instant>) -> bool {
+    /// The probe's completion time as unix seconds, the first time a fresh
+    /// completion is seen; `None` for a stale probe or one already learned.
+    fn fresh_reading(&mut self, source: &str, completed: Option<Instant>) -> Option<f64> {
         if !crate::collectors::health::ProbeTimes::fresh(completed, 30) {
-            return false;
+            return None;
         }
-        let completed = completed.unwrap();
-        self.learned_samples.insert(source.into(), completed) != Some(completed)
+        let completed = completed?;
+        if self.learned_samples.insert(source.into(), completed) == Some(completed) {
+            return None;
+        }
+        Some(unix_secs(completed))
     }
 
     /// The verdict this socket is currently carrying, if it has one.
@@ -175,9 +211,9 @@ impl LiveSampler {
     }
 
     /// Apply a batch of readings to the store.
-    pub fn learn(base: &mut BaselineStore, readings: &[(String, &'static str, f64)]) {
-        for (subject, metric, value) in readings {
-            base.observe(subject, metric, *value);
+    pub fn learn(base: &mut BaselineStore, readings: &[Reading]) {
+        for r in readings {
+            base.observe(&r.subject, r.metric, r.value, r.at);
         }
     }
 
@@ -535,11 +571,15 @@ mod tests {
     fn cached_probe_is_learned_once_and_stale_results_are_not_learned() {
         let mut sampler = LiveSampler::new();
         let now = Instant::now();
-        assert!(sampler.fresh_reading("dns", Some(now)));
-        assert!(!sampler.fresh_reading("dns", Some(now)));
-        assert!(!sampler.fresh_reading("dns", Some(now - std::time::Duration::from_secs(31))));
-        assert!(!sampler.fresh_reading("dns", None));
-        assert!(sampler.fresh_reading("dns", Some(now + std::time::Duration::from_nanos(1))));
+        assert!(sampler.fresh_reading("dns", Some(now)).is_some());
+        assert!(sampler.fresh_reading("dns", Some(now)).is_none());
+        assert!(sampler
+            .fresh_reading("dns", Some(now - std::time::Duration::from_secs(31)))
+            .is_none());
+        assert!(sampler.fresh_reading("dns", None).is_none());
+        assert!(sampler
+            .fresh_reading("dns", Some(now + std::time::Duration::from_nanos(1)))
+            .is_some());
     }
 
     #[test]

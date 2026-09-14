@@ -1388,4 +1388,75 @@ mod tests {
             "history limit not enforced: {closed} closed issues"
         );
     }
+
+    /// A gateway that stays slow for 25 minutes must stay one open issue for
+    /// all 25 minutes, whatever the probe cadence. Before learning was gated
+    /// and ordered after evaluation, the EWMA absorbed the slowdown within a
+    /// few minutes and the issue auto-closed while the user still had it.
+    #[test]
+    fn a_sustained_slowdown_is_not_learned_away() {
+        for step in [2.0_f64, 25.0] {
+            let gw = "192.168.8.1";
+            let mut b = BaselineStore::new(NetworkFingerprint::new(
+                "eth0",
+                Some(gw.into()),
+                vec!["169.254.1.1".into()],
+                None,
+            ));
+            let (mut e, clock) = engine_at("2026-09-03 06:00:00");
+            let gateway = |rtt: f64| Observations {
+                now: "2026-09-03 06:48:10".into(),
+                gateway: Some(GatewayObs {
+                    addr: Some(gw.into()),
+                    rtt_ms: Some(rtt),
+                    loss_pct: 0.0,
+                    arp_ok: true,
+                    icmp_ok: true,
+                    internet_reachable: Some(true),
+                }),
+                ..Default::default()
+            };
+
+            // An hour of a healthy ~2ms gateway, in the same order as the
+            // live tick: evaluate, then learn.
+            let mut t = 0.0;
+            let mut i = 0u32;
+            while t < 3_600.0 {
+                let rtt = if i.is_multiple_of(2) { 1.7 } else { 2.3 };
+                e.observe(&gateway(rtt), &b);
+                b.observe(gw, "gateway.rtt", rtt, t);
+                clock.advance_secs(step as i64);
+                t += step;
+                i += 1;
+            }
+            assert!(
+                b.get(gw, "gateway.rtt").is_some(),
+                "baseline ready at step {step}"
+            );
+
+            let mut open_since = None;
+            while t < 3_600.0 + 25.0 * 60.0 {
+                e.observe(&gateway(82.0), &b);
+                b.observe(gw, "gateway.rtt", 82.0, t);
+                let open = e
+                    .issues()
+                    .iter()
+                    .any(|i| i.rule == "gateway.rtt_spike" && i.state.is_open());
+                match (open, open_since) {
+                    (true, None) => open_since = Some(t),
+                    (false, Some(since)) => panic!(
+                        "step {step}s: issue closed {:.0}s into the slowdown",
+                        t - since
+                    ),
+                    _ => {}
+                }
+                clock.advance_secs(step as i64);
+                t += step;
+            }
+            assert!(
+                open_since.is_some(),
+                "step {step}s: the slowdown never opened an issue"
+            );
+        }
+    }
 }
