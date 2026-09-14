@@ -4,6 +4,19 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.3] - 2026-09-14
+
+### Added
+- `netwatch-linux-armv5te` release binary for Debian armel on Marvell Kirkwood NAS
+  boxes such as the Iomega ix2-dl. libpcap is statically linked; the binary needs
+  Debian 12 (bookworm) or newer with `libatomic1`. Built in a bookworm container,
+  whose 32-bit time_t `pcap_pkthdr` layout matches Rust's; the build fails if the
+  layout changes. CI now runs `cargo check` for armv5te on every push. (#54)
+
+### Fixed
+- Captured packets whose `caplen` exceeds the snap length are skipped before their
+  data is read. (#54)
+
 ## [0.31.2] - 2026-09-12
 
 ### Added
