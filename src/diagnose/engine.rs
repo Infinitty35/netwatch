@@ -63,6 +63,24 @@ impl Clock for FixedClock {
     }
 }
 
+impl FixedClock {
+    /// Move the clock to a recorded timestamp. `false` if it doesn't parse.
+    pub fn set(&self, s: &str) -> bool {
+        let Some(at) = parse_ts(s) else {
+            return false;
+        };
+        *self.at.lock().unwrap() = at;
+        true
+    }
+}
+
+/// A shared handle, so a caller can keep setting the clock an engine owns.
+impl Clock for std::sync::Arc<FixedClock> {
+    fn now(&self) -> DateTime<Local> {
+        self.as_ref().now()
+    }
+}
+
 pub fn format_ts(dt: DateTime<Local>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -83,7 +101,7 @@ pub fn parse_ts(s: &str) -> Option<DateTime<Local>> {
 const RECURRENCE_WINDOW_MINS: i64 = 30;
 
 /// Engine settings, all user-tunable.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub thresholds: Thresholds,
     /// How long a resolved condition must stay resolved before auto-closing.
@@ -186,33 +204,47 @@ impl Engine {
         base: &BaselineStore,
         times: &ObservationTimes,
     ) {
+        self.observe_live_at(obs, base, times, std::time::Instant::now());
+    }
+
+    /// [`Self::observe_live`] with freshness judged at `now`. Replay drives
+    /// this with synthetic instants so a recorded tick sees exactly the probe
+    /// ages it saw live.
+    pub fn observe_live_at(
+        &mut self,
+        obs: &Observations,
+        base: &BaselineStore,
+        times: &ObservationTimes,
+        now: std::time::Instant,
+    ) {
         use crate::collectors::health::ProbeTimes;
+        let fresh = |at, max| ProbeTimes::fresh_at(at, max, now);
         let mut observed = obs.clone();
-        if !ProbeTimes::fresh(times.interface, 15) {
+        if !fresh(times.interface, 15) {
             observed.iface = None;
         }
-        if !ProbeTimes::fresh(times.health.dns, 30) {
+        if !fresh(times.health.dns, 30) {
             observed.dns = None;
         }
-        if !ProbeTimes::fresh(times.health.gateway, 30) {
+        if !fresh(times.health.gateway, 30) {
             observed.gateway = None;
         }
-        if !ProbeTimes::fresh(times.health.internet, 30) {
+        if !fresh(times.health.internet, 30) {
             if let Some(gateway) = &mut observed.gateway {
                 gateway.internet_reachable = None;
             }
         }
-        if !ProbeTimes::fresh(times.health.nat, 300) {
+        if !fresh(times.health.nat, 300) {
             observed.nat = None;
         }
-        if !ProbeTimes::fresh(times.sockets, 30) {
+        if !fresh(times.sockets, 30) {
             observed.sockets.clear();
         }
-        if !ProbeTimes::fresh(times.path, 120) {
+        if !fresh(times.path, 120) {
             observed.paths.clear();
         }
         self.observe_inner(&observed, base, Some(times));
-        self.coverage.mark_stale_probes(&times.health);
+        self.coverage.mark_stale_probes(&times.health, now);
         for row in &mut self.coverage.rules {
             if row.status == super::coverage::Availability::Unsupported {
                 continue;
@@ -230,7 +262,7 @@ impl Engine {
                 None
             };
             if let Some((Some(at), max_age)) = sample {
-                if !ProbeTimes::fresh(Some(at), max_age) {
+                if !fresh(Some(at), max_age) {
                     row.status = super::coverage::Availability::Stale;
                     row.reason = format!(
                         "collector snapshot older than {max_age}s; excluded from evaluation"

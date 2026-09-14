@@ -19,7 +19,7 @@ use super::issue::{
 use super::rules;
 
 /// Tunables. Defaults are the spec's: k=3σ, N=3 consecutive samples.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Thresholds {
     /// σ multiple that counts as a deviation.
     pub sigma_k: f64,

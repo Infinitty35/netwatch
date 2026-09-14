@@ -51,7 +51,11 @@ impl Coverage {
         )
     }
 
-    pub fn mark_stale_probes(&mut self, times: &crate::collectors::health::ProbeTimes) {
+    pub fn mark_stale_probes(
+        &mut self,
+        times: &crate::collectors::health::ProbeTimes,
+        now: std::time::Instant,
+    ) {
         use crate::collectors::health::ProbeTimes;
         for row in &mut self.rules {
             let sample = if row.rule.starts_with("dns.") {
@@ -64,7 +68,7 @@ impl Coverage {
                 None
             };
             if let Some((Some(at), limit)) = sample {
-                if !ProbeTimes::fresh(Some(at), limit) {
+                if !ProbeTimes::fresh_at(Some(at), limit, now) {
                     row.status = Availability::Stale;
                     row.reason =
                         format!("probe result is older than {limit}s; excluded from evaluation");

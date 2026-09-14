@@ -487,6 +487,11 @@ pub struct DiagnoseState {
     status_tick: u32,
     /// Ticks since the baselines were last written.
     persist_tick: u32,
+    /// Created on the first live tick when `diagnose_record_episodes` is on.
+    pub recorder: Option<crate::diagnose::episode::Recorder>,
+    /// Where finished episodes are written. `None` in unit tests, so a test
+    /// that ticks the app can never write into the user's state directory.
+    pub episode_dir: Option<std::path::PathBuf>,
 }
 
 impl DiagnoseState {
@@ -509,6 +514,12 @@ impl DiagnoseState {
             demo: None,
             status_tick: 0,
             persist_tick: 0,
+            recorder: None,
+            episode_dir: if cfg!(test) {
+                None
+            } else {
+                crate::diagnose::episode::default_dir()
+            },
         }
     }
 
@@ -867,11 +878,15 @@ impl App {
         let observations = sampler.sample(self, &thresholds);
         self.diagnose.sampler = sampler;
 
-        self.diagnose.engine.observe_live(
+        let now = std::time::Instant::now();
+        let wall = chrono::Local::now();
+        self.diagnose.engine.observe_live_at(
             &observations,
             &self.diagnose.baselines,
             &self.diagnose.sampler.completed,
+            now,
         );
+        self.record_episode_tick(&observations, &readings, now, wall);
 
         self.diagnose.baselines.set_gate_sigma(thresholds.sigma_k);
         crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
@@ -931,6 +946,70 @@ impl App {
         self.inspect_remediations(crate::diagnose::remediation::RecoveryAuthority::InspectOnly);
         let path = crate::diagnose::baseline::BaselineStore::default_path();
         let _ = self.diagnose.baselines.save(&path);
+        // An incident still in progress at quit is worth keeping; write it
+        // synchronously, since the process is about to exit.
+        let ts = crate::diagnose::engine::format_ts(chrono::Local::now());
+        if let (Some(recorder), Some(dir)) =
+            (self.diagnose.recorder.as_mut(), self.diagnose.episode_dir.as_ref())
+        {
+            if let Some(episode) = recorder.flush(&self.diagnose.engine, &ts) {
+                if let Err(e) = crate::diagnose::episode::save(dir, &episode) {
+                    tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved at shutdown");
+                }
+            }
+        }
+    }
+
+    /// Feed one live tick to the episode recorder and write any episode it
+    /// finishes on a background thread.
+    fn record_episode_tick(
+        &mut self,
+        observations: &crate::diagnose::detectors::Observations,
+        readings: &[crate::diagnose::live::Reading],
+        now: std::time::Instant,
+        wall: chrono::DateTime<chrono::Local>,
+    ) {
+        use crate::diagnose::episode;
+        let Some(dir) = self.diagnose.episode_dir.clone() else {
+            return;
+        };
+        if !self.user_config.diagnose_record_episodes {
+            self.diagnose.recorder = None;
+            return;
+        }
+        let at = wall.timestamp_micros() as f64 / 1e6;
+        let recorder = self.diagnose.recorder.get_or_insert_with(|| {
+            episode::Recorder::new(
+                episode::EnvProfile::detect(
+                    self.diagnose.capability.label(),
+                    self.user_config.refresh_rate_ms,
+                ),
+                at,
+            )
+        });
+        let finished = recorder.record(episode::Tick {
+            at,
+            ts: crate::diagnose::engine::format_ts(wall),
+            now,
+            obs: observations,
+            times: &self.diagnose.sampler.completed,
+            readings,
+            engine: &self.diagnose.engine,
+            baselines: &self.diagnose.baselines,
+        });
+        if let Some(episode) = finished {
+            std::thread::spawn(move || {
+                match episode::save(&dir, &episode) {
+                    Ok(path) => tracing::info!(target: "netwatch::diagnose", path = %path.display(), frames = episode.frames.len(), "episode saved"),
+                    Err(e) => tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved"),
+                }
+                episode::prune(
+                    &dir,
+                    std::time::Duration::from_secs(episode::RETAIN_SECS),
+                    episode::RETAIN_BYTES,
+                );
+            });
+        }
     }
 
     /// State of the PKTAP attribution path for the Connections header.

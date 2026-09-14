@@ -535,6 +535,64 @@ impl BaselineStore {
     }
 }
 
+/// The current network's baselines and the store's tuning, as one value.
+///
+/// An episode stores one at its first frame and at every network change, so
+/// replay starts from exactly the baselines the live engine judged against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineSnapshot {
+    pub network: NetworkFingerprint,
+    pub switched: bool,
+    pub tau_secs: f64,
+    pub min_observed_secs: f64,
+    pub min_samples: u32,
+    pub gate_sigma: f64,
+    /// Keyed as in `baselines.json`: `"subject\u{1f}metric"`.
+    pub metrics: HashMap<String, Baseline>,
+}
+
+impl BaselineStore {
+    pub fn snapshot(&self) -> BaselineSnapshot {
+        BaselineSnapshot {
+            network: self.current.clone(),
+            switched: self.switched,
+            tau_secs: self.tau_secs,
+            min_observed_secs: self.min_observed_secs,
+            min_samples: self.min_samples,
+            gate_sigma: self.gate_sigma,
+            metrics: self
+                .networks
+                .get(&self.current.key())
+                .map(|n| n.metrics.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Switch to the snapshot's network and tuning, replacing that network's
+    /// baselines with the snapshot's. Other networks are untouched.
+    pub fn restore(&mut self, snap: &BaselineSnapshot) {
+        self.current = snap.network.clone();
+        self.switched = snap.switched;
+        self.tau_secs = snap.tau_secs;
+        self.min_observed_secs = snap.min_observed_secs;
+        self.min_samples = snap.min_samples;
+        self.gate_sigma = snap.gate_sigma;
+        self.networks.insert(
+            snap.network.key(),
+            NetworkBaselines {
+                metrics: snap.metrics.clone(),
+                label: snap.network.label(),
+            },
+        );
+    }
+
+    pub fn from_snapshot(snap: &BaselineSnapshot) -> Self {
+        let mut store = Self::new(snap.network.clone());
+        store.restore(snap);
+        store
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persisted {
     version: u32,
@@ -846,6 +904,22 @@ mod tests {
         assert_eq!(b.samples, 1_800);
         assert_eq!(b.observed_secs, 9_000.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_same_judgements() {
+        let mut s = BaselineStore::new(office())
+            .with_min_samples(10)
+            .with_min_observed_secs(100.0);
+        let t = ready_noisy(&mut s, 10.0, 0.0, 5.0, 300.0);
+        let snap = s.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let mut back = BaselineStore::from_snapshot(&serde_json::from_str(&json).unwrap());
+        assert_eq!(back.get("r", "m"), s.get("r", "m"));
+        assert_eq!(
+            back.observe("r", "m", 90.0, t),
+            s.observe("r", "m", 90.0, t)
+        );
     }
 
     #[test]

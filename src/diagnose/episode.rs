@@ -1,0 +1,1278 @@
+//! Incident episodes: what the engine saw around an issue, recorded so it can
+//! be reviewed, exported, labelled and replayed.
+//!
+//! ```text
+//!   tick ──▶ Frame ──▶ pre-roll ring (10 min) ──┐
+//!                                              │ a primary issue opens
+//!                                              ▼
+//!                                        Episode (Live) ── last issue closes
+//!                                              │           + 10 min post-roll
+//!                                              ▼
+//!                           <state>/netwatch/episodes/YYYY-MM/<id>.json.gz
+//! ```
+//!
+//! A frame holds the *inputs* to one diagnose tick — observations, probe ages,
+//! the readings learned afterwards — plus the open issues the live engine
+//! produced from them. [`replay`] feeds the inputs to a fresh engine and
+//! compares its open issues frame by frame, so a recording doubles as a
+//! regression test of the engine that made it.
+//!
+//! Recording is local. Nothing here uploads or redacts; exports do that.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use super::baseline::{BaselineSnapshot, BaselineStore};
+use super::detectors::{classify_socket, Observations, SocketVerdict};
+use super::engine::{Engine, FixedClock, ObservationTimes, Settings};
+use super::issue::{Issue, Subject};
+use super::live::Reading;
+
+pub const SCHEMA_VERSION: u16 = 1;
+
+/// Seconds of frames kept before an issue opens.
+pub const PRE_ROLL_SECS: f64 = 600.0;
+/// Seconds recorded after the last attached issue closes.
+pub const POST_ROLL_SECS: f64 = 600.0;
+/// Longest single episode; a longer incident continues in a new file.
+pub const MAX_EPISODE_SECS: f64 = 2.0 * 3_600.0;
+/// Length of the daily sample of a quiet network.
+pub const QUIET_SAMPLE_SECS: f64 = 900.0;
+/// Sockets kept per frame beyond those with a verdict or an open issue.
+pub const TOP_SOCKETS: usize = 20;
+
+pub const RETAIN_SECS: u64 = 90 * 24 * 3_600;
+pub const RETAIN_BYTES: u64 = 300 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EpisodeSource {
+    /// Recorded around an issue on this host.
+    Live,
+    /// A stretch with no open issues, recorded once a day so false-alert
+    /// rates have a denominator.
+    QuietSample,
+    /// Produced by the fault lab.
+    Lab { scenario: String, seed: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvProfile {
+    pub os: String,
+    pub arch: String,
+    pub kernel: Option<String>,
+    pub netwatch_version: String,
+    /// Privileges the process held, as [`super::issue::Capability::label`].
+    pub capability: String,
+    pub refresh_rate_ms: u64,
+}
+
+impl EnvProfile {
+    pub fn detect(capability: &str, refresh_rate_ms: u64) -> Self {
+        Self {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|s| s.trim().to_string()),
+            netwatch_version: env!("CARGO_PKG_VERSION").into(),
+            capability: capability.into(),
+            refresh_rate_ms,
+        }
+    }
+}
+
+/// Seconds before the frame each collector's last result completed. Instants
+/// can't be stored; ages can, and replay turns them back into instants.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProbeAges {
+    pub interface: Option<f64>,
+    pub sockets: Option<f64>,
+    pub path: Option<f64>,
+    pub gateway: Option<f64>,
+    pub dns: Option<f64>,
+    pub internet: Option<f64>,
+    pub nat: Option<f64>,
+    pub gateway_target: Option<String>,
+    pub dns_target: Option<String>,
+}
+
+impl ProbeAges {
+    fn from_times(times: &ObservationTimes, now: Instant) -> Self {
+        let age =
+            |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at).as_secs_f64());
+        Self {
+            interface: age(times.interface),
+            sockets: age(times.sockets),
+            path: age(times.path),
+            gateway: age(times.health.gateway),
+            dns: age(times.health.dns),
+            internet: age(times.health.internet),
+            nat: age(times.health.nat),
+            gateway_target: times.health.gateway_target.clone(),
+            dns_target: times.health.dns_target.clone(),
+        }
+    }
+
+    fn to_times(&self, now: Instant) -> ObservationTimes {
+        let at = |age: Option<f64>| age.and_then(|a| now.checked_sub(Duration::from_secs_f64(a)));
+        let mut times = ObservationTimes {
+            interface: at(self.interface),
+            sockets: at(self.sockets),
+            path: at(self.path),
+            ..Default::default()
+        };
+        times.health.gateway = at(self.gateway);
+        times.health.dns = at(self.dns);
+        times.health.internet = at(self.internet);
+        times.health.nat = at(self.nat);
+        times.health.gateway_target = self.gateway_target.clone();
+        times.health.dns_target = self.dns_target.clone();
+        times
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordedReading {
+    pub subject: String,
+    pub metric: String,
+    pub value: f64,
+    pub at: f64,
+}
+
+/// An open, primary issue as the engine left it after a tick.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OpenIssue {
+    /// `rule|subject`, the engine's own identity for a condition.
+    pub key: String,
+    pub top_cause: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Frame {
+    /// Unix seconds.
+    pub at: f64,
+    /// Local `YYYY-MM-DD HH:MM:SS`, what the engine's clock read.
+    pub ts: String,
+    pub obs: Observations,
+    pub ages: ProbeAges,
+    /// Learned after evaluation, as on the live tick.
+    #[serde(default)]
+    pub readings: Vec<RecordedReading>,
+    /// Present on the first frame and wherever the network changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baselines: Option<BaselineSnapshot>,
+    /// What the live engine had open after this tick.
+    #[serde(default)]
+    pub open: Vec<OpenIssue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotReason {
+    Opened,
+    Closed,
+    /// Still open when the episode ended.
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueSnapshot {
+    pub ts: String,
+    pub reason: SnapshotReason,
+    pub issue: Issue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LabelSource {
+    /// The rule engine's own top cause. Provisional only.
+    Rule,
+    /// The person at the keyboard, after the issue resolved.
+    User,
+    /// A reviewer working from the recording.
+    Expert { reviewer: String },
+    /// The fault the lab injected.
+    Lab,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Label {
+    /// Issue key (`rule|subject`) the label is about.
+    pub issue: String,
+    /// `rule/cause_id`, or `not_network`, `unknown`.
+    pub cause: String,
+    pub source: LabelSource,
+    pub ts: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Episode {
+    pub schema_version: u16,
+    pub id: String,
+    pub source: EpisodeSource,
+    pub env: EnvProfile,
+    pub settings: Settings,
+    pub started: String,
+    pub ended: String,
+    /// Id of the episode this one continues, when an incident outlasted
+    /// [`MAX_EPISODE_SECS`].
+    #[serde(default)]
+    pub continues: Option<String>,
+    pub frames: Vec<Frame>,
+    #[serde(default)]
+    pub issues: Vec<IssueSnapshot>,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+}
+
+impl Episode {
+    pub fn duration_secs(&self) -> f64 {
+        match (self.frames.first(), self.frames.last()) {
+            (Some(a), Some(b)) => b.at - a.at,
+            _ => 0.0,
+        }
+    }
+
+    /// Distinct issue keys that were open at any frame.
+    pub fn issue_keys(&self) -> Vec<String> {
+        let mut seen = Vec::new();
+        for o in self.frames.iter().flat_map(|f| &f.open) {
+            if !seen.contains(&o.key) {
+                seen.push(o.key.clone());
+            }
+        }
+        seen
+    }
+}
+
+// ------------------------------------------------------------------ recorder
+
+/// One tick's worth of what the recorder needs, borrowed from the app.
+pub struct Tick<'a> {
+    /// Unix seconds.
+    pub at: f64,
+    pub ts: String,
+    pub now: Instant,
+    pub obs: &'a Observations,
+    pub times: &'a ObservationTimes,
+    pub readings: &'a [Reading],
+    pub engine: &'a Engine,
+    /// The store as the engine judged against it, before this tick's learning.
+    pub baselines: &'a BaselineStore,
+}
+
+struct Active {
+    episode: Episode,
+    /// Network of the last snapshot kept, so later frames only carry one
+    /// when it changes.
+    network: Option<super::baseline::NetworkFingerprint>,
+    open: HashMap<String, Issue>,
+    started_at: f64,
+    all_closed_since: Option<f64>,
+}
+
+pub struct Recorder {
+    env: EnvProfile,
+    ring: VecDeque<Frame>,
+    active: Option<Active>,
+    next_quiet_at: f64,
+}
+
+impl Recorder {
+    pub fn new(env: EnvProfile, now_unix: f64) -> Self {
+        Self {
+            env,
+            ring: VecDeque::new(),
+            active: None,
+            next_quiet_at: now_unix + random_offset(86_400.0),
+        }
+    }
+
+    /// Move the next quiet sample to `at` (unix seconds).
+    pub fn schedule_quiet_sample(&mut self, at: f64) {
+        self.next_quiet_at = at;
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Record one tick. Returns an episode when one finished on this tick.
+    pub fn record(&mut self, tick: Tick<'_>) -> Option<Episode> {
+        let frame = self.frame(&tick);
+        let open: HashMap<String, &Issue> = tick
+            .engine
+            .primary()
+            .into_iter()
+            .map(|i| (issue_key(i), i))
+            .collect();
+
+        self.ring.push_back(frame.clone());
+        while self
+            .ring
+            .front()
+            .is_some_and(|f| tick.at - f.at > PRE_ROLL_SECS)
+        {
+            self.ring.pop_front();
+        }
+
+        let Some(active) = self.active.as_mut() else {
+            if !open.is_empty() {
+                self.start(EpisodeSource::Live, &tick, true, None);
+                self.track(&tick, &open);
+            } else if tick.at >= self.next_quiet_at {
+                self.next_quiet_at = tick.at + 86_400.0 + random_offset(3_600.0) - 1_800.0;
+                self.start(EpisodeSource::QuietSample, &tick, false, None);
+            }
+            return None;
+        };
+
+        let mut frame = frame;
+        strip_repeat_snapshot(&mut active.network, &mut frame);
+        active.episode.frames.push(frame);
+
+        if active.episode.source == EpisodeSource::QuietSample && !open.is_empty() {
+            // Something broke during the quiet sample. Its last ten minutes
+            // become the incident's pre-roll, taken from the ring because the
+            // ring's frames still carry their own baseline snapshots.
+            active.episode.source = EpisodeSource::Live;
+            active.network = None;
+            active.episode.frames = self.ring.iter().cloned().collect();
+            for f in &mut active.episode.frames {
+                strip_repeat_snapshot(&mut active.network, f);
+            }
+            active.started_at = active.episode.frames.first().map_or(tick.at, |f| f.at);
+            active.episode.started = active
+                .episode
+                .frames
+                .first()
+                .map_or_else(|| tick.ts.clone(), |f| f.ts.clone());
+        }
+        self.track(&tick, &open);
+
+        let active = self.active.as_mut().expect("still recording");
+        let elapsed = tick.at - active.started_at;
+        let done = match active.episode.source {
+            EpisodeSource::QuietSample => elapsed >= QUIET_SAMPLE_SECS,
+            _ => {
+                if open.is_empty() {
+                    let since = *active.all_closed_since.get_or_insert(tick.at);
+                    tick.at - since >= POST_ROLL_SECS
+                } else {
+                    active.all_closed_since = None;
+                    false
+                }
+            }
+        };
+        if done {
+            return self.finish(&tick);
+        }
+        if elapsed >= MAX_EPISODE_SECS {
+            let finished = self.finish(&tick);
+            let prev = finished.as_ref().map(|e| e.id.clone());
+            self.start(EpisodeSource::Live, &tick, false, prev);
+            self.track(&tick, &open);
+            return finished;
+        }
+        None
+    }
+
+    /// End the active episode now, e.g. on quit.
+    pub fn flush(&mut self, engine: &Engine, ts: &str) -> Option<Episode> {
+        let mut active = self.active.take()?;
+        final_snapshots(&mut active, engine, ts);
+        active.episode.ended = ts.to_string();
+        Some(active.episode)
+    }
+
+    fn frame(&self, tick: &Tick<'_>) -> Frame {
+        let thresholds = tick.engine.settings().thresholds;
+        let open: Vec<OpenIssue> = tick.engine.primary().into_iter().map(open_issue).collect();
+        let mut obs = tick.obs.clone();
+        trim_sockets(&mut obs, &thresholds, tick.engine);
+        Frame {
+            at: tick.at,
+            ts: tick.ts.clone(),
+            obs,
+            ages: ProbeAges::from_times(tick.times, tick.now),
+            readings: tick
+                .readings
+                .iter()
+                .map(|r| RecordedReading {
+                    subject: r.subject.clone(),
+                    metric: r.metric.to_string(),
+                    value: r.value,
+                    at: r.at,
+                })
+                .collect(),
+            baselines: Some(tick.baselines.snapshot()),
+            open,
+        }
+    }
+
+    fn start(
+        &mut self,
+        source: EpisodeSource,
+        tick: &Tick<'_>,
+        with_pre_roll: bool,
+        continues: Option<String>,
+    ) {
+        let mut frames: Vec<Frame> = if with_pre_roll {
+            self.ring.iter().cloned().collect()
+        } else {
+            self.ring.back().cloned().into_iter().collect()
+        };
+        let mut network = None;
+        for f in &mut frames {
+            strip_repeat_snapshot(&mut network, f);
+        }
+        let started = frames
+            .first()
+            .map(|f| f.ts.clone())
+            .unwrap_or_else(|| tick.ts.clone());
+        let started_at = frames.first().map(|f| f.at).unwrap_or(tick.at);
+        self.active = Some(Active {
+            episode: Episode {
+                schema_version: SCHEMA_VERSION,
+                id: uuid::Uuid::new_v4().to_string(),
+                source,
+                env: self.env.clone(),
+                settings: *tick.engine.settings(),
+                started,
+                ended: String::new(),
+                continues,
+                frames,
+                issues: vec![],
+                labels: vec![],
+            },
+            network,
+            open: HashMap::new(),
+            started_at,
+            all_closed_since: None,
+        });
+    }
+
+    /// Snapshot issues as they open and close.
+    fn track(&mut self, tick: &Tick<'_>, open: &HashMap<String, &Issue>) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        for (key, issue) in open {
+            if !active.open.contains_key(key) {
+                active.episode.issues.push(IssueSnapshot {
+                    ts: tick.ts.clone(),
+                    reason: SnapshotReason::Opened,
+                    issue: (*issue).clone(),
+                });
+            }
+            active.open.insert(key.clone(), (*issue).clone());
+        }
+        let closed: Vec<String> = active
+            .open
+            .keys()
+            .filter(|k| !open.contains_key(*k))
+            .cloned()
+            .collect();
+        for key in closed {
+            let last = active.open.remove(&key).expect("key came from the map");
+            let issue = tick
+                .engine
+                .issues()
+                .iter()
+                .find(|i| i.id == last.id)
+                .cloned()
+                .unwrap_or(last);
+            active.episode.issues.push(IssueSnapshot {
+                ts: tick.ts.clone(),
+                reason: SnapshotReason::Closed,
+                issue,
+            });
+        }
+    }
+
+    fn finish(&mut self, tick: &Tick<'_>) -> Option<Episode> {
+        let mut active = self.active.take()?;
+        final_snapshots(&mut active, tick.engine, &tick.ts);
+        active.episode.ended = tick.ts.clone();
+        Some(active.episode)
+    }
+}
+
+/// Drop a frame's baseline snapshot when its network matches the last one
+/// kept. Replay learns forward from a snapshot, so only the first frame and
+/// network changes need one.
+fn strip_repeat_snapshot(
+    last: &mut Option<super::baseline::NetworkFingerprint>,
+    frame: &mut Frame,
+) {
+    let Some(snap) = &frame.baselines else {
+        return;
+    };
+    if last.as_ref() == Some(&snap.network) {
+        frame.baselines = None;
+    } else {
+        *last = Some(snap.network.clone());
+    }
+}
+
+fn final_snapshots(active: &mut Active, engine: &Engine, ts: &str) {
+    for last in active.open.values() {
+        let issue = engine
+            .issues()
+            .iter()
+            .find(|i| i.id == last.id)
+            .cloned()
+            .unwrap_or_else(|| last.clone());
+        active.episode.issues.push(IssueSnapshot {
+            ts: ts.to_string(),
+            reason: SnapshotReason::Final,
+            issue,
+        });
+    }
+}
+
+pub fn issue_key(issue: &Issue) -> String {
+    format!("{}|{}", issue.rule, issue.subject.label())
+}
+
+fn open_issue(issue: &Issue) -> OpenIssue {
+    OpenIssue {
+        key: issue_key(issue),
+        top_cause: issue.top_cause().map(|c| c.key(&issue.rule)),
+    }
+}
+
+/// Keep every socket whose verdict can raise an issue or that an open issue is
+/// about, plus the busiest few by retransmits. Nothing dropped here could have
+/// produced or held an issue, and the kept set still carries rtt and rwnd
+/// whenever any socket did, so replay reaches the same coverage and result.
+fn trim_sockets(obs: &mut Observations, t: &super::detectors::Thresholds, engine: &Engine) {
+    if obs.sockets.len() <= TOP_SOCKETS {
+        return;
+    }
+    let subjects: HashSet<(String, String)> = engine
+        .issues()
+        .iter()
+        .filter(|i| i.state.is_open())
+        .filter_map(|i| match &i.subject {
+            Subject::Socket { local, remote } => Some((local.clone(), remote.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut rest = Vec::new();
+    let mut keep = Vec::new();
+    for s in obs.sockets.drain(..) {
+        let raises = !matches!(
+            classify_socket(&s, t),
+            SocketVerdict::Ok | SocketVerdict::AppLimited | SocketVerdict::Congestion
+        );
+        if raises || subjects.contains(&(s.local.clone(), s.remote.clone())) {
+            keep.push(s);
+        } else {
+            rest.push(s);
+        }
+    }
+    rest.sort_by(|a, b| {
+        let measured = |s: &super::detectors::SocketObs| s.rtt_ms.is_some() && s.rwnd.is_some();
+        measured(b)
+            .cmp(&measured(a))
+            .then(b.retrans.cmp(&a.retrans))
+    });
+    keep.extend(rest.into_iter().take(TOP_SOCKETS));
+    obs.sockets = keep;
+}
+
+fn random_offset(range_secs: f64) -> f64 {
+    (uuid::Uuid::new_v4().as_u128() % 1_000_000) as f64 / 1_000_000.0 * range_secs
+}
+
+// ------------------------------------------------------------------ storage
+
+/// `<state>/netwatch/episodes`, beside the egress baseline so the sandbox
+/// rule that permits one permits the other.
+pub fn default_dir() -> Option<PathBuf> {
+    crate::collectors::egress::default_profiles_path()
+        .and_then(|p| p.parent().map(|d| d.join("episodes")))
+}
+
+pub fn path_for(dir: &Path, episode: &Episode) -> PathBuf {
+    let month = episode.started.get(..7).unwrap_or("unknown");
+    dir.join(month).join(format!("{}.json.gz", episode.id))
+}
+
+/// Gzipped JSON, written to a temp file and renamed so a crash can't leave a
+/// half-written episode. Private to the user: it holds addresses and names.
+pub fn save(dir: &Path, episode: &Episode) -> std::io::Result<PathBuf> {
+    let path = path_for(dir, episode);
+    let parent = path.parent().expect("episode path has a month dir");
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("gz.tmp");
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&tmp)?;
+        let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        serde_json::to_writer(&mut gz, episode).map_err(std::io::Error::other)?;
+        gz.finish()?.flush()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+pub fn load(path: &Path) -> std::io::Result<Episode> {
+    let file = std::fs::File::open(path)?;
+    let mut text = String::new();
+    if path.extension().is_some_and(|e| e == "gz") {
+        flate2::read::GzDecoder::new(file).read_to_string(&mut text)?;
+    } else {
+        std::io::BufReader::new(file).read_to_string(&mut text)?;
+    }
+    let episode: Episode = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+    if episode.schema_version > SCHEMA_VERSION {
+        return Err(std::io::Error::other(format!(
+            "episode schema {} is newer than this netwatch ({SCHEMA_VERSION})",
+            episode.schema_version
+        )));
+    }
+    Ok(episode)
+}
+
+/// Every episode file under `root`, oldest first by modification time.
+pub fn list(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with(".json.gz")
+                || path.extension().is_some_and(|e| e == "json")
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    out
+}
+
+/// Delete episodes older than `max_age`, then the oldest until the total fits
+/// `max_bytes`. Returns how many files were removed.
+pub fn prune(root: &Path, max_age: Duration, max_bytes: u64) -> usize {
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = list(root)
+        .into_iter()
+        .filter_map(|p| {
+            let m = std::fs::metadata(&p).ok()?;
+            Some((p, m.len(), m.modified().ok()?))
+        })
+        .collect();
+    let mut removed = 0;
+    files.retain(|(p, _, modified)| {
+        let old = now.duration_since(*modified).is_ok_and(|age| age > max_age);
+        if old && std::fs::remove_file(p).is_ok() {
+            removed += 1;
+            return false;
+        }
+        true
+    });
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    for (p, len, _) in &files {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(p).is_ok() {
+            total -= len;
+            removed += 1;
+        }
+    }
+    removed
+}
+
+// ------------------------------------------------------------------ replay
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Divergence {
+    pub frame: usize,
+    pub ts: String,
+    pub recorded: Vec<OpenIssue>,
+    pub replayed: Vec<OpenIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IssueSpan {
+    pub key: String,
+    pub opened: String,
+    pub closed: Option<String>,
+    pub top_cause: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReplayReport {
+    pub episode: String,
+    pub frames: usize,
+    pub issues: Vec<IssueSpan>,
+    /// Frames where replay's open issues differ from the recording. Issues
+    /// open before recording began, and user actions (ack, mute, apply)
+    /// during it, are not replayed and can show up here.
+    pub divergences: Vec<Divergence>,
+    pub first_frame_open: Vec<OpenIssue>,
+}
+
+impl ReplayReport {
+    pub fn matches(&self) -> bool {
+        self.divergences.is_empty()
+    }
+}
+
+/// Run an episode's frames through a fresh engine, exactly as the live tick
+/// did: evaluate at the recorded clock and probe ages, then learn.
+pub fn replay(episode: &Episode) -> ReplayReport {
+    let clock = std::sync::Arc::new(FixedClock::at(
+        episode
+            .frames
+            .first()
+            .map(|f| f.ts.as_str())
+            .unwrap_or("1970-01-01 00:00:00"),
+    ));
+    let mut engine = Engine::new(Box::new(clock.clone())).with_settings(episode.settings);
+    let mut store: Option<BaselineStore> = None;
+    // Real instants, offset by recorded time. Nothing here sleeps, so these
+    // are only ever compared with each other.
+    let base = Instant::now() + Duration::from_secs(86_400);
+    let t0 = episode.frames.first().map(|f| f.at).unwrap_or(0.0);
+
+    let mut report = ReplayReport {
+        episode: episode.id.clone(),
+        frames: episode.frames.len(),
+        issues: vec![],
+        divergences: vec![],
+        first_frame_open: episode
+            .frames
+            .first()
+            .map(|f| f.open.clone())
+            .unwrap_or_default(),
+    };
+    let mut spans: Vec<IssueSpan> = Vec::new();
+    let mut was_open: HashSet<String> = HashSet::new();
+
+    for (n, frame) in episode.frames.iter().enumerate() {
+        clock.set(&frame.ts);
+        if let Some(snap) = &frame.baselines {
+            match store.as_mut() {
+                Some(s) => s.restore(snap),
+                None => store = Some(BaselineStore::from_snapshot(snap)),
+            }
+        }
+        let Some(store) = store.as_mut() else {
+            continue;
+        };
+        let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
+        let times = frame.ages.to_times(now);
+        engine.observe_live_at(&frame.obs, store, &times, now);
+
+        let open: Vec<OpenIssue> = engine.primary().into_iter().map(open_issue).collect();
+        if sorted(&open) != sorted(&frame.open) {
+            report.divergences.push(Divergence {
+                frame: n,
+                ts: frame.ts.clone(),
+                recorded: frame.open.clone(),
+                replayed: open.clone(),
+            });
+        }
+        let now_open: HashSet<String> = open.iter().map(|o| o.key.clone()).collect();
+        for o in &open {
+            if !was_open.contains(&o.key) {
+                spans.push(IssueSpan {
+                    key: o.key.clone(),
+                    opened: frame.ts.clone(),
+                    closed: None,
+                    top_cause: o.top_cause.clone(),
+                });
+            }
+            if let Some(span) = spans
+                .iter_mut()
+                .rev()
+                .find(|s| s.key == o.key && s.closed.is_none())
+            {
+                span.top_cause = o.top_cause.clone();
+            }
+        }
+        for key in was_open.difference(&now_open) {
+            if let Some(span) = spans
+                .iter_mut()
+                .rev()
+                .find(|s| &s.key == key && s.closed.is_none())
+            {
+                span.closed = Some(frame.ts.clone());
+            }
+        }
+        was_open = now_open;
+
+        store.set_gate_sigma(engine.settings().thresholds.sigma_k);
+        for r in &frame.readings {
+            store.observe(&r.subject, &r.metric, r.value, r.at);
+        }
+    }
+    report.issues = spans;
+    report
+}
+
+fn sorted(open: &[OpenIssue]) -> Vec<OpenIssue> {
+    let mut v = open.to_vec();
+    v.sort_by(|a, b| a.key.cmp(&b.key));
+    v
+}
+
+// ------------------------------------------------------------------ cli
+
+/// `netwatch diagnose episodes [DIR]` and
+/// `netwatch diagnose replay [--json] <FILE|DIR>...`.
+pub fn command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(String::as_str) {
+        Some("episodes") => {
+            let dir = match args.get(1) {
+                Some(d) => PathBuf::from(d),
+                None => default_dir().ok_or_else(|| anyhow::anyhow!("no state directory"))?,
+            };
+            let files = list(&dir);
+            if files.is_empty() {
+                println!("no episodes under {}", dir.display());
+            }
+            for path in files {
+                match load(&path) {
+                    Ok(ep) => println!("{}", summary_line(&ep, &path)),
+                    Err(e) => println!("{}  unreadable: {e}", path.display()),
+                }
+            }
+            Ok(())
+        }
+        Some("replay") => {
+            let json = args.iter().any(|a| a == "--json");
+            let targets: Vec<&String> = args[1..].iter().filter(|a| *a != "--json").collect();
+            if targets.is_empty() {
+                anyhow::bail!("replay needs at least one episode file or directory");
+            }
+            let mut all_match = true;
+            let mut reports = Vec::new();
+            for target in targets {
+                let path = Path::new(target);
+                let files = if path.is_dir() {
+                    list(path)
+                } else {
+                    vec![path.to_path_buf()]
+                };
+                for file in files {
+                    let ep = load(&file)
+                        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                    let report = replay(&ep);
+                    all_match &= report.matches();
+                    if json {
+                        reports.push(report);
+                    } else {
+                        print!("{}", render_report(&report, &file));
+                    }
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            }
+            if !all_match {
+                anyhow::bail!("replay diverged from the recording");
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!(
+            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>..."
+        ),
+    }
+}
+
+fn summary_line(ep: &Episode, path: &Path) -> String {
+    let source = match &ep.source {
+        EpisodeSource::Live => "live".to_string(),
+        EpisodeSource::QuietSample => "quiet".to_string(),
+        EpisodeSource::Lab { scenario, seed } => format!("lab:{scenario}#{seed}"),
+    };
+    let keys = ep.issue_keys();
+    format!(
+        "{}  {:<6} {}  {:>4}m  {:>5} frames  {}  {}",
+        &ep.id[..8.min(ep.id.len())],
+        source,
+        ep.started,
+        (ep.duration_secs() / 60.0).round() as u64,
+        ep.frames.len(),
+        if keys.is_empty() {
+            "no issues".to_string()
+        } else {
+            keys.join(", ")
+        },
+        path.display()
+    )
+}
+
+fn render_report(report: &ReplayReport, path: &Path) -> String {
+    let mut out = format!(
+        "{}  {} frames  {}\n",
+        path.display(),
+        report.frames,
+        if report.matches() {
+            "matches recording".to_string()
+        } else {
+            format!("{} divergent frames", report.divergences.len())
+        }
+    );
+    for span in &report.issues {
+        out.push_str(&format!(
+            "  {}  opened {}  {}  cause {}\n",
+            span.key,
+            span.opened,
+            span.closed
+                .as_deref()
+                .map_or("still open".to_string(), |c| format!("closed {c}")),
+            span.top_cause.as_deref().unwrap_or("none")
+        ));
+    }
+    if !report.first_frame_open.is_empty() {
+        out.push_str("  note: issues were already open when recording began\n");
+    }
+    if let Some(d) = report.divergences.first() {
+        let keys = |v: &[OpenIssue]| {
+            v.iter()
+                .map(|o| format!("{} ({})", o.key, o.top_cause.as_deref().unwrap_or("-")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!(
+            "  first divergence at frame {} ({}):\n    recorded: {}\n    replayed: {}\n",
+            d.frame,
+            d.ts,
+            keys(&d.recorded),
+            keys(&d.replayed)
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnose::baseline::NetworkFingerprint;
+    use crate::diagnose::detectors::GatewayObs;
+    use crate::diagnose::engine::Clock;
+
+    const GW: &str = "192.168.8.1";
+    const T0: f64 = 1_789_000_000.0;
+
+    /// A live session driven exactly like `App::tick_diagnose`: evaluate at
+    /// `now`, record, then learn.
+    struct Session {
+        clock: std::sync::Arc<FixedClock>,
+        engine: Engine,
+        store: BaselineStore,
+        recorder: Recorder,
+        base: Instant,
+        at: f64,
+        finished: Vec<Episode>,
+    }
+
+    impl Session {
+        fn new() -> Self {
+            let clock = std::sync::Arc::new(FixedClock::at("2026-09-14 09:00:00"));
+            let engine = Engine::new(Box::new(clock.clone()));
+            let mut store = BaselineStore::new(NetworkFingerprint::new(
+                "eth0",
+                Some(GW.into()),
+                vec!["192.168.8.1".into()],
+                None,
+            ));
+            store.seed(GW, "gateway.rtt", 2.0, 0.3, 2_400);
+            let mut recorder = Recorder::new(EnvProfile::detect("no privileges", 1000), T0);
+            recorder.schedule_quiet_sample(f64::MAX);
+            Self {
+                clock,
+                engine,
+                store,
+                recorder,
+                base: Instant::now() + Duration::from_secs(86_400),
+                at: T0,
+                finished: vec![],
+            }
+        }
+
+        fn tick(&mut self, rtt: f64, step: f64) {
+            let now = self.base + Duration::from_secs_f64(self.at - T0);
+            let mut times = ObservationTimes::default();
+            times.health.gateway = now.checked_sub(Duration::from_secs(1));
+            times.health.gateway_target = Some(GW.into());
+            let obs = Observations {
+                now: super::super::engine::format_ts(self.clock.now()),
+                gateway: Some(GatewayObs {
+                    addr: Some(GW.into()),
+                    rtt_ms: Some(rtt),
+                    loss_pct: 0.0,
+                    arp_ok: true,
+                    icmp_ok: true,
+                    internet_reachable: Some(true),
+                }),
+                ..Default::default()
+            };
+            let readings = vec![Reading::new(GW, "gateway.rtt", rtt, self.at - 1.0)];
+            self.engine.observe_live_at(&obs, &self.store, &times, now);
+            let ts = super::super::engine::format_ts(self.clock.now());
+            if let Some(ep) = self.recorder.record(Tick {
+                at: self.at,
+                ts,
+                now,
+                obs: &obs,
+                times: &times,
+                readings: &readings,
+                engine: &self.engine,
+                baselines: &self.store,
+            }) {
+                self.finished.push(ep);
+            }
+            self.store
+                .set_gate_sigma(self.engine.settings().thresholds.sigma_k);
+            for r in &readings {
+                self.store.observe(&r.subject, r.metric, r.value, r.at);
+            }
+            self.at += step;
+            self.clock.advance_secs(step as i64);
+        }
+
+        fn run(&mut self, rtt: impl Fn(u32) -> f64, secs: f64, step: f64) {
+            let ticks = (secs / step) as u32;
+            for i in 0..ticks {
+                self.tick(rtt(i), step);
+            }
+        }
+    }
+
+    fn healthy(i: u32) -> f64 {
+        if i.is_multiple_of(2) {
+            1.7
+        } else {
+            2.3
+        }
+    }
+
+    fn incident() -> Session {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 600.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        s
+    }
+
+    #[test]
+    fn an_incident_becomes_one_episode_with_pre_and_post_roll() {
+        let s = incident();
+        assert!(!s.recorder.is_recording());
+        assert_eq!(s.finished.len(), 1, "one incident, one episode");
+        let ep = &s.finished[0];
+        assert_eq!(ep.source, EpisodeSource::Live);
+        assert_eq!(ep.issue_keys(), vec!["gateway.rtt_spike|host".to_string()]);
+
+        let first_open = ep.frames.iter().position(|f| !f.open.is_empty()).unwrap();
+        let pre_roll = ep.frames[first_open].at - ep.frames[0].at;
+        assert!(
+            (PRE_ROLL_SECS - 10.0..=PRE_ROLL_SECS).contains(&pre_roll),
+            "pre-roll {pre_roll}s"
+        );
+        let last_open = ep.frames.iter().rposition(|f| !f.open.is_empty()).unwrap();
+        let post_roll = ep.frames.last().unwrap().at - ep.frames[last_open].at;
+        assert!(post_roll >= POST_ROLL_SECS, "post-roll {post_roll}s");
+
+        assert!(ep.frames[0].baselines.is_some());
+        assert_eq!(
+            ep.frames.iter().filter(|f| f.baselines.is_some()).count(),
+            1
+        );
+        let reasons: Vec<_> = ep.issues.iter().map(|i| i.reason).collect();
+        assert_eq!(
+            reasons,
+            vec![SnapshotReason::Opened, SnapshotReason::Closed]
+        );
+    }
+
+    #[test]
+    fn replay_reproduces_the_recording_frame_by_frame() {
+        let s = incident();
+        let report = replay(&s.finished[0]);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        assert_eq!(report.issues.len(), 1);
+        let span = &report.issues[0];
+        assert!(span.closed.is_some());
+        assert_eq!(
+            span.top_cause.as_deref(),
+            Some("gateway.rtt_spike/local_network_congested")
+        );
+    }
+
+    #[test]
+    fn replay_reports_where_a_recording_disagrees() {
+        let s = incident();
+        let mut ep = s.finished[0].clone();
+        let n = ep.frames.iter().position(|f| !f.open.is_empty()).unwrap();
+        ep.frames[n].open.clear();
+        let report = replay(&ep);
+        assert_eq!(report.divergences.len(), 1);
+        assert_eq!(report.divergences[0].frame, n);
+    }
+
+    #[test]
+    fn episodes_round_trip_through_gzip_and_stay_small() {
+        let s = incident();
+        let ep = &s.finished[0];
+        let dir = std::env::temp_dir().join(format!("nw-episodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = save(&dir, ep).unwrap();
+        assert!(path.starts_with(dir.join("2026-09")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "episodes hold addresses; keep them private"
+            );
+        }
+        let back = load(&path).unwrap();
+        assert_eq!(&back, ep);
+        assert!(replay(&back).matches());
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            bytes < 64 * 1024,
+            "{} frames took {bytes} bytes",
+            ep.frames.len()
+        );
+        assert_eq!(list(&dir), vec![path.clone()]);
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        command(&args(&["replay", path.to_str().unwrap()])).unwrap();
+        command(&args(&["episodes", dir.to_str().unwrap()])).unwrap();
+        assert!(render_report(&replay(&back), &path).contains("matches recording"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quiet_sample_is_recorded_when_due() {
+        let mut s = Session::new();
+        s.recorder.schedule_quiet_sample(T0 + 60.0);
+        s.run(healthy, QUIET_SAMPLE_SECS + 120.0, 5.0);
+        assert_eq!(s.finished.len(), 1);
+        let ep = &s.finished[0];
+        assert_eq!(ep.source, EpisodeSource::QuietSample);
+        assert!(ep.issue_keys().is_empty());
+        assert!(ep.duration_secs() >= QUIET_SAMPLE_SECS - 5.0);
+        assert!(replay(ep).matches());
+    }
+
+    #[test]
+    fn an_incident_during_a_quiet_sample_becomes_a_live_episode() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.recorder.schedule_quiet_sample(s.at);
+        s.run(healthy, 300.0, 5.0);
+        s.run(|_| 80.0, 300.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        assert_eq!(s.finished.len(), 1);
+        let ep = &s.finished[0];
+        assert_eq!(ep.source, EpisodeSource::Live);
+        assert!(ep.frames[0].baselines.is_some());
+        assert!(
+            replay(ep).matches(),
+            "{:#?}",
+            replay(ep).divergences.first()
+        );
+    }
+
+    #[test]
+    fn a_long_incident_is_split_and_linked() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 30.0);
+        s.run(|_| 80.0, MAX_EPISODE_SECS + 600.0, 30.0);
+        s.run(healthy, 1_800.0, 30.0);
+        assert_eq!(s.finished.len(), 2);
+        assert_eq!(
+            s.finished[1].continues.as_deref(),
+            Some(s.finished[0].id.as_str())
+        );
+        assert!(s.finished[1].frames[0].baselines.is_some());
+    }
+
+    #[test]
+    fn many_sockets_are_trimmed_to_the_interesting_ones() {
+        let t = crate::diagnose::detectors::Thresholds::default();
+        let engine = Engine::new(Box::new(crate::diagnose::engine::SystemClock));
+        let mut obs = Observations::default();
+        for i in 0..100u32 {
+            obs.sockets.push(crate::diagnose::detectors::SocketObs {
+                local: format!("10.0.0.2:{}", 40_000 + i),
+                remote: "1.1.1.1:443".into(),
+                process: None,
+                rtt_ms: Some(20.0),
+                rttvar_ms: Some(1.0),
+                retrans: i % 4,
+                cwnd: Some(10),
+                ssthresh: None,
+                rwnd: Some(65_535),
+                mss: Some(1460),
+                tx_bps: 0.0,
+                rx_bps: 0.0,
+                verdict_age_secs: 0,
+            });
+        }
+        obs.sockets[50].retrans = 3;
+        obs.sockets[50].tx_bps = 1_000.0;
+        obs.sockets[3].rwnd = Some(0);
+        let zero_window = obs.sockets[3].clone();
+        assert_ne!(classify_socket(&zero_window, &t), SocketVerdict::Ok);
+        trim_sockets(&mut obs, &t, &engine);
+        assert!(obs.sockets.len() <= TOP_SOCKETS + 1);
+        assert!(obs.sockets.contains(&zero_window));
+        assert!(obs
+            .sockets
+            .iter()
+            .all(|s| s.retrans == 3 || s.rwnd == Some(0)));
+    }
+
+    #[test]
+    fn pruning_removes_the_oldest_beyond_the_size_cap() {
+        let dir = std::env::temp_dir().join(format!("nw-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("2026-09")).unwrap();
+        for n in 0..3 {
+            std::fs::write(
+                dir.join("2026-09").join(format!("{n}.json.gz")),
+                vec![0u8; 1000],
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(prune(&dir, Duration::from_secs(3_600), 2_500), 1);
+        let left: Vec<String> = list(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["1.json.gz", "2.json.gz"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

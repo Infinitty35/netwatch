@@ -56,7 +56,19 @@ pub struct ProbeTimes {
 
 impl ProbeTimes {
     pub fn fresh(at: Option<std::time::Instant>, max_secs: u64) -> bool {
-        at.is_some_and(|at| at.elapsed() <= std::time::Duration::from_secs(max_secs))
+        Self::fresh_at(at, max_secs, std::time::Instant::now())
+    }
+
+    /// [`Self::fresh`] against an explicit `now`, so a replayed episode judges
+    /// freshness at the recorded moment rather than at replay time.
+    pub fn fresh_at(
+        at: Option<std::time::Instant>,
+        max_secs: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        at.is_some_and(|at| {
+            now.saturating_duration_since(at) <= std::time::Duration::from_secs(max_secs)
+        })
     }
 }
 

@@ -123,6 +123,17 @@ pub struct NetwatchConfig {
     /// everything visible, which is closer to the old flat tables.
     #[serde(default = "default_groups_collapsed")]
     pub groups_start_collapsed: bool,
+
+    /// Record Diagnose episodes: the ten minutes before an issue opens through
+    /// ten minutes after it closes, plus one quiet 15-minute sample a day.
+    /// Stored locally under `~/.local/state/netwatch/episodes`, kept 90 days
+    /// or 300 MB. Nothing is uploaded. Default true.
+    #[serde(default = "default_record_episodes")]
+    pub diagnose_record_episodes: bool,
+}
+
+fn default_record_episodes() -> bool {
+    true
 }
 
 fn default_groups_collapsed() -> bool {
@@ -184,6 +195,7 @@ impl Default for NetwatchConfig {
             view: default_view(),
             graph_style: default_graph_style(),
             graph_fade: default_graph_fade(),
+            diagnose_record_episodes: default_record_episodes(),
             sandbox: default_sandbox(),
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
@@ -364,6 +376,7 @@ show_geo = false
             tls_keylog_path: "/tmp/sslkeylog.txt".into(),
             egress_violation_cooldown_secs: 120,
             groups_start_collapsed: false,
+            diagnose_record_episodes: false,
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();

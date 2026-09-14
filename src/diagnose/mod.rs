@@ -24,6 +24,7 @@ pub mod coverage;
 pub mod demo;
 pub mod detectors;
 pub mod engine;
+pub mod episode;
 pub mod fixture;
 pub mod issue;
 pub mod live;

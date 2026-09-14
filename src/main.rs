@@ -41,6 +41,9 @@ fn main() -> Result<()> {
         netwatch::cli::Command::Resolver(args) => {
             return netwatch::diagnose::remediation::resolver::command(&args)
         }
+        netwatch::cli::Command::Diagnose(args) => {
+            return netwatch::diagnose::episode::command(&args)
+        }
         netwatch::cli::Command::Doctor {
             json,
             check_capture,

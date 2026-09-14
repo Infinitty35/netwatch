@@ -11,6 +11,7 @@ pub enum Command {
         interface: Option<String>,
     },
     Resolver(Vec<String>),
+    Diagnose(Vec<String>),
     CaptureChild {
         interface: String,
         mode: Mode,
@@ -42,7 +43,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",
@@ -64,6 +65,9 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
     }
     if args.first().map(String::as_str) == Some("resolver") {
         return Ok(Command::Resolver(args[1..].to_vec()));
+    }
+    if args.first().map(String::as_str) == Some("diagnose") {
+        return Ok(Command::Diagnose(args[1..].to_vec()));
     }
     if args.first().map(String::as_str) == Some("__capture-check") {
         if args.len() != 3 || !["off", "strict", "best-effort"].contains(&args[2].as_str()) {
