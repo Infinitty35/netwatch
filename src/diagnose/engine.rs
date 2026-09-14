@@ -81,6 +81,27 @@ impl Clock for std::sync::Arc<FixedClock> {
     }
 }
 
+/// The completion time of the collector a rule's evidence comes from.
+/// `None` for rules with no single sampling collector; `Some(None)` when the
+/// collector exists but hasn't completed.
+fn sample_time(rule: &str, times: &ObservationTimes) -> Option<Option<std::time::Instant>> {
+    if rule.starts_with("dns.") {
+        Some(times.health.dns)
+    } else if rule.starts_with("gateway.") {
+        Some(times.health.gateway)
+    } else if rule.starts_with("nat.") {
+        Some(times.health.nat)
+    } else if rule.starts_with("link.") || rule.starts_with("iface.") || rule.starts_with("wifi.") {
+        Some(times.interface)
+    } else if rule.starts_with("path.") {
+        Some(times.path)
+    } else if rule.starts_with("tcp.") && rule != "tcp.bufferbloat_local" {
+        Some(times.sockets)
+    } else {
+        None
+    }
+}
+
 pub fn format_ts(dt: DateTime<Local>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -128,6 +149,17 @@ pub struct ObservationTimes {
     pub path: Option<std::time::Instant>,
 }
 
+/// A condition on its way to becoming an issue.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// Consecutive samples that have shown it.
+    samples: u32,
+    /// The last sample counted, when live timing is known.
+    last: Option<std::time::Instant>,
+    /// When it was first seen, which becomes the issue's `since`.
+    first_seen: DateTime<Local>,
+}
+
 pub struct Engine {
     issues: Vec<Issue>,
     /// `Detection::key()` → issue id, so a condition maps to the same issue
@@ -141,6 +173,8 @@ pub struct Engine {
     seq: u32,
     coverage: super::coverage::Coverage,
     verification_samples: HashMap<IssueId, (std::time::Instant, std::time::Instant)>,
+    /// Conditions detected but not yet open, by `Detection::key()`.
+    pending: HashMap<String, Pending>,
 }
 
 impl Engine {
@@ -154,6 +188,7 @@ impl Engine {
             seq: 0,
             coverage: Default::default(),
             verification_samples: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -289,9 +324,15 @@ impl Engine {
             })
             .collect();
         let seen: Vec<String> = detections.iter().map(|d| d.key()).collect();
+        self.pending.retain(|key, _| seen.contains(key));
 
         for d in detections {
-            self.merge(d, now);
+            if self.is_open_key(&d.key()) {
+                self.merge(d, now, now);
+            } else if let Some(since) = self.confirmed(&d, times, now) {
+                self.pending.remove(&d.key());
+                self.merge(d, now, since);
+            }
         }
 
         self.age_unseen(&seen, obs, base, now, times);
@@ -301,7 +342,50 @@ impl Engine {
         self.prune();
     }
 
-    fn merge(&mut self, d: Detection, now: DateTime<Local>) {
+    fn is_open_key(&self, key: &str) -> bool {
+        self.by_key
+            .get(key)
+            .and_then(|id| self.issues.iter().find(|i| &i.id == id))
+            .is_some_and(|i| i.state.is_open())
+    }
+
+    /// Hysteresis for a condition that isn't open yet: it has to hold for
+    /// `consecutive_n` samples before it becomes an issue, so one slow probe
+    /// on a noisy wifi link is not a finding.
+    ///
+    /// Counted in *samples*, not ticks. A probe result stays in the
+    /// observations until the next probe completes, several ticks later; one
+    /// spike seen on five ticks is still one sample. Without live timing (the
+    /// fixture, the demo, unit tests) each call counts as a sample.
+    ///
+    /// Returns when the condition was first seen once it is confirmed.
+    fn confirmed(
+        &mut self,
+        d: &Detection,
+        times: Option<&ObservationTimes>,
+        now: DateTime<Local>,
+    ) -> Option<DateTime<Local>> {
+        let need = self.settings.thresholds.consecutive_n.max(1);
+        let sample = times.and_then(|t| sample_time(d.rule, t)).flatten();
+        let entry = self.pending.entry(d.key()).or_insert(Pending {
+            samples: 0,
+            last: None,
+            first_seen: now,
+        });
+        let new_sample = match (sample, entry.last) {
+            (Some(at), Some(last)) => at > last,
+            _ => true,
+        };
+        if new_sample {
+            entry.samples += 1;
+            entry.last = sample;
+        }
+        (entry.samples >= need).then_some(entry.first_seen)
+    }
+
+    /// `since` is when the condition was first seen: `now` for an issue that
+    /// is already open, earlier for one that just passed hysteresis.
+    fn merge(&mut self, d: Detection, now: DateTime<Local>, since: DateTime<Local>) {
         let key = d.key();
         let ts = format_ts(now);
 
@@ -324,10 +408,10 @@ impl Engine {
                     if within {
                         issue.state = IssueState::Open;
                         issue.recurrence += 1;
-                        issue.since = ts.clone();
+                        issue.since = format_ts(since);
                     } else {
                         self.by_key.remove(&key);
-                        self.open_new(d, now);
+                        self.open_new(d, now, since);
                         return;
                     }
                 }
@@ -351,10 +435,10 @@ impl Engine {
             }
             self.by_key.remove(&key);
         }
-        self.open_new(d, now);
+        self.open_new(d, now, since);
     }
 
-    fn open_new(&mut self, d: Detection, now: DateTime<Local>) {
+    fn open_new(&mut self, d: Detection, now: DateTime<Local>, since: DateTime<Local>) {
         self.seq += 1;
         let id = format!("{}-{:02}", now.format("%Y-%m%d"), self.seq);
         let ts = format_ts(now);
@@ -366,7 +450,7 @@ impl Engine {
             severity: d.severity,
             title: d.title,
             subject: d.subject,
-            since: ts.clone(),
+            since: format_ts(since),
             last_seen: ts,
             state: IssueState::Open,
             evidence: d.evidence,
@@ -444,25 +528,7 @@ impl Engine {
 
             let mut live_held = None;
             if let Some(times) = times {
-                let sample = if issue.rule.starts_with("dns.") {
-                    Some(times.health.dns)
-                } else if issue.rule.starts_with("gateway.") {
-                    Some(times.health.gateway)
-                } else if issue.rule.starts_with("nat.") {
-                    Some(times.health.nat)
-                } else if issue.rule.starts_with("link.")
-                    || issue.rule.starts_with("iface.")
-                    || issue.rule.starts_with("wifi.")
-                {
-                    Some(times.interface)
-                } else if issue.rule.starts_with("path.") {
-                    Some(times.path)
-                } else if issue.rule.starts_with("tcp.") && issue.rule != "tcp.bufferbloat_local" {
-                    Some(times.sockets)
-                } else {
-                    None
-                };
-                if let Some(sample) = sample {
+                if let Some(sample) = sample_time(&issue.rule, times) {
                     let Some(sample) = sample else {
                         self.verifying_since.remove(&issue.id);
                         self.verification_samples.remove(&issue.id);
@@ -957,10 +1023,71 @@ mod tests {
         }
     }
 
+    /// An engine that opens an issue on its first sample. Most tests here are
+    /// about what happens *after* an issue opens; hysteresis has its own.
     fn engine_at(ts: &str) -> (Engine, std::sync::Arc<FixedClock>) {
+        let (engine, clock) = hysteresis_engine_at(ts);
+        let mut settings = *engine.settings();
+        settings.thresholds.consecutive_n = 1;
+        (engine.with_settings(settings), clock)
+    }
+
+    /// An engine with the default `consecutive_n`.
+    fn hysteresis_engine_at(ts: &str) -> (Engine, std::sync::Arc<FixedClock>) {
         let clock = std::sync::Arc::new(FixedClock::at(ts));
         let engine = Engine::new(Box::new(ClockRef(clock.clone())));
         (engine, clock)
+    }
+
+    #[test]
+    fn one_slow_sample_does_not_open_an_issue() {
+        let (mut e, clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        clock.advance_secs(1);
+        e.observe(&obs(1.0), &b);
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.open_count(), 0, "the streak was broken by a good sample");
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        assert_eq!(e.open_count(), 1);
+        assert_eq!(
+            e.issues()[0].since,
+            "2026-09-03 06:48:12",
+            "since is the first sample of the streak, not the one that confirmed it"
+        );
+    }
+
+    #[test]
+    fn a_cached_probe_result_counts_once_however_many_ticks_show_it() {
+        let (mut e, _clock) = hysteresis_engine_at("2026-09-03 06:48:10");
+        let b = base();
+        let start = std::time::Instant::now();
+        let mut times = ObservationTimes::default();
+        times.health.dns = Some(start);
+        // One slow probe result, visible for ten ticks until the next probe.
+        for tick in 0..10 {
+            e.observe_live_at(
+                &obs(40.0),
+                &b,
+                &times,
+                start + std::time::Duration::from_millis(tick * 500),
+            );
+        }
+        assert_eq!(e.open_count(), 0, "one probe result is one sample");
+        for probe in 1..=2u64 {
+            times.health.dns = Some(start + std::time::Duration::from_secs(5 * probe));
+            e.observe_live_at(
+                &obs(40.0),
+                &b,
+                &times,
+                start + std::time::Duration::from_secs(5 * probe),
+            );
+        }
+        assert_eq!(e.open_count(), 1, "three distinct probes confirm it");
     }
 
     struct ClockRef(std::sync::Arc<FixedClock>);
