@@ -36,7 +36,7 @@ scoop install netwatch                # Windows (needs Npcap)
 cargo install netwatch-tui            # anywhere with Rust and libpcap headers
 ```
 
-Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux binary is static with libpcap bundled in, so it needs nothing installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
+Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux x86_64/aarch64 binaries are static with libpcap bundled in, so they need nothing installed. There's also an armv5te build for older Marvell Kirkwood NAS boxes (e.g. Iomega ix2-dl) running Debian — libpcap is bundled the same way, but it links against glibc and libatomic, so it needs Debian 12 (bookworm) or newer with `libatomic1` installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
 
 ## Run
 

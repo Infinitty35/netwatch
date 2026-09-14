@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
@@ -1262,23 +1262,28 @@ impl StreamTracker {
 /// that appears to match nothing and a kernel buffer that overflowed look
 /// identical on screen. `dropped` is the kernel buffer plus the driver — both
 /// mean "packets existed that this screen never saw".
+// u32, not u64: every field here is sourced from libpcap's pcap_stats(),
+// whose C struct fields (ps_recv/ps_drop/ps_ifdrop) are `u_int` — 32 bits
+// on every platform pcap supports, not just this one. Widening the atomic
+// wouldn't add real range, and armv5te (old Kirkwood NAS boxes) has no
+// native 64-bit atomics.
 #[derive(Debug, Default)]
 pub struct CaptureStats {
-    received: AtomicU64,
-    dropped: AtomicU64,
+    received: AtomicU32,
+    dropped: AtomicU32,
     /// Packets per second over the last poll interval.
-    rate_pps: AtomicU64,
+    rate_pps: AtomicU32,
     observed_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl CaptureStats {
     pub fn received(&self) -> u64 {
-        self.received.load(Ordering::Relaxed)
+        self.received.load(Ordering::Relaxed) as u64
     }
 
     /// Kernel-buffer drops plus interface/driver drops.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.load(Ordering::Relaxed) as u64
     }
 
     pub fn observed_drops(&self) -> Option<u64> {
@@ -1289,7 +1294,7 @@ impl CaptureStats {
             .map(|_| self.dropped())
     }
     pub fn rate_pps(&self) -> u64 {
-        self.rate_pps.load(Ordering::Relaxed)
+        self.rate_pps.load(Ordering::Relaxed) as u64
     }
 
     /// Zeroed when a capture starts, so the numbers describe this run rather
@@ -1470,13 +1475,13 @@ impl PacketCollector {
                         // re-arm can move it backwards; saturating_sub keeps a
                         // restart from reading as a negative rate.
                         let delta = received.saturating_sub(last_received);
-                        stats.received.store(received, Ordering::Relaxed);
+                        stats.received.store(s.received, Ordering::Relaxed);
                         stats
                             .dropped
-                            .store(s.dropped as u64 + s.if_dropped as u64, Ordering::Relaxed);
+                            .store(s.dropped.saturating_add(s.if_dropped), Ordering::Relaxed);
                         stats.rate_pps.store(
                             if elapsed > 0.0 {
-                                (delta as f64 / elapsed).round() as u64
+                                (delta as f64 / elapsed).round() as u32
                             } else {
                                 0
                             },
@@ -1488,6 +1493,23 @@ impl PacketCollector {
                 }
                 match cap.next_packet() {
                     Ok(packet) => {
+                        // `packet.data` is built by the `pcap` crate as
+                        // `slice::from_raw_parts(ptr, header.caplen)` before we
+                        // ever see it (see `Packet::new`), so a bad `caplen`
+                        // is UB the moment that slice exists. Skip the packet
+                        // without touching `packet.data` if `caplen` exceeds
+                        // what we asked libpcap to capture.
+                        //
+                        // A correct build never takes this branch. It is a
+                        // last line of defence against an ABI mismatch: on
+                        // armv5te, a libpcap compiled with _TIME_BITS=64 has a
+                        // 24-byte `pcap_pkthdr`, Rust expects 16, and `caplen`
+                        // is read from tv_usec. That was the Iomega ix2-dl
+                        // segfault. The release build asserts the 16-byte
+                        // layout, so fix the build if this ever fires.
+                        if packet.header.caplen > CAPTURE_SNAPLEN as u32 {
+                            continue;
+                        }
                         if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
                             if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
                                 let proto = if parsed.tcp_flags.is_some() {
