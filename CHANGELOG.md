@@ -4,7 +4,26 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
-## [0.31.3] - 2026-09-14
+## [0.31.4] - 2026-09-14
+
+0.31.3 was tagged but never published: its release build failed. Everything
+listed for 0.31.3 ships in 0.31.4.
+
+### Fixed
+- Linux process attribution works with worker confinement on. Since 0.31.0 the
+  Landlock-confined connection worker could not read other processes'
+  `/proc/<pid>/fd`, so `ss -p` and the procfs fallback attributed nothing and every
+  socket showed as unattributed. A socket-ownership broker thread now starts before
+  confinement and scans only kernel procfs tables; the confined worker applies its
+  snapshot when it is under `MAX_MATCH_AGE` and the socket inode still matches the
+  5-tuple. Identity checks compare start token always and executable/namespace only
+  where the checking thread can read them, so PID reuse is still rejected. Sockets
+  owned by other users remain unattributed without privilege.
+- The armv5te release build runs inside its container again. An apostrophe in a
+  comment ended the single-quoted `bash -c` script early, so the build steps ran
+  on the host runner and the 0.31.3 release stopped before publishing.
+
+## [0.31.3] - 2026-09-14 (not published)
 
 ### Added
 - `netwatch-linux-armv5te` release binary for Debian armel on Marvell Kirkwood NAS
@@ -16,15 +35,6 @@ All notable changes to NetWatch will be documented in this file.
 ### Fixed
 - Captured packets whose `caplen` exceeds the snap length are skipped before their
   data is read. (#54)
-- Linux process attribution works with worker confinement on. Since 0.31.0 the
-  Landlock-confined connection worker could not read other processes'
-  `/proc/<pid>/fd`, so `ss -p` and the procfs fallback attributed nothing and every
-  socket showed as unattributed. A socket-ownership broker thread now starts before
-  confinement and scans only kernel procfs tables; the confined worker applies its
-  snapshot when it is under `MAX_MATCH_AGE` and the socket inode still matches the
-  5-tuple. Identity checks compare start token always and executable/namespace only
-  where the checking thread can read them, so PID reuse is still rejected. Sockets
-  owned by other users remain unattributed without privilege.
 
 ## [0.31.2] - 2026-09-12
 
