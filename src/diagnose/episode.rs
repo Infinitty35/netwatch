@@ -169,6 +169,10 @@ pub struct Frame {
     /// What the live engine had open after this tick.
     #[serde(default)]
     pub open: Vec<OpenIssue>,
+    /// User actions (and test results) since the previous frame. Replay
+    /// applies them before evaluating this frame, as they happened live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<super::engine::EngineEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +270,8 @@ pub struct Tick<'a> {
     pub engine: &'a Engine,
     /// The store as the engine judged against it, before this tick's learning.
     pub baselines: &'a BaselineStore,
+    /// [`Engine::take_events`], drained before this tick's evaluation.
+    pub events: Vec<super::engine::EngineEvent>,
 }
 
 struct Active {
@@ -384,6 +390,23 @@ impl Recorder {
         None
     }
 
+    /// Attach a label to the episode being recorded, if it covers `label.issue`.
+    pub fn label(&mut self, label: &Label) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        let covers = active.open.contains_key(&label.issue)
+            || active
+                .episode
+                .issues
+                .iter()
+                .any(|s| issue_key(&s.issue) == label.issue);
+        if covers {
+            active.episode.labels.push(label.clone());
+        }
+        covers
+    }
+
     /// End the active episode now, e.g. on quit.
     pub fn flush(&mut self, engine: &Engine, ts: &str) -> Option<Episode> {
         let mut active = self.active.take()?;
@@ -414,6 +437,7 @@ impl Recorder {
                 .collect(),
             baselines: Some(tick.baselines.snapshot()),
             open,
+            events: tick.events.clone(),
         }
     }
 
@@ -649,6 +673,131 @@ pub fn load(path: &Path) -> std::io::Result<Episode> {
     Ok(episode)
 }
 
+/// One incident in the history list: enough to render a row and open the
+/// recording, without holding every frame in memory.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryEntry {
+    pub path: PathBuf,
+    pub id: String,
+    pub source: EpisodeSource,
+    pub started: String,
+    pub ended: String,
+    pub duration_secs: f64,
+    pub issues: Vec<HistoryIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HistoryIssue {
+    pub key: String,
+    pub rule: String,
+    pub title: String,
+    pub opened: String,
+    /// `None` when still open at the end of the recording.
+    pub closed: Option<String>,
+    pub rule_top_cause: Option<String>,
+    /// The most trusted label, if any: lab, then expert, then user.
+    pub label: Option<Label>,
+}
+
+pub fn summarise(ep: &Episode, path: &Path) -> HistoryEntry {
+    let rank = |s: &LabelSource| match s {
+        LabelSource::Lab => 3,
+        LabelSource::Expert { .. } => 2,
+        LabelSource::User => 1,
+        LabelSource::Rule => 0,
+    };
+    let mut issues: Vec<HistoryIssue> = Vec::new();
+    for snap in &ep.issues {
+        let key = issue_key(&snap.issue);
+        let entry = match issues
+            .iter_mut()
+            .rev()
+            .find(|i| i.key == key && i.closed.is_none())
+        {
+            Some(e) => e,
+            None => {
+                issues.push(HistoryIssue {
+                    key: key.clone(),
+                    rule: snap.issue.rule.clone(),
+                    title: snap.issue.title.clone(),
+                    opened: snap.issue.since.clone(),
+                    closed: None,
+                    rule_top_cause: None,
+                    label: ep
+                        .labels
+                        .iter()
+                        .filter(|l| l.issue == key)
+                        .max_by_key(|l| rank(&l.source))
+                        .cloned(),
+                });
+                issues.last_mut().expect("just pushed")
+            }
+        };
+        entry.rule_top_cause = snap.issue.top_cause().map(|c| c.key(&snap.issue.rule));
+        if snap.reason == SnapshotReason::Closed {
+            entry.closed = Some(snap.ts.clone());
+        }
+    }
+    HistoryEntry {
+        path: path.to_path_buf(),
+        id: ep.id.clone(),
+        source: ep.source.clone(),
+        started: ep.started.clone(),
+        ended: ep.ended.clone(),
+        duration_secs: ep.duration_secs(),
+        issues,
+    }
+}
+
+/// The newest `limit` incident episodes under `root`, newest first. Quiet
+/// samples are not incidents and are left out.
+pub fn history(root: &Path, limit: usize) -> Vec<HistoryEntry> {
+    list(root)
+        .into_iter()
+        .rev()
+        .filter_map(|p| load(&p).ok().map(|ep| summarise(&ep, &p)))
+        .filter(|h| h.source != EpisodeSource::QuietSample)
+        .take(limit)
+        .collect()
+}
+
+/// Answers offered when asking what caused an issue, as `(label, wording)`.
+/// Candidate causes first, then the three ways of not naming one.
+pub fn label_choices(issue: &Issue) -> Vec<(String, String)> {
+    let mut choices: Vec<(String, String)> = issue
+        .causes
+        .iter()
+        .map(|c| (c.key(&issue.rule), c.label.clone()))
+        .collect();
+    choices.push(("other".into(), "something else".into()));
+    choices.push(("not_a_problem".into(), "not a real problem".into()));
+    choices.push(("unknown".into(), "don't know".into()));
+    choices
+}
+
+/// Add `label` to the newest saved episode under `root` that covers its issue.
+/// Looks at the most recent `search` files only; an answer about a problem
+/// from last month is not what this prompt is for.
+pub fn label_saved(root: &Path, label: &Label, search: usize) -> std::io::Result<Option<PathBuf>> {
+    for path in list(root).into_iter().rev().take(search) {
+        let Ok(mut ep) = load(&path) else {
+            continue;
+        };
+        let covers = ep.issue_keys().contains(&label.issue)
+            || ep.issues.iter().any(|s| issue_key(&s.issue) == label.issue);
+        if covers {
+            ep.labels.push(label.clone());
+            let dir = root;
+            let written = save(dir, &ep)?;
+            if written != path {
+                std::fs::remove_file(&path)?;
+            }
+            return Ok(Some(written));
+        }
+    }
+    Ok(None)
+}
+
 /// Every saved episode (`*.json.gz`) under `root`, oldest first by
 /// modification time.
 pub fn list(root: &Path) -> Vec<PathBuf> {
@@ -844,6 +993,9 @@ pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
         };
         let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
         let times = frame.ages.to_times(now);
+        for event in &frame.events {
+            engine.apply_event(event);
+        }
         engine.observe_live_at(&frame.obs, store, &times, now);
 
         on_step(Step {
@@ -925,8 +1077,9 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Some("features") => super::features::command(&args[1..]),
+        Some("export") => super::export::command(&args[1..]),
         _ => anyhow::bail!(
-            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>..."
+            "usage: netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]"
         ),
     }
 }
@@ -1061,6 +1214,7 @@ mod tests {
                 ..Default::default()
             };
             let readings = vec![Reading::new(GW, "gateway.rtt", rtt, self.at - 1.0)];
+            let events = self.engine.take_events();
             self.engine.observe_live_at(&obs, &self.store, &times, now);
             let ts = super::super::engine::format_ts(self.clock.now());
             if let Some(ep) = self.recorder.record(Tick {
@@ -1072,6 +1226,7 @@ mod tests {
                 readings: &readings,
                 engine: &self.engine,
                 baselines: &self.store,
+                events,
             }) {
                 self.finished.push(ep);
             }
@@ -1151,6 +1306,87 @@ mod tests {
             span.top_cause.as_deref(),
             Some("gateway.rtt_spike/local_network_congested")
         );
+    }
+
+    #[test]
+    fn user_actions_during_an_incident_replay_too() {
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 120.0, 5.0);
+        let id = s.engine.primary()[0].id.clone();
+        assert!(s.engine.mute(&id, 5));
+        s.run(|_| 80.0, 480.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        let ep = &s.finished[0];
+        let events: Vec<_> = ep.frames.iter().flat_map(|f| &f.events).collect();
+        assert!(matches!(
+            events.as_slice(),
+            [crate::diagnose::engine::EngineEvent::Muted { .. }]
+        ));
+        let report = replay(ep);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        // Muting really changed what was open, so replay had to apply it.
+        let muted_frames = ep.frames.iter().filter(|f| f.open.is_empty()).count();
+        assert!(muted_frames > 0);
+    }
+
+    #[test]
+    fn a_label_lands_on_the_recording_or_the_saved_episode() {
+        let key = "gateway.rtt_spike|host".to_string();
+        let label = |cause: &str| Label {
+            issue: key.clone(),
+            cause: cause.into(),
+            source: LabelSource::User,
+            ts: "2026-09-14 10:00:00".into(),
+            note: None,
+        };
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 600.0, 5.0);
+        assert!(s
+            .recorder
+            .label(&label("gateway.rtt_spike/local_network_congested")));
+        s.run(healthy, 1_800.0, 5.0);
+        assert_eq!(s.finished[0].labels.len(), 1);
+        assert!(
+            !s.recorder.label(&label("unknown")),
+            "nothing is recording now"
+        );
+
+        let dir = std::env::temp_dir().join(format!("nw-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = save(&dir, &s.finished[0]).unwrap();
+        let written = label_saved(&dir, &label("not_a_problem"), 10).unwrap();
+        assert_eq!(written.as_deref(), Some(path.as_path()));
+        let back = load(&path).unwrap();
+        assert_eq!(back.labels.len(), 2);
+        assert!(replay(&back).matches(), "labels don't change replay");
+        let mut other = label("unknown");
+        other.issue = "dns.failing|1.1.1.1".into();
+        assert_eq!(label_saved(&dir, &other, 10).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let history_dir = std::env::temp_dir().join(format!("nw-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&history_dir);
+        let mut labelled = s.finished[0].clone();
+        labelled
+            .labels
+            .push(label("gateway.rtt_spike/local_network_congested"));
+        save(&history_dir, &labelled).unwrap();
+        let h = history(&history_dir, 10);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].issues.len(), 1);
+        assert!(h[0].issues[0].closed.is_some());
+        assert_eq!(
+            h[0].issues[0].label.as_ref().map(|l| l.cause.as_str()),
+            Some("gateway.rtt_spike/local_network_congested")
+        );
+        let _ = std::fs::remove_dir_all(&history_dir);
+
+        let issue = &s.finished[0].issues[0].issue;
+        let choices = label_choices(issue);
+        assert_eq!(choices[0].0, "gateway.rtt_spike/local_network_congested");
+        assert_eq!(choices.last().unwrap().0, "unknown");
     }
 
     #[test]

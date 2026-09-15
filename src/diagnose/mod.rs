@@ -26,6 +26,7 @@ pub mod demo;
 pub mod detectors;
 pub mod engine;
 pub mod episode;
+pub mod export;
 pub mod features;
 pub mod fixture;
 pub mod issue;

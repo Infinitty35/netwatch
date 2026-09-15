@@ -149,6 +149,35 @@ pub struct ObservationTimes {
     pub path: Option<std::time::Instant>,
 }
 
+/// Something done to an issue from outside the detection loop: a user action,
+/// or (later) a diagnostic test result. Logged so an episode can replay it.
+///
+/// Events name issues by `rule|subject` rather than id, because a replayed
+/// engine numbers its issues independently.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum EngineEvent {
+    Acked {
+        issue: String,
+    },
+    Muted {
+        issue: String,
+        until: String,
+    },
+    Resolved {
+        issue: String,
+        at: String,
+    },
+    Applied {
+        issue: String,
+        step: char,
+        applied: super::issue::Applied,
+    },
+}
+
+/// Events kept when nothing drains them (demo mode, recording off).
+const EVENT_LOG_CAP: usize = 256;
+
 /// A condition on its way to becoming an issue.
 #[derive(Debug, Clone)]
 struct Pending {
@@ -175,6 +204,8 @@ pub struct Engine {
     verification_samples: HashMap<IssueId, (std::time::Instant, std::time::Instant)>,
     /// Conditions detected but not yet open, by `Detection::key()`.
     pending: HashMap<String, Pending>,
+    /// Events since the last [`Engine::take_events`].
+    events: Vec<EngineEvent>,
 }
 
 impl Engine {
@@ -189,6 +220,7 @@ impl Engine {
             coverage: Default::default(),
             verification_samples: HashMap::new(),
             pending: HashMap::new(),
+            events: Vec::new(),
         }
     }
 
@@ -618,22 +650,32 @@ impl Engine {
     // ------------------------------------------------------ user actions
 
     pub fn ack(&mut self, id: &str) -> bool {
-        self.set_state(id, |s| {
+        let done = self.set_state(id, |s| {
             if matches!(s, IssueState::Open) {
                 Some(IssueState::Acked)
             } else {
                 None
             }
-        })
+        });
+        self.log(id, done, |issue| EngineEvent::Acked { issue });
+        done
     }
 
     pub fn mute(&mut self, id: &str, mins: i64) -> bool {
         let until = format_ts(self.clock.now() + Duration::minutes(mins));
-        self.set_state(id, move |s| {
+        self.mute_until(id, &until)
+    }
+
+    fn mute_until(&mut self, id: &str, until: &str) -> bool {
+        let until = until.to_string();
+        let state_until = until.clone();
+        let done = self.set_state(id, move |s| {
             s.is_open().then(|| IssueState::Muted {
-                until: until.clone(),
+                until: state_until.clone(),
             })
-        })
+        });
+        self.log(id, done, |issue| EngineEvent::Muted { issue, until });
+        done
     }
 
     /// Mark an issue fixed by hand. Distinct from auto-close: the report says
@@ -641,7 +683,59 @@ impl Engine {
     /// fine" are different claims.
     pub fn resolve(&mut self, id: &str) -> bool {
         let at = format_ts(self.clock.now());
-        self.set_state(id, move |_| Some(IssueState::Resolved { at: at.clone() }))
+        self.resolve_at(id, &at)
+    }
+
+    fn resolve_at(&mut self, id: &str, at: &str) -> bool {
+        let at = at.to_string();
+        let state_at = at.clone();
+        let done = self.set_state(id, move |_| {
+            Some(IssueState::Resolved {
+                at: state_at.clone(),
+            })
+        });
+        self.log(id, done, |issue| EngineEvent::Resolved { issue, at });
+        done
+    }
+
+    /// Events since the last call, oldest first.
+    pub fn take_events(&mut self) -> Vec<EngineEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Re-apply a recorded event. Returns false when no issue has its key.
+    pub fn apply_event(&mut self, event: &EngineEvent) -> bool {
+        let key = match event {
+            EngineEvent::Acked { issue }
+            | EngineEvent::Muted { issue, .. }
+            | EngineEvent::Resolved { issue, .. }
+            | EngineEvent::Applied { issue, .. } => issue,
+        };
+        let Some(id) = self.by_key.get(key).cloned() else {
+            return false;
+        };
+        match event {
+            EngineEvent::Acked { .. } => self.ack(&id),
+            EngineEvent::Muted { until, .. } => self.mute_until(&id, until),
+            EngineEvent::Resolved { at, .. } => self.resolve_at(&id, at),
+            EngineEvent::Applied { step, applied, .. } => {
+                self.record_applied(&id, *step, applied.clone())
+            }
+        }
+    }
+
+    fn log(&mut self, id: &str, done: bool, event: impl FnOnce(String) -> EngineEvent) {
+        if !done {
+            return;
+        }
+        let Some(issue) = self.issues.iter().find(|i| i.id == id) else {
+            return;
+        };
+        let key = format!("{}|{}", issue.rule, issue.subject.label());
+        if self.events.len() >= EVENT_LOG_CAP {
+            self.events.remove(0);
+        }
+        self.events.push(event(key));
     }
 
     fn set_state(&mut self, id: &str, f: impl Fn(&IssueState) -> Option<IssueState>) -> bool {
@@ -667,7 +761,12 @@ impl Engine {
         let Some(step) = issue.remediation.iter_mut().find(|s| s.key == Some(key)) else {
             return false;
         };
-        step.applied = Some(applied);
+        step.applied = Some(applied.clone());
+        self.log(id, true, |issue| EngineEvent::Applied {
+            issue,
+            step: key,
+            applied,
+        });
         true
     }
 

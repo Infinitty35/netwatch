@@ -880,13 +880,16 @@ impl App {
 
         let now = std::time::Instant::now();
         let wall = chrono::Local::now();
+        // User actions since the last tick belong to this frame: replay
+        // applies them before evaluating it, which is when they took effect.
+        let events = self.diagnose.engine.take_events();
         self.diagnose.engine.observe_live_at(
             &observations,
             &self.diagnose.baselines,
             &self.diagnose.sampler.completed,
             now,
         );
-        self.record_episode_tick(&observations, &readings, now, wall);
+        self.record_episode_tick(&observations, &readings, events, now, wall);
 
         self.diagnose.baselines.set_gate_sigma(thresholds.sigma_k);
         crate::diagnose::live::LiveSampler::learn(&mut self.diagnose.baselines, &readings);
@@ -960,12 +963,53 @@ impl App {
         }
     }
 
+    /// Record what the user says caused an issue, from
+    /// [`crate::diagnose::episode::label_choices`]. Lands on the episode being
+    /// recorded, or else the newest saved one that covers the issue.
+    pub fn label_issue(&mut self, issue_id: &str, cause: &str) -> Result<String, String> {
+        use crate::diagnose::episode;
+        let issue = self
+            .diagnose
+            .engine
+            .get(issue_id)
+            .ok_or_else(|| format!("{issue_id} is no longer tracked"))?;
+        if !episode::label_choices(issue).iter().any(|(k, _)| k == cause) {
+            return Err(format!("{cause} is not an answer offered for {issue_id}"));
+        }
+        let label = episode::Label {
+            issue: episode::issue_key(issue),
+            cause: cause.to_string(),
+            source: episode::LabelSource::User,
+            ts: crate::diagnose::engine::format_ts(chrono::Local::now()),
+            note: None,
+        };
+        if self
+            .diagnose
+            .recorder
+            .as_mut()
+            .is_some_and(|r| r.label(&label))
+        {
+            return Ok("answer saved with this incident".into());
+        }
+        let dir = self
+            .diagnose
+            .episode_dir
+            .clone()
+            .ok_or("episode recording is off")?;
+        match episode::label_saved(&dir, &label, 50) {
+            Ok(Some(_)) => Ok("answer saved with this incident".into()),
+            Ok(None) => Err("no recording of this incident to attach the answer to".into()),
+            Err(e) => Err(format!("answer not saved: {e}")),
+        }
+    }
+
     /// Feed one live tick to the episode recorder and write any episode it
     /// finishes on a background thread.
     fn record_episode_tick(
         &mut self,
         observations: &crate::diagnose::detectors::Observations,
         readings: &[crate::diagnose::live::Reading],
+        events: Vec<crate::diagnose::engine::EngineEvent>,
         now: std::time::Instant,
         wall: chrono::DateTime<chrono::Local>,
     ) {
@@ -996,6 +1040,7 @@ impl App {
             readings,
             engine: &self.diagnose.engine,
             baselines: &self.diagnose.baselines,
+            events,
         });
         if let Some(episode) = finished {
             std::thread::spawn(move || {

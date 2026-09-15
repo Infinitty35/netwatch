@@ -1,0 +1,544 @@
+//! Redacted episode exports: what a pilot user sends, and nothing else.
+//!
+//! Local episodes keep real addresses and names because the local history is
+//! only useful with them. An export replaces every IP address and every
+//! hostname netwatch knows about with a keyed hash, drops process names and
+//! artifact paths, and writes one gzipped bundle the user sends themselves.
+//!
+//! The key is per install and stays on the machine, so the same resolver maps
+//! to the same token in every weekly bundle — a reviewer can follow it across
+//! incidents — but nobody holding the bundle can reverse or confirm a guess.
+//! That is pseudonymisation, not anonymity, and the preview says so.
+//!
+//! Tokens keep the address class (`ip4-private:…`, `ip4-loopback:…`) because
+//! "the resolver is on the LAN" is diagnostic and identifies no one.
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+use super::episode::{self, Episode};
+
+pub const FORMAT: &str = "netwatch-episode-export";
+pub const VERSION: u32 = 1;
+
+pub struct Redactor {
+    key: ring::hmac::Key,
+    /// Hostnames seen in structured fields, longest first when replacing.
+    names: Vec<String>,
+    tokens: HashMap<String, String>,
+    pub counts: BTreeMap<&'static str, usize>,
+}
+
+impl Redactor {
+    pub fn new(secret: &[u8]) -> Self {
+        Self {
+            key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret),
+            names: Vec::new(),
+            tokens: HashMap::new(),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    fn token(&mut self, class: &'static str, value: &str) -> String {
+        if let Some(t) = self.tokens.get(value) {
+            return t.clone();
+        }
+        let tag = ring::hmac::sign(&self.key, value.as_bytes());
+        let hex: String = tag.as_ref()[..5]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let token = format!("{class}:{hex}");
+        *self.counts.entry(class).or_default() += 1;
+        self.tokens.insert(value.to_string(), token.clone());
+        token
+    }
+
+    /// A redacted copy of `episode`.
+    pub fn episode(&mut self, episode: &Episode) -> Episode {
+        let mut ep = episode.clone();
+        for frame in &mut ep.frames {
+            for s in &mut frame.obs.sockets {
+                if s.process.take().is_some() {
+                    *self.counts.entry("process").or_default() += 1;
+                }
+            }
+            self.learn_names(&frame.obs);
+        }
+        for snap in &mut ep.issues {
+            snap.issue.scope.processes.clear();
+            snap.issue.artifacts.clear();
+        }
+        let mut value = serde_json::to_value(&ep).expect("episodes serialise");
+        self.walk(&mut value);
+        serde_json::from_value(value).expect("redaction keeps the shape")
+    }
+
+    fn learn_names(&mut self, obs: &super::detectors::Observations) {
+        let mut add = |name: &str| {
+            let name = name.trim().trim_end_matches('.');
+            if name.contains('.')
+                && name.parse::<IpAddr>().is_err()
+                && !self.names.iter().any(|n| n == name)
+            {
+                self.names.push(name.to_string());
+            }
+        };
+        if let Some(cross) = obs.dns.as_ref().and_then(|d| d.cross.as_ref()) {
+            add(&cross.name);
+        }
+        for path in &obs.paths {
+            add(&path.target);
+        }
+        if let Some(url) = &obs.captive_portal_url {
+            let host = url
+                .split("://")
+                .nth(1)
+                .unwrap_or(url)
+                .split(['/', ':', '?'])
+                .next()
+                .unwrap_or_default();
+            add(host);
+        }
+        self.names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    }
+
+    fn walk(&mut self, value: &mut serde_json::Value) {
+        use serde_json::Value;
+        match value {
+            Value::String(s) => *s = self.text(s),
+            Value::Array(items) => items.iter_mut().for_each(|v| self.walk(v)),
+            Value::Object(map) => {
+                let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+                for (k, mut v) in entries {
+                    self.walk(&mut v);
+                    map.insert(self.text(&k), v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Replace every known hostname and every IP address in `s`.
+    pub fn text(&mut self, s: &str) -> String {
+        let mut out = s.to_string();
+        for name in self.names.clone() {
+            if out.contains(&name) {
+                let token = self.token("host", &name);
+                out = out.replace(&name, &token);
+            }
+        }
+        self.addresses(&out)
+    }
+
+    fn addresses(&mut self, s: &str) -> String {
+        let is_addr_char = |c: char| c.is_ascii_hexdigit() || c == '.' || c == ':';
+        let mut out = String::with_capacity(s.len());
+        let mut run = String::new();
+        let flush = |run: &mut String, out: &mut String, this: &mut Self| {
+            if !run.is_empty() {
+                out.push_str(&this.address_run(run));
+                run.clear();
+            }
+        };
+        for c in s.chars() {
+            if is_addr_char(c) {
+                run.push(c);
+            } else {
+                flush(&mut run, &mut out, self);
+                out.push(c);
+            }
+        }
+        flush(&mut run, &mut out, self);
+        out
+    }
+
+    /// One run of address-ish characters: an address, `v4:port`, or not an
+    /// address at all (a time, a version number, a hex word).
+    fn address_run(&mut self, run: &str) -> String {
+        let trimmed = run.trim_end_matches(['.', ':']);
+        let tail = &run[trimmed.len()..];
+        if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            if trimmed.contains(['.', ':']) && !is_unspecified_text(trimmed) {
+                return format!("{}{tail}", self.token(class(&ip), trimmed));
+            }
+        }
+        if let Some((host, port)) = trimmed.rsplit_once(':') {
+            if let (Ok(ip @ IpAddr::V4(_)), true) = (
+                host.parse::<IpAddr>(),
+                port.chars().all(|c| c.is_ascii_digit()),
+            ) {
+                return format!("{}:{port}{tail}", self.token(class(&ip), host));
+            }
+        }
+        run.to_string()
+    }
+}
+
+/// `::` on its own parses as an address but is far more often punctuation.
+fn is_unspecified_text(s: &str) -> bool {
+    s == "::"
+}
+
+fn class(ip: &IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => "ip4-loopback",
+        IpAddr::V4(v4) if v4.is_private() => "ip4-private",
+        IpAddr::V4(v4) if v4.is_link_local() => "ip4-linklocal",
+        IpAddr::V4(v4) if v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]) => {
+            "ip4-cgnat"
+        }
+        IpAddr::V4(_) => "ip4-public",
+        IpAddr::V6(v6) if v6.is_loopback() => "ip6-loopback",
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => "ip6-linklocal",
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00 => "ip6-ula",
+        IpAddr::V6(_) => "ip6-public",
+    }
+}
+
+// ------------------------------------------------------------------ bundle
+
+#[derive(Debug, Serialize)]
+pub struct Bundle {
+    pub format: &'static str,
+    pub version: u32,
+    pub created: String,
+    /// Stable per install, unlinkable to anything else about the machine.
+    pub install: String,
+    pub redaction: &'static str,
+    pub episodes: Vec<Episode>,
+}
+
+pub const REDACTION_NOTE: &str =
+    "IP addresses and hostnames replaced with per-install keyed hashes \
+(pseudonymised, not anonymous); process names and artifact paths removed; interface names, \
+timings, counts, rule and cause ids kept.";
+
+/// The per-install export key: 32 random bytes, created on first use,
+/// readable only by the user.
+pub fn install_key(dir: &Path) -> std::io::Result<Vec<u8>> {
+    let path = dir.join("export-key");
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() == 32 {
+            return Ok(bytes);
+        }
+    }
+    let mut key = vec![0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+        .map_err(|_| std::io::Error::other("no system randomness"))?;
+    std::fs::create_dir_all(dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    options.open(&path)?.write_all(&key)?;
+    Ok(key)
+}
+
+pub struct Preview {
+    pub bundle: Bundle,
+    pub skipped: Vec<(PathBuf, String)>,
+    pub counts: BTreeMap<&'static str, usize>,
+}
+
+/// Build a redacted bundle of the episodes under `dir` started within
+/// `since_days`.
+pub fn build(
+    dir: &Path,
+    key: &[u8],
+    since_days: u64,
+    now: chrono::DateTime<chrono::Local>,
+) -> Preview {
+    let cutoff = super::engine::format_ts(now - chrono::Duration::days(since_days as i64));
+    let mut redactor = Redactor::new(key);
+    let mut episodes = Vec::new();
+    let mut skipped = Vec::new();
+    for path in episode::list(dir) {
+        match episode::load(&path) {
+            Ok(ep) if ep.started >= cutoff => episodes.push(redactor.episode(&ep)),
+            Ok(_) => {}
+            Err(e) => skipped.push((path, e.to_string())),
+        }
+    }
+    let install = {
+        let tag = ring::hmac::sign(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+            b"install",
+        );
+        tag.as_ref()[..6]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    Preview {
+        bundle: Bundle {
+            format: FORMAT,
+            version: VERSION,
+            created: super::engine::format_ts(now),
+            install,
+            redaction: REDACTION_NOTE,
+            episodes,
+        },
+        skipped,
+        counts: redactor.counts,
+    }
+}
+
+pub fn write(bundle: &Bundle, path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(path)?;
+    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    serde_json::to_writer(&mut gz, bundle).map_err(std::io::Error::other)?;
+    gz.finish()?.flush()
+}
+
+/// `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]`
+pub fn command(args: &[String]) -> anyhow::Result<()> {
+    let (mut since, mut out, mut dry_run, mut dir) = (7u64, None, false, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--since" => {
+                let v = rest
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--since needs days"))?;
+                since = v.trim_end_matches('d').parse()?;
+            }
+            "--out" => {
+                out = Some(PathBuf::from(
+                    rest.next()
+                        .ok_or_else(|| anyhow::anyhow!("--out needs a file"))?,
+                ))
+            }
+            "--dry-run" => dry_run = true,
+            other if other.starts_with("--") => anyhow::bail!("unknown option {other}"),
+            other => dir = Some(PathBuf::from(other)),
+        }
+    }
+    let state = episode::default_dir()
+        .and_then(|d| d.parent().map(Path::to_path_buf))
+        .ok_or_else(|| anyhow::anyhow!("no state directory"))?;
+    let dir = dir.unwrap_or_else(|| state.join("episodes"));
+    let key = install_key(&state)?;
+    let now = chrono::Local::now();
+    let preview = build(&dir, &key, since, now);
+
+    println!(
+        "episodes from the last {since} days under {}:",
+        dir.display()
+    );
+    for ep in &preview.bundle.episodes {
+        println!(
+            "  {}  {}  {:>4}m  {}",
+            &ep.id[..8.min(ep.id.len())],
+            ep.started,
+            (ep.duration_secs() / 60.0).round() as u64,
+            ep.issue_keys().join(", ")
+        );
+    }
+    for (path, why) in &preview.skipped {
+        println!("  skipped {}: {why}", path.display());
+    }
+    let redacted: Vec<String> = preview
+        .counts
+        .iter()
+        .map(|(k, n)| format!("{n} {k}"))
+        .collect();
+    println!(
+        "redacted: {}",
+        if redacted.is_empty() {
+            "nothing".into()
+        } else {
+            redacted.join(", ")
+        }
+    );
+    println!("{REDACTION_NOTE}");
+
+    if dry_run {
+        println!("dry run: nothing written");
+        return Ok(());
+    }
+    if preview.bundle.episodes.is_empty() {
+        println!("nothing to export");
+        return Ok(());
+    }
+    let path = out.unwrap_or_else(|| {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("netwatch")
+            .join("exports")
+            .join(format!(
+                "netwatch-episodes-{}.json.gz",
+                now.format("%Y%m%d-%H%M%S")
+            ))
+    });
+    write(&preview.bundle, &path)?;
+    println!(
+        "wrote {} — review it, then send it yourself",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addresses_become_stable_classed_tokens() {
+        let mut r = Redactor::new(b"test key");
+        let a = r.text("resolver 192.168.8.1 answered; 192.168.8.1 again");
+        let parts: Vec<&str> = a.split(' ').collect();
+        assert!(parts[1].starts_with("ip4-private:"));
+        assert_eq!(parts[1], parts[3]);
+        assert!(!a.contains("192.168"));
+
+        let s = r.text("10.88.0.2:52344 → 1.1.1.1:443 via fe80::1%wlan0 and [2001:db8::5]:53");
+        assert!(
+            !s.contains("10.88") && !s.contains("1.1.1.1") && !s.contains("2001:db8"),
+            "{s}"
+        );
+        assert!(
+            s.contains(":52344") && s.contains(":443"),
+            "ports survive: {s}"
+        );
+        assert!(s.contains("ip6-linklocal:") && s.contains("%wlan0"));
+    }
+
+    #[test]
+    fn times_versions_and_words_are_left_alone() {
+        let mut r = Redactor::new(b"k");
+        let text = "2026-09-14 20:56:46 · v0.31.2 · 12.5ms · cafe · aa:bb:cc:dd:ee:ff · a :: b";
+        assert_eq!(r.text(text), text);
+    }
+
+    #[test]
+    fn a_different_install_key_gives_different_tokens() {
+        let a = Redactor::new(b"one").text("1.1.1.1");
+        let b = Redactor::new(b"two").text("1.1.1.1");
+        assert_ne!(a, b);
+    }
+
+    fn fixture_episode() -> Episode {
+        use crate::diagnose::engine::{Clock, Engine, FixedClock, ObservationTimes};
+        use crate::diagnose::fixture;
+        let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:44:00"));
+        let mut engine = Engine::new(Box::new(clock.clone()));
+        let base = fixture::baselines();
+        let mut rec = episode::Recorder::new(episode::EnvProfile::detect("root", 1000), 1.789e9);
+        rec.schedule_quiet_sample(f64::MAX);
+        let start = std::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        for t in 0..=fixture::SCENARIO_SECS {
+            let mut obs = fixture::observations_at(t);
+            for s in &mut obs.sockets {
+                s.process = Some("firefox".into());
+            }
+            let now = start + std::time::Duration::from_secs(t);
+            let mut times = ObservationTimes {
+                interface: Some(now),
+                sockets: Some(now),
+                path: Some(now),
+                ..Default::default()
+            };
+            times.health.dns = Some(now);
+            times.health.gateway = Some(now);
+            times.health.internet = Some(now);
+            engine.observe_live_at(&obs, &base, &times, now);
+            let _ = rec.record(episode::Tick {
+                at: 1.789e9 + t as f64,
+                ts: crate::diagnose::engine::format_ts(clock.now()),
+                now,
+                obs: &obs,
+                times: &times,
+                readings: &[],
+                engine: &engine,
+                baselines: &base,
+                events: vec![],
+            });
+            clock.advance_secs(1);
+        }
+        rec.flush(&engine, &crate::diagnose::engine::format_ts(clock.now()))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_redacted_episode_holds_no_address_or_process_and_still_replays() {
+        let ep = fixture_episode();
+        let raw = serde_json::to_string(&ep).unwrap();
+        let mut r = Redactor::new(b"install");
+        let redacted = r.episode(&ep);
+        let text = serde_json::to_string(&redacted).unwrap();
+
+        let mut probe = Redactor::new(b"probe");
+        let originals: Vec<String> = probe.tokens_in(&raw);
+        assert!(
+            originals.len() >= 4,
+            "the fixture should carry addresses: {originals:?}"
+        );
+        for addr in &originals {
+            assert!(!text.contains(addr.as_str()), "{addr} survived redaction");
+        }
+        assert!(!text.contains("firefox"));
+        assert!(raw.contains("firefox"));
+
+        // One consistent mapping means the engine sees the same structure,
+        // so replay reaches the same issues under their redacted names.
+        let report = episode::replay(&redacted);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        assert_eq!(report.issues.len(), episode::replay(&ep).issues.len());
+    }
+
+    #[test]
+    fn bundles_include_recent_episodes_and_write_privately_keyed() {
+        let root = std::env::temp_dir().join(format!("nw-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("episodes");
+        episode::save(&dir, &fixture_episode()).unwrap();
+        let key = install_key(&root).unwrap();
+        assert_eq!(install_key(&root).unwrap(), key, "the key is created once");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("export-key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+        let now = crate::diagnose::engine::parse_ts("2026-09-05 12:00:00").unwrap();
+        assert_eq!(build(&dir, &key, 7, now).bundle.episodes.len(), 1);
+        assert_eq!(build(&dir, &key, 1, now).bundle.episodes.len(), 0);
+
+        let preview = build(&dir, &key, 7, now);
+        assert!(preview.counts.get("process").copied().unwrap_or(0) > 0);
+        let out = root.join("bundle.json.gz");
+        write(&preview.bundle, &out).unwrap();
+        let mut text = String::new();
+        use std::io::Read;
+        flate2::read::GzDecoder::new(std::fs::File::open(&out).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains(FORMAT) && !text.contains("169.254.1.1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    impl Redactor {
+        /// Every original address or known hostname `text` would replace.
+        fn tokens_in(&mut self, text: &str) -> Vec<String> {
+            self.text(text);
+            let mut v: Vec<String> = self.tokens.keys().cloned().collect();
+            v.sort();
+            v
+        }
+    }
+}

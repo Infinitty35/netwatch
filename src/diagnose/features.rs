@@ -810,6 +810,7 @@ mod decision_tests {
                 readings: &[],
                 engine: &engine,
                 baselines: &base,
+                events: vec![],
             });
             clock.advance_secs(1);
         }
