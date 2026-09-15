@@ -365,7 +365,7 @@ fn run_tcp_probe(target: &str) -> (Option<f64>, f64) {
     (None, 100.0)
 }
 
-fn run_tcp_probe_port(addr: std::net::IpAddr, port: u16) -> (Option<f64>, f64) {
+pub(crate) fn run_tcp_probe_port(addr: std::net::IpAddr, port: u16) -> (Option<f64>, f64) {
     use std::net::{SocketAddr, TcpStream};
     use std::time::{Duration, Instant};
 
@@ -405,13 +405,13 @@ fn run_tcp_probe_port(addr: std::net::IpAddr, port: u16) -> (Option<f64>, f64) {
 
 /// One decoded DNS reply: the header bits the rules read, plus any A records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DnsReply {
-    id: u16,
-    truncated: bool,
+pub(crate) struct DnsReply {
+    pub(crate) id: u16,
+    pub(crate) truncated: bool,
     /// Authentic Data — the resolver validated the answer with DNSSEC.
-    authentic: bool,
-    rcode: u8,
-    answers: Vec<std::net::Ipv4Addr>,
+    pub(crate) authentic: bool,
+    pub(crate) rcode: u8,
+    pub(crate) answers: Vec<std::net::Ipv4Addr>,
 }
 
 const RCODE_SERVFAIL: u8 = 2;
@@ -421,7 +421,7 @@ const RCODE_SERVFAIL: u8 = 2;
 /// Names are skipped, not decoded — a compression pointer is two bytes and
 /// ends the name, a label is its length plus one. Anything malformed returns
 /// `None` and counts as no reply, which is the safe way to be wrong here.
-fn parse_dns_reply(buf: &[u8]) -> Option<DnsReply> {
+pub(crate) fn parse_dns_reply(buf: &[u8]) -> Option<DnsReply> {
     if buf.len() < 12 {
         return None;
     }
@@ -468,7 +468,7 @@ fn parse_dns_reply(buf: &[u8]) -> Option<DnsReply> {
 }
 
 /// Send one query and wait up to a second for the reply that matches its id.
-fn dns_exchange(
+pub(crate) fn dns_exchange(
     sock: &std::net::UdpSocket,
     dest: std::net::SocketAddr,
     query: &[u8],
@@ -489,7 +489,7 @@ fn dns_exchange(
     }
 }
 
-fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> {
+pub(crate) fn dns_socket(addr: std::net::IpAddr) -> Option<std::net::UdpSocket> {
     let bind_addr = match addr {
         std::net::IpAddr::V4(_) => "0.0.0.0:0",
         std::net::IpAddr::V6(_) => "[::]:0",
@@ -610,7 +610,7 @@ fn run_dns_cross_check(server: &str) -> Option<DnsCrossCheck> {
 
 /// A standard recursive query for `name`/`qtype`. With `dnssec`, an EDNS OPT
 /// record with the DO bit asks the resolver to validate and say so via AD.
-fn build_dns_query(id: u16, name: &str, qtype: u16, dnssec: bool) -> Vec<u8> {
+pub(crate) fn build_dns_query(id: u16, name: &str, qtype: u16, dnssec: bool) -> Vec<u8> {
     let mut q = Vec::with_capacity(64);
     q.extend_from_slice(&id.to_be_bytes()); // transaction id
     q.extend_from_slice(&[0x01, 0x00]); // flags: standard query, RD=1

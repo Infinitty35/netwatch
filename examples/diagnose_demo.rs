@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // These stills are for documentation, not a live claim: the
             // caption carries the provenance.
             demo_banner: None,
+            running_tests: vec![],
         };
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT))?;
         terminal.draw(|f| render_body(f, &view, f.size()))?;

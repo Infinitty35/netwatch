@@ -391,6 +391,38 @@
       "name": "check.tcp.bufferbloat_local.no_aqm_upstream.rtt_rises_under_our_own_load"
     },
     {
+      "group": "test",
+      "name": "test.dns.alt_resolver"
+    },
+    {
+      "group": "test",
+      "name": "test.dns.tcp_fallback"
+    },
+    {
+      "group": "test",
+      "name": "test.dns.cached_vs_cold"
+    },
+    {
+      "group": "test",
+      "name": "test.dns.nxdomain_probe"
+    },
+    {
+      "group": "test",
+      "name": "test.gateway.tcp_probe"
+    },
+    {
+      "group": "test",
+      "name": "test.path.internet_tracks_gateway"
+    },
+    {
+      "group": "test",
+      "name": "test.path.end_to_end_loss"
+    },
+    {
+      "group": "test",
+      "name": "test.load.idle_vs_loaded"
+    },
+    {
       "group": "coverage",
       "name": "coverage.dns.slow_resolver.available"
     },
@@ -783,7 +815,7 @@
       "name": "open.nat.symmetric"
     }
   ],
-  "hash": "c58ffc853e893cbc",
+  "hash": "c5c979f6d39ffc9c",
   "meta_columns": [
     "episode",
     "source",

@@ -35,6 +35,21 @@ pub const BASELINED_METRICS: &[(&str, &str)] = &[
     ("path.rtt", "path.rtt_spike"),
 ];
 
+/// Negotiated wired link rate from `/sys/class/net/<iface>/speed` (Mb/s).
+/// `None` off Linux, for unknown (-1) or absent speeds.
+fn link_rate_bps(iface: &str) -> Option<f64> {
+    if iface.contains('/') || iface.contains("..") {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/sys/class/net/{iface}/speed")).ok()?;
+    parse_link_speed(&text)
+}
+
+fn parse_link_speed(text: &str) -> Option<f64> {
+    let mbps: i64 = text.trim().parse().ok()?;
+    (mbps > 0).then_some(mbps as f64 * 1_000_000.0)
+}
+
 /// One probe result destined for the baseline store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
@@ -85,7 +100,12 @@ pub struct LiveSampler {
     /// Interface name → the last minute of (tx retries, tx packets) deltas,
     /// for the wifi retry rate. Same shape as `iface_history`.
     wifi_history: HashMap<String, IfaceCounters>,
+    /// The last idle-vs-loaded test: when it finished, idle rtt, loaded rtt.
+    pub load_test: Option<(Instant, f64, f64)>,
 }
+
+/// How long a load test result stands in for a live measurement.
+pub const LOAD_TEST_VALID_SECS: u64 = 30 * 60;
 
 /// A rolling one-minute window of interface counter deltas.
 ///
@@ -229,15 +249,20 @@ impl LiveSampler {
             dns: dns(app),
             paths: self.paths(app),
             sockets: self.sockets(app, thresholds),
-            // netwatch does not yet run a loaded-rtt test of its own. Leaving
-            // these `None` makes the local-bufferbloat rule dormant and the
-            // remote rule's discriminating check report "not run" — which is
-            // the truth, and is why the check exists as a tri-state.
-            idle_rtt_ms: None,
-            loaded_rtt_ms: None,
+            // Only the user-started load test measures these. Without a recent
+            // one they stay `None`: the local-bufferbloat rule is dormant and
+            // the remote rule's discriminating check reports "not run".
+            idle_rtt_ms: self.recent_load_test().map(|(idle, _)| idle),
+            loaded_rtt_ms: self.recent_load_test().map(|(_, loaded)| loaded),
             captive_portal_url: None,
             nat: nat(app),
         }
+    }
+
+    fn recent_load_test(&self) -> Option<(f64, f64)> {
+        self.load_test
+            .filter(|(at, _, _)| at.elapsed().as_secs() <= LOAD_TEST_VALID_SECS)
+            .map(|(_, idle, loaded)| (idle, loaded))
     }
 
     fn iface(&mut self, app: &App) -> Option<IfaceObs> {
@@ -289,9 +314,14 @@ impl LiveSampler {
             tx_dropped: t.tx_drops,
             errors_per_min,
             drops_per_min,
-            // Link rate isn't collected yet, so the saturation rule stays
-            // dormant rather than guessing at 1Gb and crying wolf on wifi.
-            link_rate_bps: None,
+            // Wired only. A wifi PHY rate moves with every retrain and is
+            // not the rate the link can carry, so on wifi the saturation
+            // rule stays dormant rather than crying wolf.
+            link_rate_bps: if wireless {
+                None
+            } else {
+                link_rate_bps(&t.name)
+            },
             wireless,
             signal_dbm: t.signal_dbm,
             tx_retry_pct,
@@ -566,6 +596,14 @@ fn subnet_of(ip: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_speed_parses_megabits_and_rejects_unknown() {
+        assert_eq!(parse_link_speed("1000\n"), Some(1e9));
+        assert_eq!(parse_link_speed("-1\n"), None);
+        assert_eq!(parse_link_speed(""), None);
+        assert_eq!(link_rate_bps("../etc"), None);
+    }
 
     #[test]
     fn cached_probe_is_learned_once_and_stale_results_are_not_learned() {

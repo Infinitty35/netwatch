@@ -173,7 +173,23 @@ pub enum EngineEvent {
         step: char,
         applied: super::issue::Applied,
     },
+    TestCompleted {
+        issue: String,
+        run: super::next_test::TestRun,
+    },
+    StepDone {
+        issue: String,
+        /// Index into the issue's remediation steps.
+        step: usize,
+        at: String,
+    },
 }
+
+/// Test runs kept per issue.
+const MAX_TEST_RUNS: usize = 20;
+/// Seconds past an issue's verify hold before an unrecovered step is judged
+/// not to have worked.
+const VERIFY_GRACE_SECS: i64 = 600;
 
 /// Events kept when nothing drains them (demo mode, recording off).
 const EVENT_LOG_CAP: usize = 256;
@@ -368,6 +384,7 @@ impl Engine {
         }
 
         self.age_unseen(&seen, obs, base, now, times);
+        self.decide_verifications(now);
 
         rules::apply_suppression(&mut self.issues);
         self.sort();
@@ -450,7 +467,7 @@ impl Engine {
 
                 // A muted issue keeps accruing evidence silently; it just
                 // doesn't reach the verdict line.
-                issue.last_seen = ts;
+                issue.last_seen = ts.clone();
                 issue.severity = d.severity;
                 issue.title = d.title;
                 issue.evidence = d.evidence;
@@ -460,7 +477,9 @@ impl Engine {
                 // Preserve applied outcomes across ticks: a step the user
                 // already ran must keep saying so.
                 merge_remediation(&mut issue.remediation, d.remediation);
-                issue.rank_causes();
+                // Detectors rebuild causes every tick; test evidence has to
+                // be laid back on top before ranking.
+                super::next_test::apply(issue, &ts);
                 self.verifying_since.remove(&id);
                 self.verification_samples.remove(&id);
                 return;
@@ -494,6 +513,8 @@ impl Engine {
             consequences: vec![],
             suppressed_by: None,
             recurrence: 0,
+            tests: vec![],
+            verification: None,
         };
         issue.rank_causes();
         self.by_key.insert(key, id);
@@ -709,7 +730,9 @@ impl Engine {
             EngineEvent::Acked { issue }
             | EngineEvent::Muted { issue, .. }
             | EngineEvent::Resolved { issue, .. }
-            | EngineEvent::Applied { issue, .. } => issue,
+            | EngineEvent::Applied { issue, .. }
+            | EngineEvent::TestCompleted { issue, .. }
+            | EngineEvent::StepDone { issue, .. } => issue,
         };
         let Some(id) = self.by_key.get(key).cloned() else {
             return false;
@@ -720,6 +743,135 @@ impl Engine {
             EngineEvent::Resolved { at, .. } => self.resolve_at(&id, at),
             EngineEvent::Applied { step, applied, .. } => {
                 self.record_applied(&id, *step, applied.clone())
+            }
+            EngineEvent::TestCompleted { run, .. } => self.record_test(&id, run.clone()),
+            EngineEvent::StepDone { step, at, .. } => self.mark_step_done_at(&id, *step, at),
+        }
+    }
+
+    /// Attach a finished test run to an issue and re-rank its causes.
+    pub fn record_test(&mut self, id: &str, run: super::next_test::TestRun) -> bool {
+        let now = format_ts(self.clock.now());
+        let Some(issue) = self.issues.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        issue.tests.push(run.clone());
+        if issue.tests.len() > MAX_TEST_RUNS {
+            issue.tests.remove(0);
+        }
+        super::next_test::apply(issue, &now);
+        self.log(id, true, |issue| EngineEvent::TestCompleted { issue, run });
+        true
+    }
+
+    /// The user says they carried out remediation step `step` (its index).
+    /// From here the engine decides whether it worked; see
+    /// [`super::issue::VerifyOutcome`].
+    pub fn mark_step_done(&mut self, id: &str, step: usize) -> bool {
+        let at = format_ts(self.clock.now());
+        self.mark_step_done_at(id, step, &at)
+    }
+
+    fn mark_step_done_at(&mut self, id: &str, step: usize, at: &str) -> bool {
+        use super::issue::{Verification, VerifyOutcome};
+        let holding = self.verifying_since.contains_key(id);
+        let Some(issue) = self.issues.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        if !issue.state.is_open() || step >= issue.remediation.len() {
+            return false;
+        }
+        let top = issue.top_cause().cloned();
+        let supporting = super::next_test::latest_runs(issue, at)
+            .into_iter()
+            .filter(|run| {
+                top.as_ref().is_some_and(|c| {
+                    c.checks.iter().any(|k| {
+                        k.id == super::next_test::check_id(&run.test) && k.passed == Some(true)
+                    })
+                })
+            })
+            .map(|run| run.test.clone())
+            .collect();
+        issue.verification = Some(Verification {
+            step,
+            action_at: at.to_string(),
+            holding_at_action: holding,
+            top_cause: top.map(|c| c.key(&issue.rule)),
+            supporting,
+            outcome: holding.then_some(VerifyOutcome::RecoveredBeforeAction),
+            decided_at: holding.then(|| at.to_string()),
+        });
+        let at = at.to_string();
+        self.log(id, true, |issue| EngineEvent::StepDone { issue, step, at });
+        true
+    }
+
+    /// Decide pending verifications: closed issues recovered (fully, unless a
+    /// re-run test still points at the cause); open ones past their deadline
+    /// did not.
+    fn decide_verifications(&mut self, now: DateTime<Local>) {
+        use super::issue::VerifyOutcome;
+        let ts = format_ts(now);
+        for issue in &mut self.issues {
+            let rule = issue.rule.clone();
+            let Some(v) = issue.verification.as_mut() else {
+                continue;
+            };
+            if v.outcome.is_some() {
+                continue;
+            }
+            let still_supported = v.supporting.iter().any(|test| {
+                let Some(spec) = super::next_test::lookup(test) else {
+                    return false;
+                };
+                let Some(cause) = v
+                    .top_cause
+                    .as_deref()
+                    .and_then(|k| k.split_once('/'))
+                    .map(|x| x.1)
+                else {
+                    return false;
+                };
+                let Some(expect) = spec
+                    .expects
+                    .iter()
+                    .find(|x| x.rule == rule && x.cause == cause)
+                else {
+                    return false;
+                };
+                issue
+                    .tests
+                    .iter()
+                    .rev()
+                    .find(|r| r.after_action && &r.test == test)
+                    .is_some_and(|r| {
+                        r.outcome != super::next_test::Outcome::Inconclusive
+                            && (r.outcome == super::next_test::Outcome::Positive) == expect.positive
+                    })
+            });
+            let outcome = if !issue.state.is_open() {
+                Some(if still_supported {
+                    VerifyOutcome::Partial
+                } else {
+                    VerifyOutcome::Recovered
+                })
+            } else {
+                let deadline = parse_ts(&v.action_at).map(|a| {
+                    a + Duration::seconds(issue.verify.hold_secs as i64 + VERIFY_GRACE_SECS)
+                });
+                match deadline {
+                    Some(d) if now >= d => Some(if self.verifying_since.contains_key(&issue.id) {
+                        VerifyOutcome::Partial
+                    } else {
+                        VerifyOutcome::NotRecovered
+                    }),
+                    _ => None,
+                }
+            };
+            if outcome.is_some() {
+                v.outcome = outcome;
+                v.decided_at = Some(ts.clone());
             }
         }
     }
@@ -1238,6 +1390,161 @@ mod tests {
             e.open_count(),
             1,
             "one good sample is not a fix — the verify window has to elapse"
+        );
+    }
+
+    fn run(
+        test: &str,
+        at: &str,
+        outcome: crate::diagnose::next_test::Outcome,
+        after: bool,
+    ) -> crate::diagnose::next_test::TestRun {
+        crate::diagnose::next_test::TestRun {
+            test: test.into(),
+            at: at.into(),
+            outcome,
+            detail: "t".into(),
+            measurements: Default::default(),
+            after_action: after,
+        }
+    }
+
+    #[test]
+    fn a_test_run_survives_the_next_detector_pass() {
+        use crate::diagnose::next_test::Outcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        let _ = e.take_events();
+        assert!(e.record_test(
+            &id,
+            run(
+                "dns.alt_resolver",
+                "2026-09-03 06:48:10",
+                Outcome::Positive,
+                false
+            )
+        ));
+        clock.advance_secs(1);
+        e.observe(&obs(40.0), &b);
+        let issue = e.get(&id).unwrap();
+        let check = crate::diagnose::next_test::check_id("dns.alt_resolver");
+        let local = issue
+            .causes
+            .iter()
+            .find(|c| c.id == "local_udp_path")
+            .unwrap();
+        assert_eq!(
+            local.checks.iter().find(|k| k.id == check).unwrap().passed,
+            Some(false),
+            "a fast reference resolver rules out the local path"
+        );
+        assert_eq!(issue.causes.last().unwrap().id, "local_udp_path");
+        assert!(matches!(
+            e.take_events().as_slice(),
+            [EngineEvent::TestCompleted { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_step_that_works_is_recovered_and_one_that_does_not_is_not() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            None
+        );
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            Some(VerifyOutcome::Recovered)
+        );
+
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+        for _ in 0..(60 + VERIFY_GRACE_SECS) {
+            clock.advance_secs(1);
+            e.observe(&obs(40.0), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            Some(VerifyOutcome::NotRecovered)
+        );
+    }
+
+    #[test]
+    fn a_step_taken_while_already_recovering_gets_no_credit() {
+        use crate::diagnose::issue::VerifyOutcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        for _ in 0..10 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert!(e.mark_step_done(&id, 0));
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            Some(VerifyOutcome::RecoveredBeforeAction)
+        );
+    }
+
+    #[test]
+    fn recovery_with_a_rerun_still_pointing_at_the_cause_is_partial() {
+        use crate::diagnose::issue::VerifyOutcome;
+        use crate::diagnose::next_test::Outcome;
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        // A fast reference resolver supports upstream_slow, the top cause.
+        e.record_test(
+            &id,
+            run(
+                "dns.alt_resolver",
+                "2026-09-03 06:48:10",
+                Outcome::Positive,
+                false,
+            ),
+        );
+        assert!(e.mark_step_done(&id, 0));
+        assert_eq!(
+            e.get(&id)
+                .unwrap()
+                .verification
+                .as_ref()
+                .unwrap()
+                .supporting,
+            vec!["dns.alt_resolver".to_string()]
+        );
+        clock.advance_secs(1);
+        e.record_test(
+            &id,
+            run(
+                "dns.alt_resolver",
+                "2026-09-03 06:48:11",
+                Outcome::Positive,
+                true,
+            ),
+        );
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+        assert_eq!(
+            e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
+            Some(VerifyOutcome::Partial)
         );
     }
 

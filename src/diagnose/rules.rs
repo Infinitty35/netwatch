@@ -474,6 +474,8 @@ mod tests {
             consequences: vec![],
             suppressed_by: None,
             recurrence: 0,
+            tests: vec![],
+            verification: None,
         }
     }
 

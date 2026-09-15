@@ -1390,6 +1390,45 @@ mod tests {
     }
 
     #[test]
+    fn a_test_result_during_an_incident_replays_and_becomes_a_decision_point() {
+        use crate::diagnose::next_test::{Outcome, TestRun};
+        let mut s = Session::new();
+        s.run(healthy, 900.0, 5.0);
+        s.run(|_| 80.0, 120.0, 5.0);
+        let id = s.engine.primary()[0].id.clone();
+        let at = super::super::engine::format_ts(s.clock.now());
+        assert!(s.engine.record_test(
+            &id,
+            TestRun {
+                test: "path.internet_tracks_gateway".into(),
+                at,
+                outcome: Outcome::Negative,
+                detail: "internet flat while gateway rose".into(),
+                measurements: Default::default(),
+                after_action: false,
+            },
+        ));
+        s.run(|_| 80.0, 480.0, 5.0);
+        s.run(healthy, 1_800.0, 5.0);
+        let ep = &s.finished[0];
+        let report = replay(ep);
+        assert!(report.matches(), "{:#?}", report.divergences.first());
+        assert_eq!(
+            report.issues[0].top_cause.as_deref(),
+            Some("gateway.rtt_spike/gateway_loaded"),
+            "the test moved the ranking, and replay kept it"
+        );
+        let rows = crate::diagnose::features::decisions(ep);
+        let tested: Vec<_> = rows.iter().filter(|r| r.trigger == "tested").collect();
+        assert_eq!(tested.len(), 1);
+        let i = crate::diagnose::features::schema()
+            .iter()
+            .position(|f| f.name == "test.path.internet_tracks_gateway")
+            .unwrap();
+        assert_eq!(tested[0].values[i], -1.0);
+    }
+
+    #[test]
     fn replay_reports_where_a_recording_disagrees() {
         let s = incident();
         let mut ep = s.finished[0].clone();

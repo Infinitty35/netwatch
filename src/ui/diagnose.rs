@@ -43,6 +43,8 @@ pub struct View<'a> {
     /// watching the network. Rendered on every frame and not suppressible —
     /// a demo a viewer can mistake for live measurement is worse than none.
     pub demo_banner: Option<String>,
+    /// Tests running against the selected issue.
+    pub running_tests: Vec<String>,
 }
 
 /// The AI commentary block's state.
@@ -115,6 +117,9 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
             .blocked_reason()
             .or(app.diagnose.status.as_deref()),
         demo_banner: app.diagnose.demo.as_ref().map(|d| d.banner()),
+        running_tests: selected_issue(app)
+            .map(|id| app.diagnose.tests.running_for(&id))
+            .unwrap_or_default(),
     };
     // The header's verdict row is suppressed here: this tab *is* the verdict,
     // and the body renders it in full a line below. Two copies of the same
@@ -150,6 +155,21 @@ fn chunk_footer(area: Rect) -> Rect {
     }
 }
 
+/// Index of the first step the user carries out by hand, which `d` marks done.
+pub fn first_manual_step(issue: &crate::diagnose::Issue) -> Option<usize> {
+    issue
+        .remediation
+        .iter()
+        .position(|s| s.kind == StepKind::Instruct)
+}
+
+fn selected_issue(app: &crate::app::App) -> Option<String> {
+    let primary = app.diagnose.engine.primary();
+    primary
+        .get(app.diagnose.selected.min(primary.len().saturating_sub(1)))
+        .map(|i| i.id.clone())
+}
+
 pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
     use crate::ui::widgets::hint;
     let mut hints = vec![hint("↑↓", "issue")];
@@ -159,6 +179,17 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
         .unwrap_or(false)
     {
         hints.push(hint("↵", "apply fix"));
+    }
+    if let Some(issue) = view.current() {
+        if view.running_tests.is_empty()
+            && crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen)
+                .is_some()
+        {
+            hints.push(hint("t", "run test"));
+        }
+        if first_manual_step(issue).is_some() && issue.verification.is_none() {
+            hints.push(hint("d", "done it"));
+        }
     }
     hints.push(hint("a", "ack"));
     hints.push(hint("m", "mute"));
@@ -867,6 +898,56 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
         lines.push(Line::from(""));
     }
 
+    // ── next test ────────────────────────────────────────────
+    let runs = crate::diagnose::next_test::latest_runs(issue, &issue.last_seen);
+    let suggestion = crate::diagnose::next_test::suggest(issue, view.capability, &issue.last_seen);
+    if !view.running_tests.is_empty() || suggestion.is_some() || !runs.is_empty() {
+        lines.push(section(t, "tests"));
+        for run in &runs {
+            let spec = crate::diagnose::next_test::lookup(&run.test);
+            lines.push(Line::from(vec![
+                Span::styled("  ✓ ", Style::default().fg(t.text_muted)),
+                Span::styled(
+                    spec.map_or(run.test.as_str(), |s| s.question).to_string(),
+                    Style::default().fg(t.text_secondary),
+                ),
+                Span::styled(
+                    format!(
+                        " — {} · {}",
+                        match run.outcome {
+                            crate::diagnose::next_test::Outcome::Positive => "yes",
+                            crate::diagnose::next_test::Outcome::Negative => "no",
+                            crate::diagnose::next_test::Outcome::Inconclusive => "can't tell",
+                        },
+                        run.detail
+                    ),
+                    Style::default().fg(t.text_muted),
+                ),
+            ]));
+        }
+        for running in &view.running_tests {
+            let spec = crate::diagnose::next_test::lookup(running);
+            lines.push(Line::from(Span::styled(
+                format!("  … {}", spec.map_or(running.as_str(), |s| s.question)),
+                Style::default().fg(t.status_warn),
+            )));
+        }
+        if let (true, Some(s)) = (view.running_tests.is_empty(), &suggestion) {
+            lines.push(Line::from(vec![
+                Span::styled("t ", Style::default().fg(t.key_hint).bold()),
+                Span::styled(
+                    format!("check whether {}", s.test.question),
+                    Style::default().fg(t.text_primary),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("  {} · about {}s", s.test.does, s.test.cost.secs),
+                Style::default().fg(t.text_muted),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
     // ── remediation ──────────────────────────────────────────
     let steps: Vec<&Step> = issue.offered_steps(view.capability);
     if !steps.is_empty() {
@@ -945,6 +1026,30 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
             Style::default().fg(t.text_muted),
         ),
     ]));
+    if let Some(v) = &issue.verification {
+        let step = issue
+            .remediation
+            .get(v.step)
+            .map_or("a step", |s| s.text.as_str());
+        let (text, color) = match v.outcome {
+            None => (
+                format!("after \"{step}\" · watching for recovery"),
+                t.text_secondary,
+            ),
+            Some(o) => (
+                format!("after \"{step}\" · {}", o.label()),
+                match o {
+                    crate::diagnose::issue::VerifyOutcome::Recovered => t.status_good,
+                    crate::diagnose::issue::VerifyOutcome::NotRecovered => t.status_error,
+                    _ => t.status_warn,
+                },
+            ),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("        {text}"),
+            Style::default().fg(color),
+        )));
+    }
 
     // ── consequences ─────────────────────────────────────────
     if !issue.consequences.is_empty() {
@@ -1154,6 +1259,7 @@ mod tests {
             endpoint: "local".to_string(),
             status: None,
             demo_banner: None,
+            running_tests: vec![],
         };
         mutate(&mut view);
 
@@ -1269,6 +1375,7 @@ mod tests {
             endpoint: "local".to_string(),
             status: None,
             demo_banner: None,
+            running_tests: vec![],
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
@@ -1635,6 +1742,7 @@ mod tests {
                 endpoint: "local".to_string(),
                 status: None,
                 demo_banner: None,
+                running_tests: vec![],
             };
             footer_hints(&v)
         };

@@ -31,6 +31,7 @@ pub mod features;
 pub mod fixture;
 pub mod issue;
 pub mod live;
+pub mod next_test;
 pub mod remediation;
 pub mod report;
 pub mod rules;

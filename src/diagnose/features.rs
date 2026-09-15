@@ -38,6 +38,8 @@ pub enum Group {
     Baseline,
     /// The issue's own cause checks.
     Check,
+    /// Discriminating tests run against the issue.
+    Test,
     /// Which rule inputs were available.
     Coverage,
     /// The issue and the host it was raised on.
@@ -312,6 +314,24 @@ fn build(input: &Input<'_>) -> Builder {
         }
     }
 
+    // ------------------------------------------------------ tests
+    b.group(Group::Test);
+    let runs = input
+        .issue
+        .map(|i| super::next_test::latest_runs(i, input.ts))
+        .unwrap_or_default();
+    for spec in super::next_test::TESTS {
+        let value = runs
+            .iter()
+            .find(|r| r.test == spec.id)
+            .map(|r| match r.outcome {
+                super::next_test::Outcome::Positive => 1.0,
+                super::next_test::Outcome::Negative => -1.0,
+                super::next_test::Outcome::Inconclusive => 0.0,
+            });
+        b.put(format!("test.{}", spec.id), value);
+    }
+
     // ------------------------------------------------------ coverage
     b.group(Group::Coverage);
     for rule in rules::CATALOGUE.iter().filter(|r| r.status.is_active()) {
@@ -408,7 +428,8 @@ pub struct DecisionRow {
     pub episode: String,
     pub source: String,
     pub os: String,
-    /// `opened`, `closed`, or `final` for an issue still open at the end.
+    /// `opened`, `tested` (after a test result), `closed`, or `final` for an
+    /// issue still open at the end.
     pub trigger: &'static str,
     pub ts: String,
     /// `rule#n`: the n-th distinct issue in the episode. Not the subject,
@@ -505,6 +526,13 @@ pub fn decisions(episode: &super::episode::Episode) -> Vec<DecisionRow> {
             if !open_before.contains_key(key) {
                 if let Some(issue) = engine.get(id) {
                     emit(issue, "opened");
+                }
+            }
+        }
+        for event in &step.frame.events {
+            if let super::engine::EngineEvent::TestCompleted { issue, .. } = event {
+                if let Some(issue) = now_open.get(issue).and_then(|id| engine.get(id)) {
+                    emit(issue, "tested");
                 }
             }
         }

@@ -492,6 +492,8 @@ pub struct DiagnoseState {
     /// Where finished episodes are written. `None` in unit tests, so a test
     /// that ticks the app can never write into the user's state directory.
     pub episode_dir: Option<std::path::PathBuf>,
+    /// Discriminating tests in flight, and re-runs after a step is done.
+    pub tests: crate::diagnose::next_test::Runner,
 }
 
 impl DiagnoseState {
@@ -520,6 +522,7 @@ impl DiagnoseState {
             } else {
                 crate::diagnose::episode::default_dir()
             },
+            tests: Default::default(),
         }
     }
 
@@ -880,6 +883,7 @@ impl App {
 
         let now = std::time::Instant::now();
         let wall = chrono::Local::now();
+        self.collect_diagnose_tests(now);
         // User actions since the last tick belong to this frame: replay
         // applies them before evaluating it, which is when they took effect.
         let events = self.diagnose.engine.take_events();
@@ -960,6 +964,110 @@ impl App {
                     tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved at shutdown");
                 }
             }
+        }
+    }
+
+    /// Start a discriminating test on an issue. Context is taken from what the
+    /// app currently knows: configured resolver and gateway, the issue's
+    /// traced target, and the learned baselines.
+    pub fn start_diagnose_test(&mut self, issue_id: &str, test: &str) -> Result<String, String> {
+        self.start_diagnose_test_inner(issue_id, test, false)
+    }
+
+    fn start_diagnose_test_inner(
+        &mut self,
+        issue_id: &str,
+        test: &str,
+        after_action: bool,
+    ) -> Result<String, String> {
+        use crate::diagnose::{issue::Subject, next_test};
+        let issue = self
+            .diagnose
+            .engine
+            .get(issue_id)
+            .ok_or_else(|| format!("{issue_id} is no longer tracked"))?;
+        let spec = next_test::lookup(test).ok_or_else(|| format!("no test named {test}"))?;
+        if !next_test::offered(issue, self.diagnose.capability)
+            .iter()
+            .any(|t| t.id == test)
+        {
+            return Err(format!("{} does not apply to this issue", spec.question));
+        }
+        let cfg = &self.config_collector.config;
+        let reference: std::net::IpAddr = crate::collectors::health::REFERENCE_RESOLVER
+            .parse()
+            .expect("reference resolver is an address");
+        let mut ctx = next_test::Context::new(reference);
+        ctx.resolver = match &issue.subject {
+            Subject::Resolver { addr } => addr.parse().ok(),
+            _ => None,
+        }
+        .or_else(|| cfg.primary_dns().and_then(|d| d.parse().ok()));
+        ctx.gateway = cfg.gateway.as_deref().and_then(|g| g.parse().ok());
+        if let Subject::Path { target } = &issue.subject {
+            if let Ok(ip) = target.parse() {
+                ctx.target = ip;
+            }
+        }
+        let health = self.health_prober.status();
+        ctx.gateway_rtt_ms = health.gateway_rtt_ms;
+        let base = &self.diagnose.baselines;
+        ctx.gateway_baseline_ms = cfg
+            .gateway
+            .as_deref()
+            .and_then(|g| base.get(g, "gateway.rtt"))
+            .map(|b| b.mean);
+        ctx.path_baseline_ms = base.get("internet", "path.rtt").map(|b| b.mean);
+        ctx.loaded_rtt_delta_ms = self.diagnose.engine.settings().thresholds.loaded_rtt_delta_ms;
+        self.diagnose
+            .tests
+            .start(issue_id, test, ctx, after_action)?;
+        Ok(format!("running: {}", spec.does))
+    }
+
+    /// The user says they carried out remediation step `step` (its index).
+    /// Re-runs the tests that pointed at the cause a minute later, so recovery
+    /// is checked against the same evidence that chose it.
+    pub fn mark_diagnose_step_done(&mut self, issue_id: &str, step: usize) -> Result<String, String> {
+        if !self.diagnose.engine.mark_step_done(issue_id, step) {
+            return Err("that step can't be marked done on this issue".into());
+        }
+        let supporting = self
+            .diagnose
+            .engine
+            .get(issue_id)
+            .and_then(|i| i.verification.as_ref())
+            .map(|v| v.supporting.clone())
+            .unwrap_or_default();
+        let due = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for test in &supporting {
+            self.diagnose.tests.schedule_rerun(due, issue_id, test);
+        }
+        Ok(if supporting.is_empty() {
+            "noted — watching for recovery".into()
+        } else {
+            format!("noted — re-checking {} test(s) in a minute", supporting.len())
+        })
+    }
+
+    /// Hand finished test runs to the engine and start any re-runs now due.
+    fn collect_diagnose_tests(&mut self, now: std::time::Instant) {
+        for (issue, run) in self.diagnose.tests.poll() {
+            if run.test == "load.idle_vs_loaded" {
+                if let (Some(idle), Some(loaded)) = (
+                    run.measurements.get("idle_rtt_ms"),
+                    run.measurements.get("loaded_rtt_ms"),
+                ) {
+                    self.diagnose.sampler.load_test = Some((now, *idle, *loaded));
+                }
+            }
+            let line = format!("{}: {}", run.test, run.detail);
+            if self.diagnose.engine.record_test(&issue, run) {
+                self.diagnose.set_status(line);
+            }
+        }
+        for (issue, test) in self.diagnose.tests.due_reruns(now) {
+            let _ = self.start_diagnose_test_inner(&issue, &test, true);
         }
     }
 
@@ -3306,6 +3414,36 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
         }
+        KeyCode::Char('t') if app.ui.current_tab == Tab::Diagnose => {
+            if let Some(id) = selected_issue_id(app) {
+                let suggestion = app.diagnose.engine.get(&id).and_then(|i| {
+                    crate::diagnose::next_test::suggest(i, app.diagnose.capability, &i.last_seen)
+                });
+                let status = match suggestion {
+                    Some(s) => app
+                        .start_diagnose_test(&id, s.test.id)
+                        .unwrap_or_else(|e| e),
+                    None => "no test would separate the remaining causes".to_string(),
+                };
+                app.diagnose.set_status(status);
+            }
+        }
+        KeyCode::Char('d') if app.ui.current_tab == Tab::Diagnose => {
+            if let Some(id) = selected_issue_id(app) {
+                let step = app
+                    .diagnose
+                    .engine
+                    .get(&id)
+                    .and_then(crate::ui::diagnose::first_manual_step);
+                let status = match step {
+                    Some(step) => app
+                        .mark_diagnose_step_done(&id, step)
+                        .unwrap_or_else(|e| e),
+                    None => "this issue has no step to carry out by hand".to_string(),
+                };
+                app.diagnose.set_status(status);
+            }
+        }
         KeyCode::Char('o') if app.ui.current_tab == Tab::Diagnose => {
             app.diagnose.show_report = !app.diagnose.show_report;
         }
@@ -3974,7 +4112,8 @@ pub const fn probe_history_len(refresh_ms: u64) -> usize {
 /// cycled the theme instead, which looks like the toggle not working rather
 /// than like a key collision. Theme cycling is still reachable from `,` on
 /// every tab.
-pub(crate) const TABS_WITH_OWN_T: &[Tab] = &[Tab::Dashboard, Tab::Stats, Tab::Timeline];
+pub(crate) const TABS_WITH_OWN_T: &[Tab] =
+    &[Tab::Dashboard, Tab::Stats, Tab::Timeline, Tab::Diagnose];
 
 /// Whether `t` means "next theme" on this tab.
 pub(crate) fn t_cycles_theme(tab: Tab) -> bool {

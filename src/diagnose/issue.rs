@@ -727,6 +727,53 @@ pub struct Issue {
     /// condition is one issue with a count, not N issues.
     #[serde(default)]
     pub recurrence: u32,
+    /// Discriminating tests run against this issue, oldest first.
+    #[serde(default)]
+    pub tests: Vec<super::next_test::TestRun>,
+    /// Set when the user says they carried out a step; tracks whether it
+    /// worked.
+    #[serde(default)]
+    pub verification: Option<Verification>,
+}
+
+/// What became of an issue after the user acted on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyOutcome {
+    /// Closed, and no re-run test still points at the cause.
+    Recovered,
+    /// The headline recovered but a re-run test still points at the cause,
+    /// or it was still settling when time ran out.
+    Partial,
+    NotRecovered,
+    /// It was already recovering before the step; the step gets no credit.
+    RecoveredBeforeAction,
+}
+
+impl VerifyOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifyOutcome::Recovered => "recovered",
+            VerifyOutcome::Partial => "partly recovered",
+            VerifyOutcome::NotRecovered => "not recovered",
+            VerifyOutcome::RecoveredBeforeAction => "was already recovering",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Verification {
+    /// Index of the remediation step the user carried out.
+    pub step: usize,
+    pub action_at: String,
+    /// The verify condition was already holding when they acted.
+    pub holding_at_action: bool,
+    /// `rule/cause` that was on top when they acted.
+    pub top_cause: Option<String>,
+    /// Tests whose last answer supported that cause; re-run to confirm.
+    pub supporting: Vec<String>,
+    pub outcome: Option<VerifyOutcome>,
+    pub decided_at: Option<String>,
 }
 
 impl Issue {
@@ -962,6 +1009,8 @@ mod tests {
             consequences: vec![],
             suppressed_by: None,
             recurrence: 0,
+            tests: vec![],
+            verification: None,
         }
     }
 
