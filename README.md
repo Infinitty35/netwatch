@@ -7,6 +7,7 @@
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/d/netwatch-tui.svg" alt="downloads"></a>
     <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Release"></a>
+    <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/downloads/matthart1983/netwatch/total?label=GitHub%20downloads" alt="GitHub release downloads"></a>
     <a href="https://repology.org/project/netwatch-tui/versions"><img src="https://repology.org/badge/tiny-repos/netwatch-tui.svg" alt="Packaging status"></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="Platform">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
