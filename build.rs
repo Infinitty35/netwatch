@@ -18,7 +18,7 @@ fn main() {
 /// [`platform::npcap::ensure_wpcap`] point the loader at Npcap's directory and
 /// load the DLL itself, with a readable failure if it isn't there.
 ///
-/// Bins and tests: the flags belong to the final link, and `delayimp.lib` supplies
+/// All linked artifacts: the flags belong to the final link, and `delayimp.lib` supplies
 /// the `__delayLoadHelper2` thunk that the `/DELAYLOAD` imports call through.
 /// Keyed on the *target* rather than the host, like the manifest above, so a
 /// cross-compile gets the same treatment; MSVC-only because `/DELAYLOAD` is a
@@ -30,13 +30,12 @@ fn delay_load_wpcap() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
-    println!("cargo:rustc-link-arg-bins=/DELAYLOAD:wpcap.dll");
-    println!("cargo:rustc-link-arg-bins=delayimp.lib");
-    // Test executables too: the lib's unit-test harness links pcap, and CI
-    // runners have the SDK but not Npcap, so a load-time import kills the
-    // test binary with STATUS_DLL_NOT_FOUND before a single test runs.
-    println!("cargo:rustc-link-arg-tests=/DELAYLOAD:wpcap.dll");
-    println!("cargo:rustc-link-arg-tests=delayimp.lib");
+    // Every linked artifact, not just bins: the lib's own unit-test harness
+    // links pcap too, and `-tests` does not reach it. CI runners have the SDK
+    // but not Npcap, so a load-time import killed that binary with
+    // STATUS_DLL_NOT_FOUND before a single test ran.
+    println!("cargo:rustc-link-arg=/DELAYLOAD:wpcap.dll");
+    println!("cargo:rustc-link-arg=delayimp.lib");
 }
 
 /// Embed a Windows application manifest that sets the process **active code
