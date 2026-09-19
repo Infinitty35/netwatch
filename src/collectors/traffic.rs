@@ -27,6 +27,8 @@ pub struct InterfaceTraffic {
     pub tx_retries: Option<u64>,
     pub rx_history: VecDeque<u64>,
     pub tx_history: VecDeque<u64>,
+    /// Actual completion times aligned with both rate histories.
+    pub sample_times: VecDeque<Instant>,
 }
 
 struct TrafficState {
@@ -137,16 +139,24 @@ impl TrafficCollector {
                     (0.0, 0.0)
                 };
 
-                let (mut rx_hist, mut tx_hist) = prev_interfaces
+                let (mut rx_hist, mut tx_hist, mut sample_times) = prev_interfaces
                     .iter()
                     .find(|i| i.name == *name)
-                    .map(|i| (i.rx_history.clone(), i.tx_history.clone()))
+                    .map(|i| {
+                        (
+                            i.rx_history.clone(),
+                            i.tx_history.clone(),
+                            i.sample_times.clone(),
+                        )
+                    })
                     .unwrap_or_default();
 
+                sample_times.push_back(now);
                 rx_hist.push_back(rx_rate as u64);
                 tx_hist.push_back(tx_rate as u64);
                 if rx_hist.len() > SPARKLINE_HISTORY {
                     rx_hist.pop_front();
+                    sample_times.pop_front();
                 }
                 if tx_hist.len() > SPARKLINE_HISTORY {
                     tx_hist.pop_front();
@@ -170,6 +180,7 @@ impl TrafficCollector {
                     tx_retries: cur.tx_retries,
                     rx_history: rx_hist,
                     tx_history: tx_hist,
+                    sample_times,
                 });
             }
 
@@ -220,6 +231,7 @@ mod tests {
             tx_retries: None,
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
+            sample_times: VecDeque::new(),
         }]);
 
         let a = collector.interfaces();

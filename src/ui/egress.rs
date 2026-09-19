@@ -74,6 +74,7 @@ pub const DEFAULT_SORT: crate::sort::TabSortState = crate::sort::TabSortState {
 /// Attention ordering over verdicts — lower is more urgent. Drives both the
 /// risk sort and the rollup verdict a collapsed process shows.
 ///
+/// `Blocked` outranks everything: the operator named it explicitly.
 /// `Undeclared` outranks `Drift`: drift is declared software reaching
 /// somewhere new, whereas an undeclared process is a program the operator
 /// never accounted for at all, under a policy that says they accounted for
@@ -81,12 +82,13 @@ pub const DEFAULT_SORT: crate::sort::TabSortState = crate::sort::TabSortState {
 /// below both — worth surfacing, not yet a finding.
 fn verdict_rank(v: &Verdict) -> u8 {
     match v {
-        Verdict::Undeclared => 0,
-        Verdict::Drift => 1,
-        Verdict::NoRule => 2,
-        Verdict::Asn(_) => 3,
-        Verdict::Ech => 4,
-        _ => 5,
+        Verdict::Blocked(_) => 0,
+        Verdict::Undeclared => 1,
+        Verdict::Drift => 2,
+        Verdict::NoRule => 3,
+        Verdict::Asn(_) => 4,
+        Verdict::Ech => 5,
+        _ => 6,
     }
 }
 
@@ -748,6 +750,7 @@ fn verdict_style(t: &crate::theme::Theme, v: &Verdict, rollup: bool) -> (Color, 
             },
         ),
         Verdict::Ech => (t.status_warn, v.label().to_string()),
+        Verdict::Blocked(_) => (t.status_error, v.label().to_string()),
         Verdict::Drift => (t.status_error, v.label().to_string()),
         Verdict::NoRule => (t.status_warn, v.label().to_string()),
         // A finding, not a gap — the policy said it was complete.

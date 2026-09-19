@@ -902,8 +902,10 @@ dependencies = [
  "pcap",
  "ratatui",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "tls-parser",
  "tokio",
  "toml",
@@ -913,7 +915,9 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "ureq",
+ "url",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

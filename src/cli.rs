@@ -43,7 +43,7 @@ const OPTIONS: &[(&str, bool, &str)] = &[
     ("--daemon", false, "Headless mode (alias: --headless)"),
 ];
 pub fn help() -> String {
-    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
+    let mut text = format!("netwatch {}\n\nUsage: netwatch [OPTIONS] | daemon [OPTIONS]\n       netwatch doctor [--json] [--check-capture] [--interface NAME]\n       netwatch diagnose coverage [--json] [--seconds 1..120] [--test CHECK]\n       netwatch diagnose episodes [DIR]\n       netwatch diagnose replay [--json] <FILE|DIR>...\n       netwatch diagnose features [--out FILE] [--schema FILE] <FILE|DIR>...\n       netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]\n       netwatch resolver status\n       netwatch resolver set <IP> --unmanaged [--seconds 1..3600]\n       netwatch resolver recover --unmanaged\n\nOptions:\n", env!("CARGO_PKG_VERSION"));
     for (name, value, description) in OPTIONS {
         text.push_str(&format!(
             "  {name:<19} {}{description}\n",

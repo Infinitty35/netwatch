@@ -134,6 +134,7 @@ pub const STUN_EVERY: u32 = 12;
 pub const INTERNET_TARGET: &str = "1.1.1.1";
 
 pub struct HealthProber {
+    cancel: crate::diagnose::probe_io::Cancel,
     /// Latest probe results, shared via the `Arc<RwLock<Arc<…>>>` snapshot
     /// pattern (see [`crate::collectors::traffic::TrafficCollector`] for the
     /// canonical example). Readers clone the inner `Arc` in O(1); the probe
@@ -144,6 +145,13 @@ pub struct HealthProber {
     /// Probe cycles so far, for the checks that run less often than every
     /// cycle.
     cycles: Arc<AtomicU32>,
+    nat_outcome: Arc<RwLock<Option<Result<(), String>>>>,
+}
+
+impl Drop for HealthProber {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Default for HealthProber {
@@ -155,6 +163,7 @@ impl Default for HealthProber {
 impl HealthProber {
     pub fn new() -> Self {
         Self {
+            cancel: Default::default(),
             snapshot: Arc::new(RwLock::new(Arc::new(HealthStatus {
                 completed: Default::default(),
                 gateway_rtt_ms: None,
@@ -173,6 +182,7 @@ impl HealthProber {
             }))),
             busy: Arc::new(AtomicBool::new(false)),
             cycles: Arc::new(AtomicU32::new(0)),
+            nat_outcome: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -182,12 +192,23 @@ impl HealthProber {
         Arc::clone(&safe_read(&self.snapshot, "health::status"))
     }
 
+    pub fn nat_outcome(&self) -> Option<Result<(), String>> {
+        self.nat_outcome.read().unwrap().clone()
+    }
+
+    /// Request STUN on the next health cycle, without starting another worker.
+    pub fn request_nat(&self) {
+        self.cycles.store(0, Ordering::SeqCst);
+    }
+
     pub fn probe(&self, gateway: Option<&str>, dns_server: Option<&str>) {
         if self.busy.load(Ordering::SeqCst) {
             return;
         }
         self.busy.store(true, Ordering::SeqCst);
+        let cancel = self.cancel.clone();
         let busy = Arc::clone(&self.busy);
+        let nat_outcome = Arc::clone(&self.nat_outcome);
         let snapshot = Arc::clone(&self.snapshot);
         let gw = gateway.map(|s| s.to_string());
         let dns = dns_server.map(|s| s.to_string());
@@ -196,6 +217,10 @@ impl HealthProber {
             // Each probe block builds a new HealthStatus off the latest
             // published snapshot, then swaps it in. The deep-clone is cheap:
             // `HealthStatus` contains at most ~60 history entries per series.
+            if cancel.cancelled() {
+                busy.store(false, Ordering::SeqCst);
+                return;
+            }
             if let Some(gw) = gw.as_deref() {
                 let (rtt, loss) = run_gateway_probe(gw);
                 let mut next = (**safe_read(&snapshot, "health::probe::read_gw")).clone();
@@ -216,6 +241,10 @@ impl HealthProber {
                 next.completed.gateway = Some(completed);
                 next.completed.gateway_target = Some(gw.to_string());
                 *safe_write(&snapshot, "health::probe::publish_gw") = Arc::new(next);
+            }
+            if cancel.cancelled() {
+                busy.store(false, Ordering::SeqCst);
+                return;
             }
             if let Some(dns) = dns.as_deref() {
                 // Send a real DNS query rather than ICMP. ICMP-pinging the
@@ -262,13 +291,19 @@ impl HealthProber {
                 next.completed.dns_target = Some(dns.to_string());
                 *safe_write(&snapshot, "health::probe::publish_dns") = Arc::new(next);
             }
+            if cancel.cancelled() {
+                busy.store(false, Ordering::SeqCst);
+                return;
+            }
             if cycle.is_multiple_of(STUN_EVERY) {
-                if let Some(nat) = run_stun_probe() {
-                    let mut next = (**safe_read(&snapshot, "health::probe::read_nat")).clone();
-                    next.nat = Some(nat);
-                    next.completed.nat = Some(std::time::Instant::now());
-                    *safe_write(&snapshot, "health::probe::publish_nat") = Arc::new(next);
-                }
+                let result = run_stun_probe(&cancel);
+                *nat_outcome.write().unwrap() =
+                    Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                let nat = result.ok();
+                let mut next = (**safe_read(&snapshot, "health::probe::read_nat")).clone();
+                next.nat = nat;
+                next.completed.nat = Some(std::time::Instant::now());
+                *safe_write(&snapshot, "health::probe::publish_nat") = Arc::new(next);
             }
             {
                 // Same ICMP-then-TCP shape as the gateway probe: on hosts
@@ -692,39 +727,57 @@ fn parse_stun_mapped(buf: &[u8], txid: [u8; 12]) -> Option<std::net::SocketAddrV
 /// A NAT that hands the same public port to both is endpoint-independent
 /// and hole-punching works through it. One that hands each a different port
 /// is address-dependent — symmetric — and only a relay gets through.
-fn run_stun_probe() -> Option<NatProbe> {
-    use std::net::{ToSocketAddrs, UdpSocket};
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+fn run_stun_probe(cancel: &crate::diagnose::probe_io::Cancel) -> Result<NatProbe, String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("STUN socket: {e}"))?;
     sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     let mut mappings = Vec::new();
-    for (n, server) in STUN_SERVERS.iter().enumerate() {
-        let Some(dest) = server
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.find(|a| a.is_ipv4()))
-        else {
-            continue;
-        };
-        let mut txid = [0u8; 12];
-        txid[0] = n as u8;
-        txid[1..9].copy_from_slice(&std::process::id().to_be_bytes()[..4].repeat(2)[..8]);
-        let req = build_stun_binding(txid);
-        if sock.send_to(&req, dest).is_err() {
-            continue;
+    let mut errors = Vec::new();
+    for server in STUN_SERVERS {
+        if cancel.cancelled() {
+            return Err("STUN cancelled".into());
         }
-        let mut buf = [0u8; 256];
-        if let Ok((len, _)) = sock.recv_from(&mut buf) {
-            if let Some(mapped) = parse_stun_mapped(&buf[..len], txid) {
-                mappings.push((server.to_string(), mapped.to_string()));
+        let (host, port) = server.rsplit_once(':').expect("authored STUN endpoint");
+        let dest = match crate::diagnose::probe_io::resolve(host, port.parse().unwrap(), cancel) {
+            Ok(addrs) => match addrs.into_iter().find(|a| a.is_ipv4()) {
+                Some(a) => a,
+                None => {
+                    errors.push(format!("{server}: no IPv4 address"));
+                    continue;
+                }
+            },
+            Err(e) => {
+                errors.push(format!("{server}: resolution: {e}"));
+                continue;
             }
+        };
+        let uuid = uuid::Uuid::new_v4();
+        let mut txid = [0; 12];
+        txid.copy_from_slice(&uuid.as_bytes()[..12]);
+        if let Err(e) = sock.send_to(&build_stun_binding(txid), dest) {
+            errors.push(format!("{server}: send: {e}"));
+            continue;
+        }
+        let mut buf = [0; 256];
+        match sock.recv_from(&mut buf) {
+            Ok((len, source)) if source == dest => match parse_stun_mapped(&buf[..len], txid) {
+                Some(mapped) => mappings.push((server.to_string(), mapped.to_string())),
+                None => errors.push(format!("{server}: invalid mapping response")),
+            },
+            Ok(_) => errors.push(format!("{server}: reply source did not match")),
+            Err(e) => errors.push(format!("{server}: receive: {e}")),
         }
     }
-    if mappings.is_empty() {
-        return None;
+    if mappings.len() != 2 {
+        return Err(format!(
+            "STUN obtained {}/2 mappings: {}",
+            mappings.len(),
+            errors.join("; ")
+        ));
     }
-    let symmetric = mappings.len() >= 2 && mappings.iter().any(|(_, m)| m != &mappings[0].1);
-    Some(NatProbe {
+    let symmetric = mappings[0].1 != mappings[1].1;
+    Ok(NatProbe {
         mappings,
         symmetric,
     })

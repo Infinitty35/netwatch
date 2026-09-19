@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -27,7 +26,14 @@ pub struct TracerouteResult {
 }
 
 pub struct TracerouteRunner {
+    cancel: Mutex<crate::diagnose::probe_io::Cancel>,
     pub result: Arc<Mutex<TracerouteResult>>,
+}
+
+impl Drop for TracerouteRunner {
+    fn drop(&mut self) {
+        self.cancel.lock().unwrap().cancel();
+    }
 }
 
 impl Default for TracerouteRunner {
@@ -39,6 +45,7 @@ impl Default for TracerouteRunner {
 impl TracerouteRunner {
     pub fn new() -> Self {
         Self {
+            cancel: Mutex::new(Default::default()),
             result: Arc::new(Mutex::new(TracerouteResult {
                 completed: None,
                 completed_at: String::new(),
@@ -62,24 +69,32 @@ impl TracerouteRunner {
             r.hops.clear();
         }
 
+        let cancel = crate::diagnose::probe_io::Cancel::default();
+        *self.cancel.lock().unwrap() = cancel.clone();
         let result = Arc::clone(&self.result);
         let target = target.to_string();
-        crate::sandbox::worker::spawn("traceroute", move || match run_traceroute(&target) {
-            Ok(hops) => {
-                let mut r = result.lock().unwrap();
-                r.hops = hops;
-                r.status = TracerouteStatus::Done;
-                r.completed = Some(std::time::Instant::now());
-                r.completed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        crate::sandbox::worker::spawn("traceroute", move || {
+            let outcome = run_traceroute(&target, &cancel);
+            let mut r = result.lock().unwrap();
+            if cancel.cancelled() {
+                return;
             }
-            Err(e) => {
-                let mut r = result.lock().unwrap();
-                r.status = TracerouteStatus::Error(e);
+            match outcome {
+                Ok(hops) => {
+                    r.hops = hops;
+                    r.status = TracerouteStatus::Done;
+                    r.completed = Some(std::time::Instant::now());
+                    r.completed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                }
+                Err(e) => {
+                    r.status = TracerouteStatus::Error(e);
+                }
             }
         });
     }
 
     pub fn clear(&self) {
+        self.cancel.lock().unwrap().cancel();
         let mut r = self.result.lock().unwrap();
         r.target.clear();
         r.status = TracerouteStatus::Idle;
@@ -88,7 +103,10 @@ impl TracerouteRunner {
     }
 }
 
-fn run_traceroute(target: &str) -> Result<Vec<TracerouteHop>, String> {
+fn run_traceroute(
+    target: &str,
+    cancel: &crate::diagnose::probe_io::Cancel,
+) -> Result<Vec<TracerouteHop>, String> {
     // Prefer native UDP+TTL traceroute on Linux — works under the
     // sandbox because Landlock sets NO_NEW_PRIVS, which makes the
     // kernel ignore the setcap on /usr/bin/traceroute. The native
@@ -100,15 +118,21 @@ fn run_traceroute(target: &str) -> Result<Vec<TracerouteHop>, String> {
     // so the subprocess path is preserved there (and macOS has no
     // sandbox today, so the setcap issue doesn't bite).
     #[cfg(target_os = "linux")]
-    if let Some(hops) = run_traceroute_native(target) {
+    if let Some(hops) = run_traceroute_native(target, cancel) {
         return Ok(hops);
     }
 
-    run_traceroute_subprocess(target)
+    if cancel.cancelled() {
+        return Err("traceroute cancelled".into());
+    }
+    run_traceroute_subprocess(target, cancel)
 }
 
 #[cfg(target_os = "linux")]
-fn run_traceroute_native(target: &str) -> Option<Vec<TracerouteHop>> {
+fn run_traceroute_native(
+    target: &str,
+    cancel: &crate::diagnose::probe_io::Cancel,
+) -> Option<Vec<TracerouteHop>> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::sys::socket::{
         recvmsg, sendto, setsockopt, socket,
@@ -163,6 +187,9 @@ fn run_traceroute_native(target: &str) -> Option<Vec<TracerouteHop>> {
         let mut hop_ip: Option<String> = None;
 
         for probe in 0..PROBES {
+            if cancel.cancelled() {
+                return None;
+            }
             let port = BASE_PORT
                 .wrapping_add((ttl as u16).wrapping_mul(PROBES as u16))
                 .wrapping_add(probe as u16);
@@ -261,27 +288,27 @@ fn run_traceroute_native(target: &str) -> Option<Vec<TracerouteHop>> {
 /// path is broken because Landlock sets NO_NEW_PRIVS and the setcap
 /// on /usr/bin/traceroute is ignored on exec — the native path above
 /// is what makes traceroute work under sandbox.
-fn run_traceroute_subprocess(target: &str) -> Result<Vec<TracerouteHop>, String> {
+fn run_traceroute_subprocess(
+    target: &str,
+    cancel: &crate::diagnose::probe_io::Cancel,
+) -> Result<Vec<TracerouteHop>, String> {
     #[cfg(target_os = "windows")]
-    let output = Command::new("tracert")
-        .args(["-d", "-w", "1000", "-h", "30", target])
-        .output()
-        .map_err(|e| spawn_error("tracert", e))?;
-
+    let (binary, args) = ("tracert", vec!["-d", "-w", "1000", "-h", "30", target]);
     #[cfg(not(target_os = "windows"))]
-    let output = Command::new("traceroute")
-        .args(["-n", "-q", "3", "-w", "1", "-m", "30", target])
-        .output()
-        .map_err(|e| spawn_error("traceroute", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            return Err(stderr.trim().to_string());
-        }
+    let (binary, args) = (
+        "traceroute",
+        vec!["-n", "-q", "3", "-w", "1", "-m", "30", target],
+    );
+    let (ok, text) = crate::diagnose::probe_io::command(
+        binary,
+        &args,
+        std::time::Duration::from_secs(95),
+        cancel,
+    )
+    .map_err(|e| spawn_error(binary, e))?;
+    if !ok {
+        return Err(text.trim().to_string());
     }
-
-    let text = String::from_utf8_lossy(&output.stdout);
     Ok(parse_traceroute_output(&text))
 }
 

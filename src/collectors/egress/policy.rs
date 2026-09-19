@@ -37,8 +37,109 @@ pub struct EgressPolicy {
     /// without one.
     #[serde(default)]
     pub strict: bool,
+    /// Which findings raise alerts. `blocked` (the default) alerts only on
+    /// destinations the operator explicitly blocked; allowlist drift and
+    /// undeclared processes stay visible in the Egress tab but stay quiet.
+    /// `all` also alerts on every allowlist miss and on new destinations.
+    ///
+    /// Blocked-only is the default because an allowlist alerts on everything
+    /// it has not yet been taught, and an alert stream that noisy gets muted
+    /// wholesale — taking the findings that matter down with it.
+    #[serde(default, skip_serializing_if = "AlertMode::is_default")]
+    pub alert: AlertMode,
+    /// Destinations blocked for every process, rule or no rule.
+    #[serde(default, skip_serializing_if = "BlockList::is_empty")]
+    pub block: BlockList,
     #[serde(default)]
     pub process: HashMap<String, ProcessRule>,
+}
+
+/// Which egress findings raise alerts. See [`EgressPolicy::alert`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertMode {
+    #[default]
+    Blocked,
+    All,
+}
+
+impl AlertMode {
+    fn is_default(&self) -> bool {
+        *self == AlertMode::Blocked
+    }
+}
+
+/// Destinations the operator has explicitly blocked. A flow matching *any*
+/// entry is blocked — the reverse of an allowlist, where it must match one.
+/// Blocking wins over allowing: an entry here is a deliberate statement, an
+/// allowlist entry may be a promoted observation nobody read.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct BlockList {
+    /// Hostnames, exact or `*.example.com` (which also matches the apex).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sni: Vec<String>,
+    /// Autonomous-system orgs, matched case-insensitively.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asn: Vec<String>,
+    /// Addresses or CIDR blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip: Vec<String>,
+    /// Destination ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
+}
+
+impl BlockList {
+    pub fn is_empty(&self) -> bool {
+        self.sni.is_empty() && self.asn.is_empty() && self.ip.is_empty() && self.ports.is_empty()
+    }
+
+    /// `Some(reason)` if the destination matches an entry. An ECH flow has no
+    /// readable SNI, so only its IP, AS and port can match — a hostname block
+    /// cannot see through ECH, and saying otherwise would be a false promise.
+    pub(super) fn matches(
+        &self,
+        sni: Option<&str>,
+        asn_org: Option<&str>,
+        ip: &str,
+        port: u16,
+    ) -> Option<String> {
+        if let Some(h) = sni {
+            if let Some(p) = self.sni.iter().find(|p| sni_matches(p, h)) {
+                return Some(format!("{h} is blocked ({p})"));
+            }
+        }
+        if let Some(p) = self.ip.iter().find(|p| ip_matches(p, ip)) {
+            return Some(format!("{ip} is blocked ({p})"));
+        }
+        if let Some(a) = asn_org {
+            if self.asn.iter().any(|x| x.eq_ignore_ascii_case(a)) {
+                return Some(format!("{a} is blocked (asn)"));
+            }
+        }
+        if self.ports.contains(&port) {
+            return Some(format!("port {port} is blocked"));
+        }
+        None
+    }
+}
+
+impl EgressPolicy {
+    /// `Some(reason)` if the destination is blocked, globally or by the
+    /// process's own rule. Checked before the allowlist, and for processes
+    /// with no rule at all.
+    pub(super) fn blocked(
+        &self,
+        rule: Option<&ProcessRule>,
+        sni: Option<&str>,
+        asn_org: Option<&str>,
+        ip: &str,
+        port: u16,
+    ) -> Option<String> {
+        self.block
+            .matches(sni, asn_org, ip, port)
+            .or_else(|| rule.and_then(|r| r.block.matches(sni, asn_org, ip, port)))
+    }
 }
 
 /// The allowed egress for one process. An empty list means "unrestricted on
@@ -62,6 +163,9 @@ pub struct ProcessRule {
     /// Allowed destination ports. Empty ⇒ any port.
     #[serde(default)]
     pub allow_ports: Vec<u16>,
+    /// Destinations blocked for this process only: `[process.x.block]`.
+    #[serde(default, skip_serializing_if = "BlockList::is_empty")]
+    pub block: BlockList,
 }
 
 impl ProcessRule {
@@ -296,6 +400,13 @@ const POLICY_HEADER: &str = "# netwatch egress policy (observe → promote → w
                              # default. Turn it on once you believe the list is complete —\n\
                              # it is what lets the linter see a binary nobody declared.\n\
                              #\n\
+                             # Alerts fire only for destinations you block, e.g.\n\
+                             #   [block]                      # every process\n\
+                             #   sni = [\"*.example.net\"]\n\
+                             #   [process.curl.block]          # one process\n\
+                             #   ip = [\"203.0.113.0/24\"]\n\
+                             # alert = \"all\" also alerts on allowlist drift.\n\
+                             #\n\
                              # Promotion never writes allow_asn from an observation: an AS\n\
                              # entry admits every host that AS operates. Widen by hand if\n\
                              # you mean it.\n\n";
@@ -465,6 +576,7 @@ pub fn merge_rules_into_policy_file(
             allow_asn: asn.clone(),
             allow_ip: ip.clone(),
             allow_ports: ports.clone(),
+            ..Default::default()
         };
         let suggestions = wildcard_suggestions(&unioned);
         if !suggestions.is_empty() {
@@ -480,6 +592,11 @@ pub fn merge_rules_into_policy_file(
         t["allow_ports"] = toml_edit::value(toml_edit::Array::from_iter(
             ports.iter().map(|p| i64::from(*p)),
         ));
+        // Carry a hand-written `[process.<name>.block]` across: promotion
+        // only ratifies observed allow entries and must never drop a block.
+        if let Some(block) = existing.and_then(|e| e.get("block")).cloned() {
+            t["block"] = block;
+        }
         doc["process"][name.as_str()] = toml_edit::Item::Table(t);
     }
 

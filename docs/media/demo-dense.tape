@@ -10,8 +10,15 @@
 #
 # Prereqs learned the hard way:
 #   - Dense needs 130x44 or it renders the compact fallback. Width/Height below
-#     were measured, not guessed: `stty size` under vhs at FontSize 14 gives
-#     133x46 for 1250x770, which clears the floor with a little headroom.
+#     were measured, not guessed. Measure them again on any machine that
+#     records this: cell metrics depend on the installed font and the vhs
+#     build, so the pixel sizes are not portable. Record a throwaway tape with
+#     the same FontSize/Padding/Theme that runs `stty size` and read the grid
+#     off the frame. On this machine 1250x770 gives 133x38 — 133 columns clears
+#     the width floor, but 38 rows is six short of 44, and netwatch responds by
+#     dropping the interfaces and latency boxes, leaving the throughput graph
+#     and the connection table alone. That is the compact fallback, and it
+#     records the four-box layout as two. 1250x930 gives 133x47.
 #   - The netwatch theme must be RGB. The Lite demo pins `theme = "terminal"`
 #     so colours come from the user's palette — right there, fatal here. Dense
 #     encodes magnitude as a colour ramp, and a palette-deferring theme flattens
@@ -36,7 +43,7 @@ Output docs/media/demo-dense.gif
 Set Shell "bash"
 Set FontSize 14
 Set Width 1250
-Set Height 770
+Set Height 930
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 30ms
 Set Framerate 10

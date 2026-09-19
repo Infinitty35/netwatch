@@ -14,6 +14,46 @@ pub struct CauseSpec {
 
 pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
+        rule: "ipv6.broken",
+        cause: "ipv6_path_failure",
+        checks: &["paired_family_failures"],
+    },
+    CauseSpec {
+        rule: "captive.portal",
+        cause: "http_interception",
+        checks: &["independent_http_redirects"],
+    },
+    CauseSpec {
+        rule: "pmtu.blackhole",
+        cause: "size_dependent_path_failure",
+        checks: &["mss_restores_transfer"],
+    },
+    CauseSpec {
+        rule: "tcp.connect_failures",
+        cause: "namespace_handshake_failures",
+        checks: &["attempt_fails_increased"],
+    },
+    CauseSpec {
+        rule: "tcp.timewait_exhaustion",
+        cause: "ephemeral_timewait_pressure",
+        checks: &["distinct_timewait_ports"],
+    },
+    CauseSpec {
+        rule: "egress.drift",
+        cause: "new_public_destination",
+        checks: &["outside_learned_baseline"],
+    },
+    CauseSpec {
+        rule: "egress.policy_violation",
+        cause: "blocked_by_policy",
+        checks: &["policy_blocks_destination"],
+    },
+    CauseSpec {
+        rule: "egress.policy_violation",
+        cause: "outside_declared_policy",
+        checks: &["policy_rejects_destination"],
+    },
+    CauseSpec {
         rule: "link.down",
         cause: "unplugged_or_port_down",
         checks: &["carrier"],
@@ -202,6 +242,91 @@ pub const CAUSES: &[CauseSpec] = &[
         cause: "no_aqm_upstream",
         checks: &["rtt_rises_under_our_own_load"],
     },
+    CauseSpec {
+        rule: "target.resolve_failed",
+        cause: "vpn_split_dns_missing",
+        checks: &["vpn_interface_up", "another_resolver_answers"],
+    },
+    CauseSpec {
+        rule: "target.resolve_failed",
+        cause: "resolver_failing",
+        checks: &["lookup_failed_not_nxdomain", "public_names_failing_too"],
+    },
+    CauseSpec {
+        rule: "target.resolve_failed",
+        cause: "name_does_not_exist",
+        checks: &["every_resolver_says_nxdomain", "no_vpn_interface"],
+    },
+    CauseSpec {
+        rule: "target.connect_failed",
+        cause: "service_down",
+        checks: &["connection_refused"],
+    },
+    CauseSpec {
+        rule: "target.connect_failed",
+        cause: "firewall_or_route",
+        checks: &[
+            "no_proxy_configured",
+            "connection_timed_out",
+            "internet_reachable",
+            "other_address_family_also_fails",
+        ],
+    },
+    CauseSpec {
+        rule: "target.connect_failed",
+        cause: "ipv6_path_broken",
+        checks: &["ipv6_fails_ipv4_works"],
+    },
+    CauseSpec {
+        rule: "target.connect_failed",
+        cause: "proxy_required",
+        checks: &["proxy_configured", "connection_timed_out"],
+    },
+    CauseSpec {
+        rule: "target.tls_failed",
+        cause: "cert_untrusted",
+        checks: &["issuer_unknown", "no_proxy_configured"],
+    },
+    CauseSpec {
+        rule: "target.tls_failed",
+        cause: "clock_skew",
+        checks: &["certificate_outside_validity", "clock_offset_large"],
+    },
+    CauseSpec {
+        rule: "target.tls_failed",
+        cause: "tls_intercepting_proxy",
+        checks: &["issuer_unknown", "proxy_configured"],
+    },
+    CauseSpec {
+        rule: "target.http_error",
+        cause: "service_error",
+        checks: &["status_5xx"],
+    },
+    CauseSpec {
+        rule: "target.http_error",
+        cause: "proxy_rejected",
+        checks: &["status_407_or_403", "proxy_configured"],
+    },
+    CauseSpec {
+        rule: "target.slow_stage",
+        cause: "dns_stage_slow",
+        checks: &["dns_stage_above_baseline"],
+    },
+    CauseSpec {
+        rule: "target.slow_stage",
+        cause: "connect_stage_slow",
+        checks: &["connect_stage_above_baseline"],
+    },
+    CauseSpec {
+        rule: "target.slow_stage",
+        cause: "tls_stage_slow",
+        checks: &["tls_stage_above_baseline"],
+    },
+    CauseSpec {
+        rule: "target.slow_stage",
+        cause: "server_stage_slow",
+        checks: &["server_stage_above_baseline"],
+    },
 ];
 
 pub fn lookup(rule: &str, cause: &str) -> Option<&'static CauseSpec> {
@@ -254,8 +379,16 @@ mod tests {
     /// the catalogue is missing from the source.
     #[test]
     fn the_catalogue_matches_the_detector_source() {
-        let src = include_str!("detectors.rs");
-        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let body = [
+            include_str!("detectors.rs"),
+            include_str!("egress.rs"),
+            include_str!("kernel.rs"),
+            include_str!("active.rs"),
+        ]
+        .iter()
+        .map(|src| &src[..src.find("#[cfg(test)]").unwrap()])
+        .collect::<Vec<_>>()
+        .join("\n");
         let literal_ids = |needle: &str| -> HashSet<String> {
             body.match_indices(needle)
                 .filter_map(|(at, _)| {
@@ -270,6 +403,7 @@ mod tests {
             "CheckResult::pass(",
             "CheckResult::fail(",
             "CheckResult::skipped(",
+            "stage_check(",
         ] {
             source_checks.extend(literal_ids(n));
         }

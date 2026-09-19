@@ -130,6 +130,20 @@ pub struct NetwatchConfig {
     /// or 300 MB. Nothing is uploaded. Default true.
     #[serde(default = "default_record_episodes")]
     pub diagnose_record_episodes: bool,
+
+    /// Hosts Diagnose probes stage by stage (DNS, TCP, TLS, HTTP), e.g.
+    ///
+    /// ```toml
+    /// [[diagnose_targets]]
+    /// name = "staging api"
+    /// host = "api.staging.example.internal"
+    /// port = 443
+    /// path = "/healthz"
+    /// expect_status = 200
+    /// ```
+    #[serde(default)]
+    pub diagnose_probes: crate::diagnose::active::Config,
+    pub diagnose_targets: Vec<crate::diagnose::targets::TargetConfig>,
 }
 
 fn default_record_episodes() -> bool {
@@ -196,6 +210,8 @@ impl Default for NetwatchConfig {
             graph_style: default_graph_style(),
             graph_fade: default_graph_fade(),
             diagnose_record_episodes: default_record_episodes(),
+            diagnose_probes: Default::default(),
+            diagnose_targets: Vec::new(),
             sandbox: default_sandbox(),
             tls_keylog_path: String::new(),
             egress_violation_cooldown_secs: default_egress_cooldown(),
@@ -377,6 +393,8 @@ show_geo = false
             egress_violation_cooldown_secs: 120,
             groups_start_collapsed: false,
             diagnose_record_episodes: false,
+            diagnose_probes: Default::default(),
+            diagnose_targets: vec![],
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: NetwatchConfig = toml::from_str(&serialized).unwrap();

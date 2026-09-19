@@ -92,7 +92,7 @@ pub fn bloated_socket(age_secs: u64) -> SocketObs {
         process: Some("ncat".into()),
         rtt_ms: Some(184.0),
         rttvar_ms: Some(41.0),
-        retrans: 12,
+        retrans: Some(12),
         cwnd: Some(64),
         ssthresh: Some(u32::MAX),
         rwnd: Some(262_144),
@@ -105,6 +105,7 @@ pub fn bloated_socket(age_secs: u64) -> SocketObs {
 
 fn healthy_iface() -> IfaceObs {
     IfaceObs {
+        counter_window_secs: None,
         name: IFACE.into(),
         carrier: true,
         rx_errors: 0,
@@ -199,6 +200,10 @@ pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observat
     let socket_bad = secs_from_start >= 331;
 
     Observations {
+        coverage_hints: Default::default(),
+        egress: None,
+        kernel: None,
+        active: Default::default(),
         now: String::new(),
         iface: Some(healthy_iface()),
         gateway: Some(healthy_gateway()),
@@ -230,6 +235,7 @@ pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observat
         loaded_rtt_ms: Some(18.0),
         captive_portal_url: None,
         nat: None,
+        targets: vec![],
     }
 }
 

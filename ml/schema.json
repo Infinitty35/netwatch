@@ -204,6 +204,38 @@
     },
     {
       "group": "check",
+      "name": "check.ipv6.broken.ipv6_path_failure.paired_family_failures"
+    },
+    {
+      "group": "check",
+      "name": "check.captive.portal.http_interception.independent_http_redirects"
+    },
+    {
+      "group": "check",
+      "name": "check.pmtu.blackhole.size_dependent_path_failure.mss_restores_transfer"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.connect_failures.namespace_handshake_failures.attempt_fails_increased"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.timewait_exhaustion.ephemeral_timewait_pressure.distinct_timewait_ports"
+    },
+    {
+      "group": "check",
+      "name": "check.egress.drift.new_public_destination.outside_learned_baseline"
+    },
+    {
+      "group": "check",
+      "name": "check.egress.policy_violation.blocked_by_policy.policy_blocks_destination"
+    },
+    {
+      "group": "check",
+      "name": "check.egress.policy_violation.outside_declared_policy.policy_rejects_destination"
+    },
+    {
+      "group": "check",
       "name": "check.link.down.unplugged_or_port_down.carrier"
     },
     {
@@ -391,6 +423,114 @@
       "name": "check.tcp.bufferbloat_local.no_aqm_upstream.rtt_rises_under_our_own_load"
     },
     {
+      "group": "check",
+      "name": "check.target.resolve_failed.vpn_split_dns_missing.vpn_interface_up"
+    },
+    {
+      "group": "check",
+      "name": "check.target.resolve_failed.vpn_split_dns_missing.another_resolver_answers"
+    },
+    {
+      "group": "check",
+      "name": "check.target.resolve_failed.resolver_failing.lookup_failed_not_nxdomain"
+    },
+    {
+      "group": "check",
+      "name": "check.target.resolve_failed.resolver_failing.public_names_failing_too"
+    },
+    {
+      "group": "check",
+      "name": "check.target.resolve_failed.name_does_not_exist.every_resolver_says_nxdomain"
+    },
+    {
+      "group": "check",
+      "name": "check.target.resolve_failed.name_does_not_exist.no_vpn_interface"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.service_down.connection_refused"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.firewall_or_route.no_proxy_configured"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.firewall_or_route.connection_timed_out"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.firewall_or_route.internet_reachable"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.firewall_or_route.other_address_family_also_fails"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.ipv6_path_broken.ipv6_fails_ipv4_works"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.proxy_required.proxy_configured"
+    },
+    {
+      "group": "check",
+      "name": "check.target.connect_failed.proxy_required.connection_timed_out"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.cert_untrusted.issuer_unknown"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.cert_untrusted.no_proxy_configured"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.clock_skew.certificate_outside_validity"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.clock_skew.clock_offset_large"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.tls_intercepting_proxy.issuer_unknown"
+    },
+    {
+      "group": "check",
+      "name": "check.target.tls_failed.tls_intercepting_proxy.proxy_configured"
+    },
+    {
+      "group": "check",
+      "name": "check.target.http_error.service_error.status_5xx"
+    },
+    {
+      "group": "check",
+      "name": "check.target.http_error.proxy_rejected.status_407_or_403"
+    },
+    {
+      "group": "check",
+      "name": "check.target.http_error.proxy_rejected.proxy_configured"
+    },
+    {
+      "group": "check",
+      "name": "check.target.slow_stage.dns_stage_slow.dns_stage_above_baseline"
+    },
+    {
+      "group": "check",
+      "name": "check.target.slow_stage.connect_stage_slow.connect_stage_above_baseline"
+    },
+    {
+      "group": "check",
+      "name": "check.target.slow_stage.tls_stage_slow.tls_stage_above_baseline"
+    },
+    {
+      "group": "check",
+      "name": "check.target.slow_stage.server_stage_slow.server_stage_above_baseline"
+    },
+    {
       "group": "test",
       "name": "test.dns.alt_resolver"
     },
@@ -421,6 +561,102 @@
     {
       "group": "test",
       "name": "test.load.idle_vs_loaded"
+    },
+    {
+      "group": "target",
+      "name": "target.resolve_ok"
+    },
+    {
+      "group": "target",
+      "name": "target.connect_ok"
+    },
+    {
+      "group": "target",
+      "name": "target.tls_ok"
+    },
+    {
+      "group": "target",
+      "name": "target.http_ok"
+    },
+    {
+      "group": "target",
+      "name": "target.resolve_ms"
+    },
+    {
+      "group": "target",
+      "name": "target.connect_ms"
+    },
+    {
+      "group": "target",
+      "name": "target.tls_ms"
+    },
+    {
+      "group": "target",
+      "name": "target.ttfb_ms"
+    },
+    {
+      "group": "target",
+      "name": "target.status"
+    },
+    {
+      "group": "target",
+      "name": "target.v6_fails_v4_ok"
+    },
+    {
+      "group": "target",
+      "name": "target.lookups_answered"
+    },
+    {
+      "group": "target",
+      "name": "target.lookups_nxdomain"
+    },
+    {
+      "group": "target",
+      "name": "target.lookups_failed"
+    },
+    {
+      "group": "target",
+      "name": "target.proxy_env"
+    },
+    {
+      "group": "target",
+      "name": "target.vpn_up"
+    },
+    {
+      "group": "target",
+      "name": "target.clock_offset_secs"
+    },
+    {
+      "group": "target",
+      "name": "target.error.nxdomain"
+    },
+    {
+      "group": "target",
+      "name": "target.error.resolver_failed"
+    },
+    {
+      "group": "target",
+      "name": "target.error.timeout"
+    },
+    {
+      "group": "target",
+      "name": "target.error.refused"
+    },
+    {
+      "group": "target",
+      "name": "target.error.cert_untrusted"
+    },
+    {
+      "group": "target",
+      "name": "target.error.cert_validity"
+    },
+    {
+      "group": "target",
+      "name": "target.error.cert_name"
+    },
+    {
+      "group": "target",
+      "name": "target.error.http_status"
     },
     {
       "group": "coverage",
@@ -696,6 +932,54 @@
     },
     {
       "group": "coverage",
+      "name": "coverage.tcp.connect_failures.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.connect_failures.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.connect_failures.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.connect_failures.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.timewait_exhaustion.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.timewait_exhaustion.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.timewait_exhaustion.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.tcp.timewait_exhaustion.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.pmtu.blackhole.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.pmtu.blackhole.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.pmtu.blackhole.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.pmtu.blackhole.stale"
+    },
+    {
+      "group": "coverage",
       "name": "coverage.nat.symmetric.available"
     },
     {
@@ -709,6 +993,150 @@
     {
       "group": "coverage",
       "name": "coverage.nat.symmetric.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.ipv6.broken.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.ipv6.broken.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.ipv6.broken.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.ipv6.broken.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.captive.portal.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.captive.portal.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.captive.portal.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.captive.portal.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.resolve_failed.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.resolve_failed.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.resolve_failed.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.resolve_failed.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.connect_failed.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.connect_failed.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.connect_failed.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.connect_failed.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.tls_failed.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.tls_failed.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.tls_failed.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.tls_failed.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.http_error.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.http_error.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.http_error.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.http_error.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.slow_stage.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.slow_stage.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.slow_stage.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.target.slow_stage.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.drift.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.drift.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.drift.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.drift.stale"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.policy_violation.available"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.policy_violation.learning"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.policy_violation.not_measured"
+    },
+    {
+      "group": "coverage",
+      "name": "coverage.egress.policy_violation.stale"
     },
     {
       "group": "context",
@@ -812,10 +1240,58 @@
     },
     {
       "group": "co_open",
+      "name": "open.tcp.connect_failures"
+    },
+    {
+      "group": "co_open",
+      "name": "open.tcp.timewait_exhaustion"
+    },
+    {
+      "group": "co_open",
+      "name": "open.pmtu.blackhole"
+    },
+    {
+      "group": "co_open",
       "name": "open.nat.symmetric"
+    },
+    {
+      "group": "co_open",
+      "name": "open.ipv6.broken"
+    },
+    {
+      "group": "co_open",
+      "name": "open.captive.portal"
+    },
+    {
+      "group": "co_open",
+      "name": "open.target.resolve_failed"
+    },
+    {
+      "group": "co_open",
+      "name": "open.target.connect_failed"
+    },
+    {
+      "group": "co_open",
+      "name": "open.target.tls_failed"
+    },
+    {
+      "group": "co_open",
+      "name": "open.target.http_error"
+    },
+    {
+      "group": "co_open",
+      "name": "open.target.slow_stage"
+    },
+    {
+      "group": "co_open",
+      "name": "open.egress.drift"
+    },
+    {
+      "group": "co_open",
+      "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "c5c979f6d39ffc9c",
+  "hash": "a1b52763644bd9fa",
   "meta_columns": [
     "episode",
     "source",

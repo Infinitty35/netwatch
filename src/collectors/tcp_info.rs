@@ -125,6 +125,7 @@ pub fn normalize_endpoint(s: &str) -> String {
 pub struct TcpInfoCollector {
     snapshot: Arc<RwLock<(Arc<FlowMap>, Option<std::time::Instant>)>>,
     busy: Arc<AtomicBool>,
+    outcome: Arc<RwLock<Option<Result<(), String>>>>,
 }
 
 impl Default for TcpInfoCollector {
@@ -138,6 +139,7 @@ impl TcpInfoCollector {
         Self {
             snapshot: Arc::new(RwLock::new((Arc::new(HashMap::new()), None))),
             busy: Arc::new(AtomicBool::new(false)),
+            outcome: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -152,14 +154,26 @@ impl TcpInfoCollector {
         }
         let snapshot = Arc::clone(&self.snapshot);
         let busy = Arc::clone(&self.busy);
+        let outcome = Arc::clone(&self.outcome);
         crate::sandbox::worker::spawn("tcp-info", move || {
             let collected = collect();
+            *outcome.write().unwrap() = Some(
+                collected
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| format!("{:?}: {e}", e.kind())),
+            );
             let completed = collected.as_ref().ok().map(|_| std::time::Instant::now());
             if let Ok(mut w) = snapshot.write() {
                 *w = (Arc::new(collected.unwrap_or_default()), completed);
             }
             busy.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Latest dump outcome; a successful empty dump is not a collector failure.
+    pub fn outcome(&self) -> Option<Result<(), String>> {
+        self.outcome.read().unwrap().clone()
     }
 
     pub fn snapshot(&self) -> Arc<FlowMap> {

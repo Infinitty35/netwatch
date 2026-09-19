@@ -1,0 +1,316 @@
+# Diagnose: implementation and verification
+
+The rules engine, incident recorder, next-test loop and developer target probes
+are available in the TUI and desktop. Model training and inference are not part
+of this implementation.
+
+## Developer targets
+
+Add targets to netwatch's `config.toml`; reload with **r** in TUI coverage or restart:
+
+```toml
+diagnose_record_episodes = true
+
+[[diagnose_targets]]
+name = "staging api"
+host = "api.staging.example.internal"
+port = 443
+path = "/healthz"
+expect_status = 200
+interval_secs = 60
+```
+
+`tls` defaults to true on port 443. For a plain TCP service, set `http = false`
+and set `tls = false` if appropriate. Without `expect_status`, HTTP 4xx and 5xx
+responses are errors; an explicit expected status takes precedence.
+
+The desktop's **targets** control shows DNS, TCP, TLS and HTTP stages, timings,
+and context. A missing or stale result says it is waiting for a fresh probe.
+Probes use the host's network and direct connections. Process proxy environment,
+GNOME proxy mode, VPN interfaces and container bridges are context; the probe
+is not run inside another application's environment or a container. GNOME PAC
+mode does not establish that a particular target needs a proxy.
+
+TLS uses bundled public WebPKI trust roots, not an application's private trust
+store. Local NTP clock error comes from synchronised `chronyc -n tracking` when
+available; absent context stays unmeasured. An HTTP Date header does not provide
+clock-skew evidence. See the [chrony tracking documentation](https://chrony-project.org/doc/4.8/chronyc.html#tracking).
+
+## Diagnose an incident
+
+1. Select an issue and inspect its evidence and possible causes.
+2. In **Tests and recovery**, run the suggested test or another offered test.
+   Each test shows its expected time, traffic cost and any disruption. Results
+   are recorded with the incident and update its cause ranking.
+3. Carry out a manual remediation, then click **I've done this** beside that
+   step. Netwatch watches for recovery and repeats supporting tests. This
+   records a manual action; it does not execute the instruction.
+4. When the issue closes, the optional cause prompt records what actually
+   happened. You can skip it or change the answer from the issue/history.
+
+## History and sharing
+
+**Incident history** lists the latest 100 saved incidents, including their
+issue timelines, evidence, tests, actions, verification and labels. An active
+incident appears after the recorder finishes it, including its post-roll.
+Reopen history to refresh the list. Saved incidents can be labelled after the
+original engine session has ended.
+
+**Export incidents…** previews the last seven days of saved recordings. It
+shows included episodes, replaced/removed field counts and skipped files before
+**Save pseudonymised bundle** writes the file. No upload occurs. The existing
+report export is a separate local report containing local detail.
+
+Episode exports replace addresses and target identities with keyed tokens,
+hash routing domains and remove free-text notes, diagnostic details, remediation
+text, process names and artifact paths. Local recordings retain their original
+detail. Bundles are written atomically with owner-only file permissions on Unix.
+The per-install key stays on the device; exports are pseudonymised, not anonymous.
+
+CLI equivalents:
+
+```sh
+netwatch diagnose episodes
+netwatch diagnose replay /path/to/episode.json.gz
+netwatch diagnose export --since 7d --dry-run
+netwatch diagnose export --since 7d --out /path/to/bundle.json.gz
+```
+
+## Validation boundary
+
+Automated coverage includes each P3 cause, local HTTP probes, HTTP 407 handling,
+NTP parsing, live/replay parity, redacted target replay, private export files and
+a simulated 24-hour storage/replay check. The simulation is not a live
+24-hour workstation soak.
+
+The privileged namespace fault lab (M1), actual workstation soak and pilot
+release gates remain. Before ML evaluation, add independent monitored-time and
+alert accounting, historical baseline inputs, and an explicit DNS/target family
+mapping. Current QuietSample recordings alone do not establish false alerts per
+device-week or supply a week of baseline history.
+
+
+## Diagnose coverage in terminal Netwatch
+
+Press **9**, then **c** to inspect every check. Use **↑/↓** to select a row.
+The detail shows its input source, source completion age, reason and next action.
+Press **t** on a path, target, NAT or local-bufferbloat row to request a measurement.
+Paths trace `1.1.1.1`; run twice for a comparison. Target rows use
+`[[diagnose_targets]]` from config.toml. STUN uses Google and Cloudflare.
+The manual load test uploads up to 25 MB to `speed.cloudflare.com` and can slow
+other traffic. It requires no open incident. Its result expires after 30 minutes.
+
+For a bounded live audit:
+
+```sh
+cargo run --release -- diagnose coverage
+cargo run --release -- diagnose coverage --json --seconds 30 > coverage.json
+```
+
+The command samples for 10 seconds by default (1–30 seconds allowed), reads
+existing network baselines without updating them, and reports incomplete or
+still-running inputs honestly. It does not reproduce a previous TUI session.
+The JSON is a local audit containing interface and configuration/error details;
+use the incident redaction/export workflow when sharing incident recordings.
+
+Ready, learning, not configured, no subjects, not applicable, awaiting test,
+permission denied, collector failed, stale and not implemented are separate
+states. A successful TCP dump with no established connections is **no subjects**.
+TCP scope is this network namespace. Retransmission checks need a full minute
+of counter observations; lifetime totals and absent fields are not a rate.
+
+Linux Wi-Fi signal collection falls back to `iw dev <interface> link` when the
+legacy `/proc/net/wireless` reading is absent. The fallback has a 500 ms deadline.
+Wireless saturation remains unsupported: PHY bitrate does not measure usable
+capacity. Invalid or duplicate target configurations are explained in coverage;
+changed target configurations cannot reuse old probe results.
+
+All 30 catalogued rules now have implementations. Ready inputs still depend on
+capabilities, configuration and completed measurements; implemented does not mean
+every check applies to this network.
+
+
+## Egress checks
+
+`egress.drift` reports a newly observed public destination after learning a
+process name's destinations for 10 minutes of observed activity. It can use
+persisted destinations with at least 600 observations spanning 10 minutes.
+The session comparison set then stays fixed, so a new destination does not
+immediately become normal just because the program contacts it again.
+This informational finding does not mean the traffic is malicious. Process
+names are not verified executable identities; local/private destinations and
+unattributed connections are outside this check's scope.
+
+`egress.policy_violation` compares observed destinations with the loaded policy
+in `~/.config/netwatch/egress-policy.toml` (or the XDG config location). It warns;
+it does not block connections. No policy is **not configured**; unreadable,
+invalid or unsafe-permission policy files report **collector failed**. Traffic
+without an applicable rule, or with an encrypted destination name, is not
+silently counted as allowed. In strict policy mode, an undeclared process must
+first appear in three profiler observations before it can become a finding.
+
+In Diagnose coverage (**9 → c**), select `egress.policy_violation` and press
+**t** to reload the policy after editing/reviewing it. Reloading an unchanged
+policy preserves the existing notification cooldown. Diagnose never promotes
+learned traffic into permissions or rewrites the policy. The existing Egress
+review workflow remains the place to make deliberate policy changes.
+
+Both rules require distinct completed connection snapshots before opening.
+They retain one incident per process/destination/port, suppress matching drift
+under a policy violation, and require five minutes without the condition before
+closing. Closure can mean the connection disappeared; it does not prove a
+program was repaired. Missing attribution, truncated observations, stale
+samples, failed connection-table commands, lost hostname visibility and
+invalid/missing policy cannot verify a policy fix.
+
+Recordings include the policy digest and contemporaneous verdicts, so replay
+keeps historical policy decisions intact. Export pseudonymizes process and
+destination identities while preserving replay. Observations are bounded to
+128 destinations per frame; a truncated snapshot cannot prove disappearance.
+The shared cause/feature schema was refreshed for compatibility; no ML model
+was added or trained.
+
+## TCP namespace measurements
+
+`tcp.connect_failures` reads Linux `Tcp: AttemptFails`, using a full elapsed
+minute and rejecting counter resets and collection gaps. This counts failed
+**active and passive TCP handshakes in the current network namespace**. It does
+not identify a process or distinguish refusal, timeout and resource exhaustion.
+More than five failures/minute, confirmed by distinct snapshots, opens a finding.
+
+`tcp.timewait_exhaustion` retains its compatibility ID but reports informational
+**TIME_WAIT pressure**. It counts distinct local ports within the configured
+ephemeral range for each local address, and reports the highest occupancy.
+Multiple destinations using the same local port count once. Above 60% opens a
+finding; this does not prove exhaustion because TCP allocation depends on tuples
+and reuse rules. Both checks require measured recovery rather than missing data.
+Linux TCP tables are limited to 4 MiB each; incomplete tables cannot establish
+port occupancy. Interface error counters also require a full elapsed minute,
+independent of the configured screen refresh rate.
+
+Counter semantics: [RFC 1213, tcpAttemptFails](https://www.rfc-editor.org/rfc/rfc1213).
+
+## IPv6, captive portal and PMTU experiments
+
+Open **9 → c**, select a check and press **t**. Each experiment takes three
+separate rounds, with 15 seconds between rounds. Cached screen updates do not
+count as new measurements. **x** cancels active measurements; partial cancelled
+results are discarded. Results expire after two minutes without a new round.
+No active experiment runs automatically by default.
+
+| Check | What establishes a finding | What remains inconclusive |
+|---|---|---|
+| `ipv6.broken` | IPv6 default route and global address exist; IPv4 connects but IPv6 fails for at least two independent configured endpoint pairs | One endpoint fails, or both families fail. An IPv4-only network is not applicable. |
+| `captive.portal` | Independent expected-response HTTP endpoints return redirects in three rounds | Timeouts, server errors, unexpected non-redirect content, or disagreement between endpoints. The finding says interception is suspected. |
+| `pmtu.blackhole` | Small DF ping works, large DF ping times out, a normal HTTP transfer fails, and the same pinned endpoint transfers at least 4096 bytes with MSS 536 | ICMP filtering alone, a dead endpoint, a packet-too-big response, or transfer failure without successful smaller-segment corroboration. |
+
+Portal probes never follow redirects or attempt login. They retain counts and
+outcomes, not redirect locations. HTTP probes use direct connections without a
+proxy and bound response reads to 64 KiB. Probe URLs must be plain HTTP without
+credentials, query strings or fragments. The PMTU experiment changes TCP segment
+size on its own socket only; it does not change the host/interface MTU. Recovery
+requires a working transfer on the same tested path, not a fixed 1400-byte cutoff.
+These selected-endpoint experiments do not suppress unrelated DNS/TCP findings.
+
+Default IPv6 pairs are Cloudflare and Google DNS addresses on TCP 443. Default
+portal endpoints are `connectivitycheck.gstatic.com/generate_204` and
+`cp.cloudflare.com/generate_204`. Configurations permit 2–4 independent pairs or
+HTTP hosts. Per three-round run, the bounds are 24 TCP connections for IPv6,
+12 HTTP requests for portal checks, or six DF pings and six bounded HTTP requests
+for PMTU. On Linux, DNS subprocesses are killed/reaped after three seconds; connections
+and stream operations have separate deadlines. Other platforms keep native name
+resolution behind a three-second caller deadline and a single shared worker; an
+OS lookup already running may continue after cancellation. One active experiment runs at a
+time. Failed experiments do not retry indefinitely.
+
+Add this table to `~/.config/netwatch/config.toml` (or its XDG location):
+
+```toml
+[diagnose_probes]
+trace_target = "1.1.1.1"
+# Optional automatic traces, 30–3600 seconds; omitted means manual only:
+# trace_refresh_secs = 120
+
+# Replace with a controlled HTTP resource returning status 200 and >=4096 bytes:
+# pmtu_url = "http://192.0.2.10:8080/test-data"
+
+# Optional replacements for the built-in IPv6 pairs and portal endpoints:
+# ipv6_pairs = [
+#   { v4 = "1.1.1.1:443", v6 = "[2606:4700:4700::1111]:443" },
+#   { v4 = "8.8.8.8:443", v6 = "[2001:4860:4860::8888]:443" },
+# ]
+# portal_endpoints = [
+#   { url = "http://connectivitycheck.gstatic.com/generate_204", expect_status = 204 },
+#   { url = "http://cp.cloudflare.com/generate_204", expect_status = 204 },
+# ]
+```
+
+Press **r** in coverage to reload Diagnose configuration. A passive CLI audit can
+wait long enough to collect the one-minute TCP window:
+
+```sh
+./target/release/netwatch diagnose coverage --json --seconds 65
+./target/release/netwatch diagnose coverage --json --test ipv6.broken
+./target/release/netwatch diagnose coverage --json --test captive.portal
+```
+
+`--test` runs the requested experiment; without it, the audit does not start these
+experiments. A test audit defaults to 90 seconds; `--seconds` accepts 1–120.
+The JSON includes experiment outcomes and progress. A shorter audit can end
+before three rounds finish; incomplete evidence does not confirm an issue.
+
+## Target setup, baselines and cancellation
+
+```toml
+[[diagnose_targets]]
+name = "development API"
+host = "127.0.0.1"
+port = 8080
+http = true
+tls = false
+path = "/health"
+expect_status = 200
+interval_secs = 60
+enabled = true
+```
+
+On a target coverage row, **[ / ]** selects a configured target. Its DNS, TCP,
+TLS and HTTP stages show timings or failure reasons. **d** enables/disables the
+selected target and saves the setting; **r** reloads edited configuration;
+**t** probes enabled targets now. Disabled targets do not send probe traffic.
+Configuration changes select a separate baseline identity and invalidate cached
+results. A healthy replacement endpoint cannot verify an old endpoint's issue.
+Old recordings without configuration identities remain readable.
+
+Changes to the observed interface/gateway/resolver/subnet fingerprint invalidate
+target, trace, health and active-test results and
+reset the sampler's histories. Cancellation stops new requests and discards
+late results; an operation already in progress may take its bounded timeout to
+return. STUN now reports resolution, send, receive and malformed-response errors,
+and only a complete two-server mapping comparison is usable.
+
+## Reproducible verification
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --examples
+unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py
+cargo run --example diagnose_live_check -- /tmp/netwatch-live-new
+cargo run --example diagnose_active_live -- /tmp/netwatch-active-new
+cargo run --example diagnose_soak -- /tmp/netwatch-soak-new 600
+```
+
+Use new scratch directories for live examples. The fault lab requires Linux,
+unprivileged user/network namespaces, `ip`, `nsenter`, `tc`, `ethtool` and `ping`.
+It changes routes, packet-drop filters and the ephemeral range **only inside its
+throwaway namespace**. It also exercises a socket-denying seccomp policy in the isolated probe process.
+It exercises working and broken IPv6, expected responses,
+redirects, HTTP errors/timeouts, actual dropped-large packets, lower working MTU,
+ICMP filtering, endpoint failure, real TCP handshake counters and port pressure.
+Integration tests verify distinct samples, missing-data safety, recovery,
+recurrence, endpoint scope, old recordings, and full/redacted replay.
+
+The workstation soak records actual observed seconds, stalls, worker count,
+resident memory and state size. Its duration is a bounded stability check, not a
+long-term false-alert-rate estimate. No ML model is trained by these changes.

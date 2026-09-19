@@ -90,6 +90,16 @@ impl EnvProfile {
 /// can't be stored; ages can, and replay turns them back into instants.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeAges {
+    #[serde(default)]
+    pub ipv6: Option<f64>,
+    #[serde(default)]
+    pub portal: Option<f64>,
+    #[serde(default)]
+    pub pmtu: Option<f64>,
+    #[serde(default)]
+    pub kernel: Option<f64>,
+    #[serde(default)]
+    pub egress: Option<f64>,
     pub interface: Option<f64>,
     pub sockets: Option<f64>,
     pub path: Option<f64>,
@@ -97,6 +107,8 @@ pub struct ProbeAges {
     pub dns: Option<f64>,
     pub internet: Option<f64>,
     pub nat: Option<f64>,
+    #[serde(default)]
+    pub targets: Option<f64>,
     pub gateway_target: Option<String>,
     pub dns_target: Option<String>,
 }
@@ -106,6 +118,11 @@ impl ProbeAges {
         let age =
             |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at).as_secs_f64());
         Self {
+            ipv6: age(times.ipv6),
+            portal: age(times.portal),
+            pmtu: age(times.pmtu),
+            kernel: age(times.kernel),
+            egress: age(times.egress),
             interface: age(times.interface),
             sockets: age(times.sockets),
             path: age(times.path),
@@ -113,17 +130,37 @@ impl ProbeAges {
             dns: age(times.health.dns),
             internet: age(times.health.internet),
             nat: age(times.health.nat),
+            targets: age(times.targets),
             gateway_target: times.health.gateway_target.clone(),
             dns_target: times.health.dns_target.clone(),
         }
     }
 
-    fn to_times(&self, now: Instant) -> ObservationTimes {
-        let at = |age: Option<f64>| age.and_then(|a| now.checked_sub(Duration::from_secs_f64(a)));
+    /// Rebuild completion instants for a frame `frame_secs` after `origin`.
+    ///
+    /// Completion times are snapped to a 100ms grid. An age is wall time
+    /// minus a monotonic elapsed, so the same probe result recorded on ten
+    /// ticks gives ten slightly different "frame − age" values; unsnapped,
+    /// replay would count each as a new sample and open issues early.
+    fn to_times(&self, origin: Instant, frame_secs: f64) -> ObservationTimes {
+        let at = |age: Option<f64>| {
+            let secs = ((frame_secs - age?) * 10.0).round() / 10.0;
+            if secs >= 0.0 {
+                origin.checked_add(Duration::from_secs_f64(secs))
+            } else {
+                origin.checked_sub(Duration::from_secs_f64(-secs))
+            }
+        };
         let mut times = ObservationTimes {
+            ipv6: at(self.ipv6),
+            portal: at(self.portal),
+            pmtu: at(self.pmtu),
+            kernel: at(self.kernel),
+            egress: at(self.egress),
             interface: at(self.interface),
             sockets: at(self.sockets),
             path: at(self.path),
+            targets: at(self.targets),
             ..Default::default()
         };
         times.health.gateway = at(self.gateway);
@@ -992,7 +1029,7 @@ pub fn drive(episode: &Episode, mut on_step: impl FnMut(Step<'_>)) {
             continue;
         };
         let now = base + Duration::from_secs_f64((frame.at - t0).max(0.0));
-        let times = frame.ages.to_times(now);
+        let times = frame.ages.to_times(base, frame.at - t0);
         for event in &frame.events {
             engine.apply_event(event);
         }
@@ -1024,6 +1061,7 @@ fn sorted(open: &[OpenIssue]) -> Vec<OpenIssue> {
 /// `netwatch diagnose replay [--json] <FILE|DIR>...`.
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
+        Some("coverage") => super::coverage::command(&args[1..]),
         Some("episodes") => {
             let dir = match args.get(1) {
                 Some(d) => PathBuf::from(d),
@@ -1429,6 +1467,26 @@ mod tests {
     }
 
     #[test]
+    fn one_probe_seen_on_many_frames_replays_as_one_sample() {
+        let origin = Instant::now() + Duration::from_secs(3_600);
+        // The same completion at t=4.0, recorded on frames with sub-ms jitter.
+        let instants: Vec<_> = [(5.0, 1.0003), (6.0, 1.9998), (7.0005, 3.0004)]
+            .iter()
+            .map(|(frame, age)| {
+                ProbeAges {
+                    dns: Some(*age),
+                    ..Default::default()
+                }
+                .to_times(origin, *frame)
+                .health
+                .dns
+                .unwrap()
+            })
+            .collect();
+        assert!(instants.windows(2).all(|w| w[0] == w[1]), "{instants:?}");
+    }
+
+    #[test]
     fn replay_reports_where_a_recording_disagrees() {
         let s = incident();
         let mut ep = s.finished[0].clone();
@@ -1472,6 +1530,32 @@ mod tests {
         command(&args(&["episodes", dir.to_str().unwrap()])).unwrap();
         assert!(render_report(&replay(&back), &path).contains("matches recording"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_simulated_day_of_quiet_time_and_incidents_stays_under_five_megabytes() {
+        let mut session = Session::new();
+        session.recorder.schedule_quiet_sample(T0 + 60.0);
+        session.run(healthy, 6.0 * 3600.0, 5.0);
+        for _ in 0..3 {
+            session.run(|_| 80.0, 600.0, 5.0);
+            session.run(healthy, 5.0 * 3600.0 + 600.0, 5.0);
+        }
+        session.run(healthy, 2.0 * 3600.0, 5.0);
+        assert_eq!(session.at - T0, 86400.0);
+        let dir = std::env::temp_dir().join(format!("nw-day-{}", uuid::Uuid::new_v4()));
+        let mut bytes = 0;
+        assert!(session.finished.len() >= 4);
+        for ep in &session.finished {
+            let path = save(&dir, ep).unwrap();
+            bytes += std::fs::metadata(path).unwrap().len();
+            assert!(replay(ep).matches());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            bytes < 5 * 1024 * 1024,
+            "day of recordings used {bytes} bytes"
+        );
     }
 
     #[test]
@@ -1532,7 +1616,7 @@ mod tests {
                 process: None,
                 rtt_ms: Some(20.0),
                 rttvar_ms: Some(1.0),
-                retrans: i % 4,
+                retrans: Some(i % 4),
                 cwnd: Some(10),
                 ssthresh: None,
                 rwnd: Some(65_535),
@@ -1542,7 +1626,7 @@ mod tests {
                 verdict_age_secs: 0,
             });
         }
-        obs.sockets[50].retrans = 3;
+        obs.sockets[50].retrans = Some(3);
         obs.sockets[50].tx_bps = 1_000.0;
         obs.sockets[3].rwnd = Some(0);
         let zero_window = obs.sockets[3].clone();
@@ -1553,7 +1637,7 @@ mod tests {
         assert!(obs
             .sockets
             .iter()
-            .all(|s| s.retrans == 3 || s.rwnd == Some(0)));
+            .all(|s| s.retrans == Some(3) || s.rwnd == Some(0)));
     }
 
     #[test]

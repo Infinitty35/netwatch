@@ -33,6 +33,10 @@ pub const BASELINED_METRICS: &[(&str, &str)] = &[
     ("dns.rtt_p50", "dns.slow_resolver"),
     ("gateway.rtt", "gateway.rtt_spike"),
     ("path.rtt", "path.rtt_spike"),
+    ("target.resolve_ms", "target.slow_stage"),
+    ("target.connect_ms", "target.slow_stage"),
+    ("target.tls_ms", "target.slow_stage"),
+    ("target.ttfb_ms", "target.slow_stage"),
 ];
 
 /// Negotiated wired link rate from `/sys/class/net/<iface>/speed` (Mb/s).
@@ -83,13 +87,17 @@ fn unix_secs(at: Instant) -> f64 {
 
 #[derive(Default)]
 pub struct LiveSampler {
+    kernel: super::kernel::Collector,
+    egress_tracker: super::egress::Tracker,
     interface_sample: Option<(Instant, IfaceObs)>,
+    network: Option<NetworkFingerprint>,
     pub completed: super::engine::ObservationTimes,
     path_samples: HashMap<String, (Instant, PathObs)>,
     /// Socket key → (verdict, when it started). A verdict has to persist
     /// before it becomes an issue, and only this map knows for how long.
     learned_samples: HashMap<String, Instant>,
     verdict_since: HashMap<String, (SocketVerdict, Instant)>,
+    retrans_history: HashMap<String, RetransWindow>,
     /// Interface name → the last 60 seconds of (errors, drops) deltas. Rules
     /// fire on the rate over that window, not on a lifetime counter (a NIC
     /// that logged 40 errors during boot last month is not a live fault) and
@@ -107,43 +115,50 @@ pub struct LiveSampler {
 /// How long a load test result stands in for a live measurement.
 pub const LOAD_TEST_VALID_SECS: u64 = 30 * 60;
 
-/// A rolling one-minute window of interface counter deltas.
-///
-/// Sized in samples rather than seconds because the caller sets the tick rate;
-/// at netwatch's 1s tick this is exactly a minute.
+/// Counter samples timestamped by the collector, independent of UI tick rate.
 #[derive(Debug)]
 struct IfaceCounters {
     last: (u64, u64),
-    window: std::collections::VecDeque<(u64, u64)>,
+    last_at: Instant,
+    started_at: Instant,
+    window: std::collections::VecDeque<(Instant, u64, u64)>,
 }
-
 impl IfaceCounters {
-    const WINDOW: usize = 60;
-
     fn new(errors: u64, drops: u64) -> Self {
         Self {
             last: (errors, drops),
-            window: std::collections::VecDeque::with_capacity(Self::WINDOW),
+            last_at: Instant::now(),
+            started_at: Instant::now(),
+            window: Default::default(),
         }
     }
-
-    /// Record a counter reading, returning `(errors, drops)` over the window.
-    ///
-    /// `saturating_sub` on both: counters reset when an interface is bounced,
-    /// and a wrapping subtraction there would report billions of errors.
-    fn observe(&mut self, errors: u64, drops: u64) -> (u64, u64) {
+    fn observe(&mut self, at: Instant, errors: u64, drops: u64) -> (u64, u64) {
+        if at < self.last_at
+            || errors < self.last.0
+            || drops < self.last.1
+            || at.saturating_duration_since(self.last_at).as_secs() > 15
+        {
+            self.window.clear();
+            self.started_at = at;
+            self.last = (errors, drops);
+        }
         let delta = (
             errors.saturating_sub(self.last.0),
             drops.saturating_sub(self.last.1),
         );
         self.last = (errors, drops);
-        if self.window.len() == Self::WINDOW {
+        self.last_at = at;
+        self.window.push_back((at, delta.0, delta.1));
+        while self
+            .window
+            .front()
+            .is_some_and(|(old, _, _)| at.saturating_duration_since(*old).as_secs() >= 60)
+        {
             self.window.pop_front();
         }
-        self.window.push_back(delta);
         self.window
             .iter()
-            .fold((0u64, 0u64), |(e, d), (de, dd)| (e + de, d + dd))
+            .fold((0, 0), |(e, d), (_, de, dd)| (e + de, d + dd))
     }
 }
 
@@ -178,6 +193,7 @@ impl LiveSampler {
     /// metric learned under one name and verified under another would be a
     /// silent dead end, and [`BASELINED_METRICS`] is asserted against the rules.
     pub fn readings(&mut self, app: &App) -> Vec<Reading> {
+        self.check_network(app);
         let health = app.health_prober.status();
         let cfg = &app.config_collector.config;
         let mut out = Vec::new();
@@ -201,7 +217,29 @@ impl LiveSampler {
                 out.push(Reading::new("internet", "path.rtt", rtt, at));
             }
         }
+        let (targets, _) = app
+            .diagnose
+            .target_prober
+            .fresh(&app.user_config.diagnose_targets);
+        for (completed, target) in targets {
+            if let Some(at) =
+                self.fresh_reading(&format!("target:{}", target.name), Some(completed))
+            {
+                for (metric, ms) in target.stage_readings() {
+                    out.push(Reading::new(target.baseline_subject(), metric, ms, at));
+                }
+            }
+        }
         out
+    }
+
+    fn targets(&mut self, app: &App) -> Vec<super::targets::TargetObs> {
+        let (fresh, newest) = app
+            .diagnose
+            .target_prober
+            .fresh(&app.user_config.diagnose_targets);
+        self.completed.targets = newest;
+        fresh.into_iter().map(|(_, obs)| obs).collect()
     }
 
     /// The probe's completion time as unix seconds, the first time a fresh
@@ -238,11 +276,23 @@ impl LiveSampler {
     }
 
     pub fn sample(&mut self, app: &App, thresholds: &Thresholds) -> Observations {
+        self.check_network(app);
         self.completed = super::engine::ObservationTimes {
             health: app.health_prober.status().completed.clone(),
             ..Default::default()
         };
+        let (active, active_times, _) = app.diagnose.active_prober.snapshot();
+        self.completed.ipv6 = active_times.ipv6;
+        self.completed.portal = active_times.portal;
+        self.completed.pmtu = active_times.pmtu;
+        let kernel = self.kernel.sample().ok().map(|(at, obs)| {
+            self.completed.kernel = Some(at);
+            obs
+        });
         Observations {
+            active,
+            kernel,
+            coverage_hints: coverage_hints(app),
             now: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             iface: self.iface(app),
             gateway: gateway(app),
@@ -256,7 +306,42 @@ impl LiveSampler {
             loaded_rtt_ms: self.recent_load_test().map(|(_, loaded)| loaded),
             captive_portal_url: None,
             nat: nat(app),
+            targets: self.targets(app),
+            egress: self.egress(app),
         }
+    }
+
+    fn check_network(&mut self, app: &App) {
+        let current = Self::fingerprint(app);
+        if self.network.as_ref().is_some_and(|old| old != &current) {
+            // Measurements and previous paths belong to the network on which
+            // they ran. Never compare a hotspot against the prior office link.
+            *self = Self::default();
+        }
+        self.network = Some(current);
+    }
+
+    fn egress(&mut self, app: &App) -> Option<super::egress::Observation> {
+        let source = app.connection_collector.coverage();
+        let at = source.completed_at?;
+        self.completed.egress = Some(at);
+        if !crate::collectors::health::ProbeTimes::fresh(Some(at), 30) {
+            return None;
+        }
+        let conns = app.connection_collector.connections();
+        let complete = source.collection_succeeded
+            && conns.iter().all(|c| {
+                crate::app::parse_addr_parts(&c.remote_addr)
+                    .0
+                    .is_none_or(|ip| {
+                        crate::collectors::geo::is_private_ip(&ip)
+                            || c.process_name.as_ref().is_some_and(|name| !name.is_empty())
+                    })
+            });
+        Some(
+            self.egress_tracker
+                .sample(&app.egress_profiler, at, complete),
+        )
     }
 
     fn recent_load_test(&self) -> Option<(f64, f64)> {
@@ -283,11 +368,17 @@ impl LiveSampler {
 
         let errors = t.rx_errors + t.tx_errors;
         let drops = t.rx_drops + t.tx_drops;
-        let (errors_per_min, drops_per_min) = self
+        let history = self
             .iface_history
             .entry(t.name.clone())
-            .or_insert_with(|| IfaceCounters::new(errors, drops))
-            .observe(errors, drops);
+            .or_insert_with(|| IfaceCounters::new(errors, drops));
+        let (errors_per_min, drops_per_min) = history.observe(completed?, errors, drops);
+        let counter_window_secs = Some(
+            completed?
+                .saturating_duration_since(history.started_at)
+                .as_secs_f64()
+                .min(60.0),
+        );
 
         let wireless = info.and_then(|i| i.is_wireless).unwrap_or(false);
         // Retries as a share of frames sent over the same minute. Both are
@@ -297,7 +388,7 @@ impl LiveSampler {
                 .wifi_history
                 .entry(t.name.clone())
                 .or_insert_with(|| IfaceCounters::new(retries, t.tx_packets))
-                .observe(retries, t.tx_packets);
+                .observe(completed.unwrap(), retries, t.tx_packets);
             if d_packets == 0 {
                 0.0
             } else {
@@ -312,6 +403,7 @@ impl LiveSampler {
             tx_errors: t.tx_errors,
             rx_dropped: t.rx_drops,
             tx_dropped: t.tx_drops,
+            counter_window_secs,
             errors_per_min,
             drops_per_min,
             // Wired only. A wifi PHY rate moves with every retrain and is
@@ -392,6 +484,7 @@ impl LiveSampler {
         self.completed.sockets = completed;
         if flows.is_empty() || !crate::collectors::health::ProbeTimes::fresh(completed, 30) {
             self.verdict_since.clear();
+            self.retrans_history.clear();
             return vec![];
         }
         let conns = app.connection_collector.connections();
@@ -410,7 +503,12 @@ impl LiveSampler {
                 process: conn.and_then(|c| c.process_name.clone()),
                 rtt_ms: info.rtt_us.map(|us| us as f64 / 1000.0),
                 rttvar_ms: None,
-                retrans: info.total_retrans.unwrap_or(0),
+                retrans: info.total_retrans.and_then(|total| {
+                    self.retrans_history
+                        .entry(format!("{local} → {remote}"))
+                        .or_default()
+                        .observe(completed?, total)
+                }),
                 cwnd: info.cwnd,
                 ssthresh: info.ssthresh,
                 rwnd: info.rwnd,
@@ -436,6 +534,7 @@ impl LiveSampler {
         // Sockets that have gone away lose their history; a new connection to
         // the same peer starts its verdict clock from zero.
         self.verdict_since.retain(|k, _| live_keys.contains(k));
+        self.retrans_history.retain(|k, _| live_keys.contains(k));
         out
     }
 }
@@ -633,37 +732,66 @@ mod tests {
     }
 
     #[test]
+    fn interface_window_uses_seconds_and_discards_unobserved_gaps() {
+        let mut c = IfaceCounters::new(0, 0);
+        let at = c.last_at;
+        for step in 1..=13 {
+            c.observe(
+                at + std::time::Duration::from_secs(step * 5),
+                step * 5,
+                step * 10,
+            );
+        }
+        assert_eq!(
+            c.observe(at + std::time::Duration::from_secs(65), 65, 130),
+            (60, 120)
+        );
+        assert_eq!(
+            c.observe(at + std::time::Duration::from_secs(100), 1000, 2000),
+            (0, 0)
+        );
+    }
+    #[test]
     fn interface_rates_are_per_minute_not_per_tick() {
         let mut c = IfaceCounters::new(1000, 5000);
+        let at = c.last_at;
         for i in 1..=10 {
-            let (e, d) = c.observe(1000 + i, 5000 + 2 * i);
+            let (e, d) = c.observe(
+                at + std::time::Duration::from_secs(i),
+                1000 + i,
+                5000 + 2 * i,
+            );
             assert_eq!((e, d), (i, 2 * i), "the window must accumulate");
         }
         for i in 11..=120 {
-            c.observe(1000 + i, 5000 + 2 * i);
+            c.observe(
+                at + std::time::Duration::from_secs(i),
+                1000 + i,
+                5000 + 2 * i,
+            );
         }
         // errors 1000 + 121, drops 5000 + 2 × 121.
-        let (e, d) = c.observe(1121, 5242);
+        let (e, d) = c.observe(at + std::time::Duration::from_secs(121), 1121, 5242);
         assert_eq!((e, d), (60, 120), "one minute at 1/s errors and 2/s drops");
     }
 
     #[test]
     fn a_counter_reset_does_not_report_billions_of_errors() {
         let mut c = IfaceCounters::new(50_000, 90_000);
-        let (e, d) = c.observe(3, 7);
+        let (e, d) = c.observe(Instant::now(), 3, 7);
         assert_eq!(
             (e, d),
             (0, 0),
             "a reset must not underflow into a huge rate"
         );
-        assert_eq!(c.observe(5, 9), (2, 2));
+        assert_eq!(c.observe(Instant::now(), 5, 9), (2, 2));
     }
 
     #[test]
     fn a_quiet_interface_reports_nothing() {
         let mut c = IfaceCounters::new(10, 20);
         for _ in 0..120 {
-            assert_eq!(c.observe(10, 20), (0, 0));
+            assert_eq!(c.observe(Instant::now(), 10, 20), (0, 0));
         }
     }
 
@@ -715,8 +843,11 @@ mod tests {
             let verify = crate::diagnose::rules::default_verify(rule_id)
                 .unwrap_or_else(|| panic!("{rule_id} has no verify condition"));
             let sigma_form = format!("{metric}_sigma");
+            // A target's four stage timings share one verify: the worst σ.
+            let shared =
+                metric.starts_with("target.") && verify.metric == "target.worst_stage_sigma";
             assert!(
-                verify.metric == *metric || verify.metric == sigma_form,
+                verify.metric == *metric || verify.metric == sigma_form || shared,
                 "{rule_id} verifies on {}, but {metric} is what gets baselined",
                 verify.metric
             );
@@ -730,6 +861,209 @@ mod tests {
         for m in ["dns.rtt_p50", "gateway.rtt", "path.rtt"] {
             assert!(declared.contains(&m), "{m} is emitted but not declared");
         }
-        assert_eq!(declared.len(), 3);
+        for m in [
+            "target.resolve_ms",
+            "target.connect_ms",
+            "target.tls_ms",
+            "target.ttfb_ms",
+        ] {
+            assert!(declared.contains(&m), "{m} is emitted but not declared");
+        }
+        assert_eq!(declared.len(), 7);
+    }
+}
+
+fn coverage_hints(
+    app: &App,
+) -> std::collections::BTreeMap<String, (super::coverage::Availability, String)> {
+    use super::coverage::Availability;
+    let mut hints = std::collections::BTreeMap::new();
+    for rule in ["ipv6.broken", "captive.portal", "pmtu.blackhole"] {
+        if let Err(error) = app.user_config.diagnose_probes.validate(rule) {
+            hints.insert(rule.into(), (Availability::NotConfigured, error));
+        }
+    }
+    let tcp_status = if !crate::collectors::tcp_info::platform_supported() {
+        Some((
+            Availability::Unsupported,
+            "TCP kernel collector is not implemented on this platform".into(),
+        ))
+    } else {
+        match app.tcp_info.outcome() {
+            Some(Err(error)) => Some((
+                if error.starts_with("PermissionDenied:") {
+                    Availability::PermissionDenied
+                } else {
+                    Availability::CollectorFailed
+                },
+                error,
+            )),
+            Some(Ok(())) if app.tcp_info.snapshot().is_empty() => Some((
+                Availability::NoSubjects,
+                "successful TCP dump contained no established sockets in this network namespace"
+                    .into(),
+            )),
+            None => Some((
+                Availability::NotMeasured,
+                "first TCP kernel dump has not completed".into(),
+            )),
+            _ => None,
+        }
+    };
+    let flows = app.tcp_info.snapshot();
+    if !flows.is_empty() {
+        if flows.values().all(|s| s.rwnd.is_none()) {
+            hints.insert(
+                "tcp.zero_window".into(),
+                (
+                    Availability::Unsupported,
+                    "the kernel TCP dump does not expose receive windows for observed sockets"
+                        .into(),
+                ),
+            );
+        }
+        if flows.values().all(|s| s.total_retrans.is_none()) {
+            hints.insert("tcp.retrans_burst".into(), (Availability::Unsupported, "the kernel TCP dump does not expose retransmission counters for observed sockets".into()));
+        }
+    }
+    if let Some(status) = tcp_status {
+        for rule in [
+            "tcp.bufferbloat_remote",
+            "tcp.retrans_burst",
+            "tcp.zero_window",
+        ] {
+            hints.insert(rule.into(), status.clone());
+        }
+    }
+    match app.health_prober.nat_outcome() {
+        Some(Err(error)) => {
+            hints.insert(
+                "nat.symmetric".into(),
+                (Availability::CollectorFailed, error),
+            );
+        }
+        None => {
+            hints.insert(
+                "nat.symmetric".into(),
+                (
+                    Availability::NotMeasured,
+                    "scheduled STUN measurement has not completed".into(),
+                ),
+            );
+        }
+        _ => {}
+    }
+    if !app.user_config.diagnose_targets.is_empty()
+        && app.user_config.diagnose_targets.iter().all(|t| !t.enabled)
+    {
+        for rule in super::rules::CATALOGUE
+            .iter()
+            .filter(|r| r.id.starts_with("target."))
+        {
+            hints.insert(rule.id.into(), (Availability::NotApplicable, "all configured targets are disabled; select one with [/] and press d to enable it".into()));
+        }
+    }
+    let errors = super::targets::validation_errors(&app.user_config.diagnose_targets);
+    if !errors.is_empty() {
+        for rule in super::rules::CATALOGUE
+            .iter()
+            .filter(|r| r.id.starts_with("target."))
+        {
+            hints.insert(
+                rule.id.into(),
+                (Availability::NotConfigured, errors.join("; ")),
+            );
+        }
+    }
+    if app.user_config.diagnose_targets.is_empty() {
+        for rule in super::rules::CATALOGUE
+            .iter()
+            .filter(|r| r.id.starts_with("target."))
+        {
+            hints.insert(
+                rule.id.into(),
+                (
+                    Availability::NotConfigured,
+                    "no [[diagnose_targets]] entries in config.toml".into(),
+                ),
+            );
+        }
+    }
+    if app
+        .interface_info
+        .iter()
+        .any(|i| i.name == app.capture_interface && i.is_wireless == Some(true))
+    {
+        hints.insert(
+            "iface.saturated".into(),
+            (
+                Availability::Unsupported,
+                "wireless usable capacity is not measured; PHY rate is not an internet speed limit"
+                    .into(),
+            ),
+        );
+    }
+    hints
+}
+
+#[derive(Debug, Default)]
+struct RetransWindow {
+    samples: std::collections::VecDeque<(Instant, u32)>,
+}
+impl RetransWindow {
+    fn observe(&mut self, at: Instant, total: u32) -> Option<u32> {
+        if self
+            .samples
+            .back()
+            .is_some_and(|(old_at, old)| at < *old_at || total < *old)
+        {
+            self.samples.clear();
+        }
+        if self.samples.back().is_none_or(|(last, _)| *last != at) {
+            self.samples.push_back((at, total));
+        }
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(t, _)| at.duration_since(*t).as_secs() >= 60)
+        {
+            self.samples.pop_front();
+        }
+        let (first_at, first) = self.samples.front()?;
+        let elapsed = at.duration_since(*first_at).as_secs_f64();
+        // Do not treat an old lifetime total, or a long sampling gap, as a burst.
+        if !(60.0..=75.0).contains(&elapsed) {
+            return None;
+        }
+        Some(((total - first) as f64 * 60.0 / elapsed).round() as u32)
+    }
+}
+
+#[cfg(test)]
+mod retrans_window_tests {
+    use super::*;
+    #[test]
+    fn lifetime_counts_duplicates_and_resets_are_not_bursts() {
+        let start = Instant::now();
+        let mut window = RetransWindow::default();
+        assert_eq!(window.observe(start, 1000), None);
+        assert_eq!(window.observe(start, 1000), None);
+        assert_eq!(
+            window.observe(start + std::time::Duration::from_secs(60), 1000),
+            Some(0)
+        );
+        assert_eq!(
+            window.observe(start + std::time::Duration::from_secs(61), 1012),
+            Some(12)
+        );
+        assert_eq!(
+            window.observe(start + std::time::Duration::from_secs(62), 0),
+            None
+        );
+        assert_eq!(
+            window.observe(start + std::time::Duration::from_secs(162), 500),
+            None
+        );
     }
 }

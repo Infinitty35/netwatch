@@ -471,6 +471,9 @@ pub struct DiagnoseState {
     /// Cursor into `engine.primary()`.
     pub selected: usize,
     pub show_report: bool,
+    pub show_coverage: bool,
+    pub coverage_selected: usize,
+    pub target_selected: usize,
     /// Privileges this process actually holds, resolved once at startup.
     /// Apply steps beyond it are hidden rather than offered and then refused.
     pub capability: crate::diagnose::issue::Capability,
@@ -494,6 +497,11 @@ pub struct DiagnoseState {
     pub episode_dir: Option<std::path::PathBuf>,
     /// Discriminating tests in flight, and re-runs after a step is done.
     pub tests: crate::diagnose::next_test::Runner,
+    /// Stage-by-stage probes of `diagnose_targets`.
+    last_trace_started: Option<std::time::Instant>,
+    probe_network: Option<crate::diagnose::baseline::NetworkFingerprint>,
+    pub active_prober: crate::diagnose::active::Runner,
+    pub target_prober: crate::diagnose::targets::TargetProber,
 }
 
 impl DiagnoseState {
@@ -510,6 +518,9 @@ impl DiagnoseState {
             journal: crate::diagnose::remediation::Journal::load_live(),
             selected: 0,
             show_report: false,
+            show_coverage: false,
+            coverage_selected: 0,
+            target_selected: 0,
             capability: detect_capability(),
             status: None,
             pending_apply: None,
@@ -523,6 +534,10 @@ impl DiagnoseState {
                 crate::diagnose::episode::default_dir()
             },
             tests: Default::default(),
+            target_prober: Default::default(),
+            active_prober: Default::default(),
+            probe_network: None,
+            last_trace_started: None,
         }
     }
 
@@ -690,7 +705,9 @@ impl App {
         Self::prepare_with_config(NetwatchConfig::load())
     }
 
-    fn prepare_with_config(user_config: NetwatchConfig) -> Self {
+    /// Construct shared application state without starting workers. Native
+    /// frontends must call runtime::bootstrap::start on their runtime thread.
+    pub fn prepare_with_config(user_config: NetwatchConfig) -> Self {
         let interface_info = platform::collect_interface_info().unwrap_or_default();
         let mut config_collector = ConfigCollector::new();
         config_collector.update();
@@ -739,7 +756,14 @@ impl App {
         #[cfg(target_os = "linux")]
         let connection_collector = {
             let snapshot = crate::collectors::connections::capture_proc_snapshot();
-            connection_collector.with_proc_snapshot(Arc::new(snapshot))
+            // The broker thread starts here, unconfined, because workers that
+            // poll sockets run sandboxed and cannot read other processes' fds.
+            let broker = crate::collectors::connections::ProcBroker::start(
+                std::time::Duration::from_millis(user_config.refresh_rate_ms.clamp(500, 5000)),
+            );
+            connection_collector
+                .with_proc_snapshot(Arc::new(snapshot))
+                .with_proc_broker(broker)
         };
 
         let ui = AppUiState::from_config(&user_config);
@@ -870,8 +894,68 @@ impl App {
         // Track which network we're on. Moving networks parks the old
         // baselines rather than comparing a hotspot against an office.
         let fingerprint = crate::diagnose::live::LiveSampler::fingerprint(self);
+        if self
+            .diagnose
+            .probe_network
+            .as_ref()
+            .is_some_and(|old| old != &fingerprint)
+        {
+            self.diagnose.target_prober.cancel();
+            self.diagnose.tests.cancel_all();
+            self.health_prober = Default::default();
+            self.traceroute_runner = Default::default();
+            self.diagnose.last_trace_started = None;
+        }
+        self.diagnose.probe_network = Some(fingerprint.clone());
+        self.diagnose.active_prober.context(format!(
+            "{fingerprint:?}:{:?}",
+            self.user_config.diagnose_probes
+        ));
         if !fingerprint.iface.is_empty() {
             self.diagnose.baselines.set_network(fingerprint);
+        }
+
+        if let Some(interval) = self
+            .user_config
+            .diagnose_probes
+            .trace_refresh_secs
+            .filter(|s| (30..=3600).contains(s))
+        {
+            if self
+                .diagnose
+                .last_trace_started
+                .is_none_or(|at| at.elapsed().as_secs() >= interval)
+                && self
+                    .user_config
+                    .diagnose_probes
+                    .trace_target
+                    .parse::<std::net::IpAddr>()
+                    .is_ok()
+            {
+                self.traceroute_runner
+                    .run(&self.user_config.diagnose_probes.trace_target);
+                self.diagnose.last_trace_started = Some(std::time::Instant::now());
+            }
+        }
+        if !self.user_config.diagnose_targets.is_empty() {
+            let env = crate::diagnose::targets::ProbeEnv {
+                resolvers: self
+                    .config_collector
+                    .config
+                    .dns_servers
+                    .iter()
+                    .filter_map(|d| d.parse().ok())
+                    .collect(),
+                vpn_ifaces: self
+                    .interface_info
+                    .iter()
+                    .filter(|i| i.is_up && crate::diagnose::targets::is_vpn_iface(&i.name))
+                    .map(|i| i.name.clone())
+                    .collect(),
+            };
+            self.diagnose
+                .target_prober
+                .probe_due(&self.user_config.diagnose_targets, env);
         }
 
         let mut sampler = std::mem::take(&mut self.diagnose.sampler);
@@ -956,15 +1040,110 @@ impl App {
         // An incident still in progress at quit is worth keeping; write it
         // synchronously, since the process is about to exit.
         let ts = crate::diagnose::engine::format_ts(chrono::Local::now());
-        if let (Some(recorder), Some(dir)) =
-            (self.diagnose.recorder.as_mut(), self.diagnose.episode_dir.as_ref())
-        {
+        if let (Some(recorder), Some(dir)) = (
+            self.diagnose.recorder.as_mut(),
+            self.diagnose.episode_dir.as_ref(),
+        ) {
             if let Some(episode) = recorder.flush(&self.diagnose.engine, &ts) {
                 if let Err(e) = crate::diagnose::episode::save(dir, &episode) {
                     tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved at shutdown");
                 }
             }
         }
+    }
+
+    /// Run a coverage measurement even when no issue has opened yet.
+    pub fn start_coverage_test(&mut self) -> Result<String, String> {
+        let row = self
+            .diagnose
+            .engine
+            .coverage()
+            .rules
+            .get(self.diagnose.coverage_selected)
+            .ok_or_else(|| "coverage has not been sampled yet".to_string())?;
+        if matches!(
+            row.rule.as_str(),
+            "ipv6.broken" | "captive.portal" | "pmtu.blackhole"
+        ) {
+            self.diagnose
+                .active_prober
+                .start(&row.rule, &self.user_config.diagnose_probes)?;
+            return Ok("three rounds started; x cancels. IPv6: up to 24 TCP connects; portal: up to 12 GETs; PMTU: six pings and up to six 64 KiB downloads".into());
+        }
+        if row.rule == "egress.policy_violation" {
+            let path = crate::collectors::egress::default_policy_path()
+                .ok_or_else(|| "no egress policy path".to_string())?;
+            self.egress_profiler.reload_policy(&path);
+            if let Some(error) = self.egress_profiler.policy_error() {
+                return Err(error.into());
+            }
+            return Ok(if self.egress_profiler.has_policy() {
+                "egress policy reloaded; awaiting a fresh connection sample".into()
+            } else {
+                format!("no policy configured at {}", path.display())
+            });
+        }
+        if row.rule.starts_with("path.") {
+            let target = &self.user_config.diagnose_probes.trace_target;
+            if target.parse::<std::net::IpAddr>().is_err() {
+                return Err("diagnose_probes.trace_target must be an IP address".into());
+            }
+            self.traceroute_runner.run(target);
+            self.diagnose.last_trace_started = Some(std::time::Instant::now());
+            return Ok(format!(
+                "tracing {target}; run again for path-change comparison"
+            ));
+        }
+        if row.rule == "nat.symmetric" {
+            self.health_prober.request_nat();
+            let config = &self.config_collector.config;
+            self.health_prober
+                .probe(config.gateway.as_deref(), config.primary_dns().as_deref());
+            return Ok("STUN queued: two UDP mapping probes to Google and Cloudflare".into());
+        }
+        if row.rule.starts_with("target.") {
+            if self.user_config.diagnose_targets.is_empty() {
+                return Err(format!(
+                    "add [[diagnose_targets]] to {}",
+                    crate::config::NetwatchConfig::path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "config.toml".into())
+                ));
+            }
+            self.diagnose.target_prober.probe_now(
+                &self.user_config.diagnose_targets,
+                crate::diagnose::targets::ProbeEnv {
+                    resolvers: self
+                        .config_collector
+                        .config
+                        .dns_servers
+                        .iter()
+                        .filter_map(|d| d.parse().ok())
+                        .collect(),
+                    vpn_ifaces: self
+                        .interface_info
+                        .iter()
+                        .filter(|i| i.is_up && crate::diagnose::targets::is_vpn_iface(&i.name))
+                        .map(|i| i.name.clone())
+                        .collect(),
+                },
+            )?;
+            return Ok("probing configured targets".into());
+        }
+        if row.rule == "tcp.bufferbloat_local" {
+            let mut ctx = crate::diagnose::next_test::Context::new("1.1.1.1".parse().unwrap());
+            ctx.loaded_rtt_delta_ms = self
+                .diagnose
+                .engine
+                .settings()
+                .thresholds
+                .loaded_rtt_delta_ms;
+            self.diagnose
+                .tests
+                .start("coverage", "load.idle_vs_loaded", ctx, false)?;
+            return Ok("load test running: up to 25 MB upload to speed.cloudflare.com".into());
+        }
+        Err(row.next_action().into())
     }
 
     /// Start a discriminating test on an issue. Context is taken from what the
@@ -986,6 +1165,9 @@ impl App {
             .engine
             .get(issue_id)
             .ok_or_else(|| format!("{issue_id} is no longer tracked"))?;
+        if !after_action && !issue.state.is_open() {
+            return Err("this incident has already closed".into());
+        }
         let spec = next_test::lookup(test).ok_or_else(|| format!("no test named {test}"))?;
         if !next_test::offered(issue, self.diagnose.capability)
             .iter()
@@ -1018,7 +1200,12 @@ impl App {
             .and_then(|g| base.get(g, "gateway.rtt"))
             .map(|b| b.mean);
         ctx.path_baseline_ms = base.get("internet", "path.rtt").map(|b| b.mean);
-        ctx.loaded_rtt_delta_ms = self.diagnose.engine.settings().thresholds.loaded_rtt_delta_ms;
+        ctx.loaded_rtt_delta_ms = self
+            .diagnose
+            .engine
+            .settings()
+            .thresholds
+            .loaded_rtt_delta_ms;
         self.diagnose
             .tests
             .start(issue_id, test, ctx, after_action)?;
@@ -1028,7 +1215,11 @@ impl App {
     /// The user says they carried out remediation step `step` (its index).
     /// Re-runs the tests that pointed at the cause a minute later, so recovery
     /// is checked against the same evidence that chose it.
-    pub fn mark_diagnose_step_done(&mut self, issue_id: &str, step: usize) -> Result<String, String> {
+    pub fn mark_diagnose_step_done(
+        &mut self,
+        issue_id: &str,
+        step: usize,
+    ) -> Result<String, String> {
         if !self.diagnose.engine.mark_step_done(issue_id, step) {
             return Err("that step can't be marked done on this issue".into());
         }
@@ -1046,7 +1237,10 @@ impl App {
         Ok(if supporting.is_empty() {
             "noted — watching for recovery".into()
         } else {
-            format!("noted — re-checking {} test(s) in a minute", supporting.len())
+            format!(
+                "noted — re-checking {} test(s) in a minute",
+                supporting.len()
+            )
         })
     }
 
@@ -1062,7 +1256,7 @@ impl App {
                 }
             }
             let line = format!("{}: {}", run.test, run.detail);
-            if self.diagnose.engine.record_test(&issue, run) {
+            if issue == "coverage" || self.diagnose.engine.record_test(&issue, run) {
                 self.diagnose.set_status(line);
             }
         }
@@ -1081,7 +1275,10 @@ impl App {
             .engine
             .get(issue_id)
             .ok_or_else(|| format!("{issue_id} is no longer tracked"))?;
-        if !episode::label_choices(issue).iter().any(|(k, _)| k == cause) {
+        if !episode::label_choices(issue)
+            .iter()
+            .any(|(k, _)| k == cause)
+        {
             return Err(format!("{cause} is not an answer offered for {issue_id}"));
         }
         let label = episode::Label {
@@ -1153,8 +1350,12 @@ impl App {
         if let Some(episode) = finished {
             std::thread::spawn(move || {
                 match episode::save(&dir, &episode) {
-                    Ok(path) => tracing::info!(target: "netwatch::diagnose", path = %path.display(), frames = episode.frames.len(), "episode saved"),
-                    Err(e) => tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved"),
+                    Ok(path) => {
+                        tracing::info!(target: "netwatch::diagnose", path = %path.display(), frames = episode.frames.len(), "episode saved")
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "netwatch::diagnose", error = %e, "episode not saved")
+                    }
                 }
                 episode::prune(
                     &dir,
@@ -1313,7 +1514,8 @@ impl App {
         self.capture_interface = ifaces[next_idx].clone();
     }
 
-    fn arm_incident_recorder(&mut self) {
+    /// Shared recorder action for native frontends.
+    pub fn arm_incident_recorder(&mut self) {
         self.incident_recorder.arm();
         {
             let packets = self.packet_collector.get_packets();
@@ -1365,9 +1567,8 @@ impl App {
             Ok(()) => {
                 // Reload from the file so the effective policy is exactly
                 // what the user would see opening it — merged, not replaced.
-                let loaded = egress::load_policy_file(&path);
-                let ok = loaded.is_some();
-                self.egress_profiler.set_policy(loaded);
+                self.egress_profiler.reload_policy(&path);
+                let ok = self.egress_profiler.has_policy();
                 self.ui.export_status = Some(if ok {
                     format!("Promoted {proc_count} processes — warn on drift active")
                 } else {
@@ -1476,9 +1677,8 @@ impl App {
         };
         match egress::merge_rules_into_policy_file(&[(process.clone(), rule)], &path) {
             Ok(()) => {
-                let loaded = egress::load_policy_file(&path);
-                let ok = loaded.is_some();
-                self.egress_profiler.set_policy(loaded);
+                self.egress_profiler.reload_policy(&path);
+                let ok = self.egress_profiler.has_policy();
                 self.ui.export_status = Some(if ok {
                     format!("Promoted {process}: {diff} — now warning on drift")
                 } else {
@@ -1535,9 +1735,8 @@ impl App {
                 self.ui.export_status = Some(format!("{process} had no rule in the policy file"));
             }
             Ok(_) => {
-                let loaded = egress::load_policy_file(&path);
-                let ok = loaded.is_some();
-                self.egress_profiler.set_policy(loaded);
+                self.egress_profiler.reload_policy(&path);
+                let ok = self.egress_profiler.has_policy();
                 self.ui.export_status = Some(if ok {
                     format!("Removed {process} from policy — no longer checked")
                 } else {
@@ -1551,7 +1750,8 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
-    fn disarm_incident_recorder(&mut self) {
+    /// Shared recorder action for native frontends.
+    pub fn disarm_incident_recorder(&mut self) {
         self.incident_recorder.disarm();
         if self.incident_capture_started && self.packet_collector.capture_requested() {
             self.packet_collector.stop_capture();
@@ -1581,7 +1781,8 @@ impl App {
         self.ui.export_status_tick = 0;
     }
 
-    fn export_incident_bundle(&mut self) {
+    /// Shared recorder action for native frontends.
+    pub fn export_incident_bundle(&mut self) {
         if self.incident_recorder.is_off() {
             self.ui.export_status = Some("Arm the flight recorder first with Shift+R".to_string());
             self.ui.export_status_tick = 0;
@@ -1639,7 +1840,8 @@ impl App {
             .map(|alert| format!("critical {} alert", alert.category.label().to_lowercase()))
     }
 
-    fn tick(&mut self) {
+    /// Advance the shared collectors and diagnostic engine without rendering.
+    pub fn tick(&mut self) {
         // Clear export status after 5 ticks
         if self.ui.export_status.is_some() {
             self.ui.export_status_tick += 1;
@@ -1697,7 +1899,12 @@ impl App {
             self.egress_profiler.observe(&conns, &self.geo_cache);
             for v in self.egress_profiler.take_violations() {
                 self.network_intel.raise_policy_violation(
-                    format!("Egress drift: {} → {}", v.process, v.dest),
+                    format!(
+                        "Egress {}: {} → {}",
+                        if v.blocked { "blocked" } else { "drift" },
+                        v.process,
+                        v.dest
+                    ),
                     format!("{} (port {})", v.reason, v.port),
                 );
             }
@@ -2819,6 +3026,11 @@ fn scroll_tab(app: &mut App, delta: isize) {
             let max = app.process_bandwidth.ranked().len().saturating_sub(1);
             app.ui.scroll.process_scroll = clamp_scroll(app.ui.scroll.process_scroll, delta, max);
         }
+        Tab::Diagnose if app.diagnose.show_coverage => {
+            let max = app.diagnose.engine.coverage().rules.len().saturating_sub(1);
+            app.diagnose.coverage_selected =
+                clamp_scroll(app.diagnose.coverage_selected, delta, max);
+        }
         Tab::Diagnose => {
             let max = app.diagnose.engine.open_count().saturating_sub(1);
             app.diagnose.selected = clamp_scroll(app.diagnose.selected, delta, max);
@@ -3349,7 +3561,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             }
         }
         KeyCode::Char('p') => app.ui.paused = !app.ui.paused,
-        KeyCode::Char('r') => {
+        KeyCode::Char('r')
+            if app.ui.current_tab != Tab::Diagnose || !app.diagnose.show_coverage =>
+        {
             app.traffic.update();
             if let Ok(info) = crate::platform::collect_interface_info() {
                 app.interface_info = info;
@@ -3396,10 +3610,12 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.diagnose.pending_apply = None;
             app.diagnose.set_status("not applied");
         }
-        KeyCode::Enter if app.ui.current_tab == Tab::Diagnose => {
+        KeyCode::Enter if app.ui.current_tab == Tab::Diagnose && !app.diagnose.show_coverage => {
             stage_remediation(app);
         }
-        KeyCode::Char('a') if app.ui.current_tab == Tab::Diagnose => {
+        KeyCode::Char('a')
+            if app.ui.current_tab == Tab::Diagnose && !app.diagnose.show_coverage =>
+        {
             if let Some(id) = selected_issue_id(app) {
                 if app.diagnose.engine.ack(&id) {
                     app.diagnose
@@ -3407,12 +3623,96 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
         }
-        KeyCode::Char('m') if app.ui.current_tab == Tab::Diagnose => {
+        KeyCode::Char('m')
+            if app.ui.current_tab == Tab::Diagnose && !app.diagnose.show_coverage =>
+        {
             if let Some(id) = selected_issue_id(app) {
                 if app.diagnose.engine.mute(&id, 60) {
                     app.diagnose.set_status(format!("{id} muted for 1h"));
                 }
             }
+        }
+        KeyCode::Char('[') | KeyCode::Char(']')
+            if app.ui.current_tab == Tab::Diagnose && app.diagnose.show_coverage =>
+        {
+            let len = app.user_config.diagnose_targets.len().max(1);
+            app.diagnose.target_selected = if key.code == KeyCode::Char(']') {
+                (app.diagnose.target_selected + 1) % len
+            } else {
+                (app.diagnose.target_selected + len - 1) % len
+            };
+        }
+        KeyCode::Char('r') if app.ui.current_tab == Tab::Diagnose && app.diagnose.show_coverage => {
+            let reload = || -> Result<crate::config::NetwatchConfig, String> {
+                let path = crate::config::NetwatchConfig::path()
+                    .ok_or("configuration path unavailable")?;
+                let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                let config: crate::config::NetwatchConfig =
+                    toml::from_str(&text).map_err(|e| e.to_string())?;
+                let errors = crate::diagnose::targets::validation_errors(&config.diagnose_targets);
+                if !errors.is_empty() {
+                    return Err(errors.join("; "));
+                }
+                Ok(config)
+            };
+            match reload() {
+                Ok(config) => {
+                    app.diagnose.target_prober.cancel();
+                    app.diagnose.active_prober.cancel();
+                    app.user_config.diagnose_targets = config.diagnose_targets;
+                    app.user_config.diagnose_probes = config.diagnose_probes;
+                    app.diagnose.target_selected = 0;
+                    app.diagnose.set_status(
+                        "Diagnose configuration reloaded; changed targets learn separate baselines",
+                    );
+                }
+                Err(e) => app
+                    .diagnose
+                    .set_status(format!("configuration unchanged: {e}")),
+            }
+        }
+        KeyCode::Char('d')
+            if app.ui.current_tab == Tab::Diagnose
+                && app.diagnose.show_coverage
+                && app
+                    .diagnose
+                    .engine
+                    .coverage()
+                    .rules
+                    .get(app.diagnose.coverage_selected)
+                    .is_some_and(|r| r.rule.starts_with("target.")) =>
+        {
+            if let Some(target) = app
+                .user_config
+                .diagnose_targets
+                .get_mut(app.diagnose.target_selected)
+            {
+                target.enabled = !target.enabled;
+                match app.user_config.save() {
+                    Ok(()) => {
+                        app.diagnose.target_prober.cancel();
+                        app.diagnose.set_status("target enabled state saved");
+                    }
+                    Err(e) => {
+                        app.user_config.diagnose_targets[app.diagnose.target_selected].enabled =
+                            !app.user_config.diagnose_targets[app.diagnose.target_selected].enabled;
+                        app.diagnose
+                            .set_status(format!("target setting not saved: {e}"));
+                    }
+                }
+            }
+        }
+        KeyCode::Char('x') if app.ui.current_tab == Tab::Diagnose && app.diagnose.show_coverage => {
+            app.diagnose.tests.cancel_all();
+            app.traceroute_runner.clear();
+            app.diagnose.active_prober.cancel();
+            app.diagnose.target_prober.cancel();
+            app.diagnose
+                .set_status("active and target probes cancelled");
+        }
+        KeyCode::Char('t') if app.ui.current_tab == Tab::Diagnose && app.diagnose.show_coverage => {
+            let message = app.start_coverage_test().unwrap_or_else(|error| error);
+            app.diagnose.set_status(message);
         }
         KeyCode::Char('t') if app.ui.current_tab == Tab::Diagnose => {
             if let Some(id) = selected_issue_id(app) {
@@ -3428,7 +3728,9 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 app.diagnose.set_status(status);
             }
         }
-        KeyCode::Char('d') if app.ui.current_tab == Tab::Diagnose => {
+        KeyCode::Char('d')
+            if app.ui.current_tab == Tab::Diagnose && !app.diagnose.show_coverage =>
+        {
             if let Some(id) = selected_issue_id(app) {
                 let step = app
                     .diagnose
@@ -3436,13 +3738,14 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                     .get(&id)
                     .and_then(crate::ui::diagnose::first_manual_step);
                 let status = match step {
-                    Some(step) => app
-                        .mark_diagnose_step_done(&id, step)
-                        .unwrap_or_else(|e| e),
+                    Some(step) => app.mark_diagnose_step_done(&id, step).unwrap_or_else(|e| e),
                     None => "this issue has no step to carry out by hand".to_string(),
                 };
                 app.diagnose.set_status(status);
             }
+        }
+        KeyCode::Char('c') if app.ui.current_tab == Tab::Diagnose => {
+            app.diagnose.show_coverage = !app.diagnose.show_coverage;
         }
         KeyCode::Char('o') if app.ui.current_tab == Tab::Diagnose => {
             app.diagnose.show_report = !app.diagnose.show_report;
@@ -4617,6 +4920,7 @@ mod tests {
             tx_retries: None,
             rx_history: std::collections::VecDeque::new(),
             tx_history: std::collections::VecDeque::new(),
+            sample_times: Default::default(),
         }
     }
 
@@ -5175,7 +5479,7 @@ fn apply_pending_remediation(app: &mut App) {
 /// The old `E` export wrote eight files and 6.4 MB with no on-screen
 /// confirmation and no path, which meant users could not tell it had worked.
 /// This one names the directory in the status line.
-fn export_diagnose_report(app: &mut App) {
+pub fn export_diagnose_report(app: &mut App) {
     if app.diagnose.is_demo() {
         // A report full of scenario data, sitting in a real directory with a
         // real timestamp, is precisely the artefact that later gets mistaken

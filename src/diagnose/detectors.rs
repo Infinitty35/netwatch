@@ -84,7 +84,8 @@ pub struct SocketObs {
     pub process: Option<String>,
     pub rtt_ms: Option<f64>,
     pub rttvar_ms: Option<f64>,
-    pub retrans: u32,
+    /// Retransmissions observed during the preceding minute; missing is not zero.
+    pub retrans: Option<u32>,
     pub cwnd: Option<u32>,
     pub ssthresh: Option<u32>,
     pub rwnd: Option<u32>,
@@ -148,7 +149,7 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
 
     // Retransmits dominate: a socket losing segments is describing the path,
     // not its own queueing, and the retrans rule carries the better causes.
-    if s.retrans >= 5 && rtt < t.socket_rtt_ms {
+    if s.retrans.is_some_and(|n| n >= 5) && rtt < t.socket_rtt_ms {
         return SocketVerdict::RetransBurst;
     }
 
@@ -167,7 +168,7 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
     }
 
     if let (Some(cwnd), Some(ssthresh)) = (s.cwnd, s.ssthresh) {
-        if ssthresh != u32::MAX && cwnd <= ssthresh && s.retrans > 0 {
+        if ssthresh != u32::MAX && cwnd <= ssthresh && s.retrans.is_some_and(|n| n > 0) {
             return SocketVerdict::Congestion;
         }
     }
@@ -205,6 +206,9 @@ pub struct PathObs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IfaceObs {
+    /// None in older recordings whose collector assumed a one-second cadence.
+    #[serde(default)]
+    pub counter_window_secs: Option<f64>,
     pub name: String,
     pub carrier: bool,
     pub rx_errors: u64,
@@ -308,6 +312,11 @@ pub struct GatewayObs {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Observations {
+    pub active: super::active::Observation,
+    pub kernel: Option<super::kernel::Observation>,
+    pub egress: Option<super::egress::Observation>,
+    /// Collector/configuration provenance, recorded so coverage replays faithfully.
+    pub coverage_hints: std::collections::BTreeMap<String, (super::coverage::Availability, String)>,
     pub now: String,
     pub iface: Option<IfaceObs>,
     pub gateway: Option<GatewayObs>,
@@ -321,6 +330,8 @@ pub struct Observations {
     pub captive_portal_url: Option<String>,
     /// The STUN mapping probe, when one has run.
     pub nat: Option<NatObs>,
+    /// Configured developer targets with a fresh probe result.
+    pub targets: Vec<super::targets::TargetObs>,
 }
 
 /// A candidate issue. The engine supplies identity and history.
@@ -338,7 +349,7 @@ pub struct Detection {
 }
 
 impl Detection {
-    fn new(rule: &'static str, subject: Subject) -> Self {
+    pub(super) fn new(rule: &'static str, subject: Subject) -> Self {
         let r = rules::lookup(rule).expect("detector references a catalogued rule");
         Self {
             rule,
@@ -362,6 +373,8 @@ impl Detection {
 /// Run every detector over one set of observations.
 pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let mut out = Vec::new();
+    out.extend(super::active::detect(&obs.active));
+    out.extend(super::kernel::detect(obs.kernel.as_ref()));
     out.extend(detect_link(obs));
     out.extend(detect_gateway(obs, base, t));
     out.extend(detect_dns(obs, base, t));
@@ -369,6 +382,8 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out.extend(detect_sockets(obs, t));
     out.extend(detect_bufferbloat_local(obs, t));
     out.extend(detect_nat(obs));
+    out.extend(super::egress::detect(obs.egress.as_ref()));
+    out.extend(detect_targets(obs, base, t));
     debug_assert!(
         out.iter().all(|d| ids_are_valid(d).is_ok()),
         "{:?}",
@@ -377,6 +392,634 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             .collect::<Vec<_>>()
     );
     out
+}
+
+// ---------------------------------------------------------------- targets
+
+fn detect_targets(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
+    obs.targets
+        .iter()
+        .filter_map(|target| {
+            target_detection(target, obs, base, t).map(|mut d| {
+                d.scope.configuration = target.baseline_key.clone();
+                d
+            })
+        })
+        .collect()
+}
+
+fn target_detection(
+    target: &super::targets::TargetObs,
+    obs: &Observations,
+    base: &BaselineStore,
+    t: &Thresholds,
+) -> Option<Detection> {
+    use super::targets::{LookupOutcome, StageError};
+    let subject = Subject::Target {
+        name: target.name.clone(),
+    };
+    let ctx = &target.context;
+    let proxy = || {
+        if ctx.proxy_env {
+            CheckResult::pass(
+                "proxy_configured",
+                "proxy configured",
+                "HTTP(S)_PROXY applies to this host",
+            )
+        } else {
+            CheckResult::fail(
+                "proxy_configured",
+                "proxy configured",
+                "no proxy in netwatch's environment",
+            )
+        }
+    };
+    let vpn_up = || {
+        if ctx.vpn_ifaces.is_empty() {
+            CheckResult::fail(
+                "vpn_interface_up",
+                "a vpn interface is up",
+                "no tun/wg/tailscale interface",
+            )
+        } else {
+            CheckResult::pass(
+                "vpn_interface_up",
+                "a vpn interface is up",
+                ctx.vpn_ifaces.join(", "),
+            )
+        }
+    };
+    let stage_err = |s: Option<&super::targets::Stage>| s.and_then(|s| s.error.clone());
+
+    let mut d;
+    if let Some(error) = target.resolve.error.clone() {
+        d = Detection::new("target.resolve_failed", subject);
+        d.evidence
+            .push(Evidence::new("target.resolve_ok", 0.0, "").with_window(0, 1));
+        let answered = target
+            .lookups
+            .iter()
+            .filter(|l| l.outcome == LookupOutcome::Answered)
+            .count();
+        let nx = target
+            .lookups
+            .iter()
+            .filter(|l| l.outcome == LookupOutcome::NxDomain)
+            .count();
+        let failed = target
+            .lookups
+            .iter()
+            .filter(|l| matches!(l.outcome, LookupOutcome::ServFail | LookupOutcome::NoReply))
+            .count();
+        let asked = target.lookups.len();
+        let other_answers = if asked == 0 {
+            CheckResult::skipped(
+                "another_resolver_answers",
+                "another resolver knows the name",
+                "no resolvers to ask directly",
+            )
+        } else if answered > 0 {
+            CheckResult::pass(
+                "another_resolver_answers",
+                "another resolver knows the name",
+                format!("{answered} of {asked} resolvers answered"),
+            )
+        } else {
+            CheckResult::fail(
+                "another_resolver_answers",
+                "another resolver knows the name",
+                format!("none of {asked} resolvers answered"),
+            )
+        };
+        d.causes = vec![
+            Cause::new(
+                "vpn_split_dns_missing",
+                "the name belongs to a vpn whose dns isn't being used",
+                vec![vpn_up(), other_answers.clone().weighted(2.0)],
+            ),
+            Cause::new(
+                "resolver_failing",
+                "the resolver couldn't answer",
+                vec![
+                    if error == StageError::ResolverFailed || failed > 0 {
+                        CheckResult::pass(
+                            "lookup_failed_not_nxdomain",
+                            "the lookup failed rather than saying no",
+                            error.label(),
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "lookup_failed_not_nxdomain",
+                            "the lookup failed rather than saying no",
+                            error.label(),
+                        )
+                    },
+                    match obs.dns.as_ref() {
+                        Some(dns) if dns.failure_rate_pct >= 5.0 => CheckResult::pass(
+                            "public_names_failing_too",
+                            "public names are failing too",
+                            format!("{:.0}% of probe queries failed", dns.failure_rate_pct),
+                        ),
+                        Some(_) => CheckResult::fail(
+                            "public_names_failing_too",
+                            "public names are failing too",
+                            "the resolver answers other names",
+                        ),
+                        None => CheckResult::skipped(
+                            "public_names_failing_too",
+                            "public names are failing too",
+                            "no resolver probe",
+                        ),
+                    },
+                ],
+            ),
+            Cause::new(
+                "name_does_not_exist",
+                "the name does not exist — not a network fault",
+                vec![
+                    if asked > 0 && nx == asked {
+                        CheckResult::pass(
+                            "every_resolver_says_nxdomain",
+                            "every resolver says it doesn't exist",
+                            format!("{nx} of {asked} said NXDOMAIN"),
+                        )
+                        .weighted(2.0)
+                    } else if asked == 0 {
+                        CheckResult::skipped(
+                            "every_resolver_says_nxdomain",
+                            "every resolver says it doesn't exist",
+                            "no resolvers to ask directly",
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "every_resolver_says_nxdomain",
+                            "every resolver says it doesn't exist",
+                            format!("{nx} of {asked} said NXDOMAIN"),
+                        )
+                        .weighted(2.0)
+                    },
+                    if ctx.vpn_ifaces.is_empty() {
+                        CheckResult::pass(
+                            "no_vpn_interface",
+                            "no vpn that might know it",
+                            "no vpn interface is up",
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "no_vpn_interface",
+                            "no vpn that might know it",
+                            ctx.vpn_ifaces.join(", "),
+                        )
+                    },
+                ],
+            ),
+        ];
+        d.remediation = vec![
+            Step::instruct(
+                "check the name",
+                "a typo or a retired hostname resolves nowhere; compare with what the service advertises",
+            ),
+            Step::instruct(
+                "if it's a vpn name, route its domain to the vpn's resolver",
+                "e.g. `resolvectl domain <vpn-iface> ~corp.internal`, or reconnect so the client sets it",
+            ),
+        ];
+    } else if let Some(error) = stage_err(target.connect.as_ref()) {
+        d = Detection::new("target.connect_failed", subject);
+        d.evidence
+            .push(Evidence::new("target.connect_ok", 0.0, "").with_window(0, 1));
+        let timed_out = matches!(error, StageError::Timeout | StageError::Unreachable);
+        let v6_only_broken = match (&target.connect_v4, &target.connect_v6) {
+            (Some(v4), Some(v6)) => Some(v4.is_ok() && !v6.is_ok()),
+            _ => None,
+        };
+        d.causes = vec![
+            Cause::new(
+                "service_down",
+                "the service isn't listening — not a network fault",
+                vec![if error == StageError::Refused {
+                    CheckResult::pass(
+                        "connection_refused",
+                        "the host refused the port",
+                        "connection refused: the host is up",
+                    )
+                    .weighted(2.0)
+                } else {
+                    CheckResult::fail(
+                        "connection_refused",
+                        "the host refused the port",
+                        error.label(),
+                    )
+                    .weighted(2.0)
+                }],
+            ),
+            Cause::new(
+                "firewall_or_route",
+                "a firewall or route is dropping the connection",
+                vec![
+                    if ctx.proxy_env {
+                        CheckResult::fail(
+                            "no_proxy_configured",
+                            "no proxy configured",
+                            "a configured proxy may be required for this destination",
+                        )
+                    } else {
+                        CheckResult::pass(
+                            "no_proxy_configured",
+                            "no proxy configured",
+                            "no proxy applies to this destination",
+                        )
+                    },
+                    if timed_out {
+                        CheckResult::pass(
+                            "connection_timed_out",
+                            "the connection timed out",
+                            error.label(),
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "connection_timed_out",
+                            "the connection timed out",
+                            error.label(),
+                        )
+                    },
+                    match obs.gateway.as_ref().and_then(|g| g.internet_reachable) {
+                        Some(true) => CheckResult::pass(
+                            "internet_reachable",
+                            "the internet is reachable",
+                            "the internet probe answered",
+                        ),
+                        Some(false) => CheckResult::fail(
+                            "internet_reachable",
+                            "the internet is reachable",
+                            "nothing beyond the gateway answers",
+                        ),
+                        None => CheckResult::skipped(
+                            "internet_reachable",
+                            "the internet is reachable",
+                            "no internet probe",
+                        ),
+                    },
+                    match v6_only_broken {
+                        Some(true) => CheckResult::fail(
+                            "other_address_family_also_fails",
+                            "the other address family fails too",
+                            "ipv4 connects, so the host is reachable",
+                        ),
+                        Some(false) => CheckResult::pass(
+                            "other_address_family_also_fails",
+                            "the other address family fails too",
+                            "ipv4 and ipv6 both fail",
+                        ),
+                        None => CheckResult::skipped(
+                            "other_address_family_also_fails",
+                            "the other address family fails too",
+                            "the name has only one address family",
+                        ),
+                    },
+                ],
+            ),
+            Cause::new(
+                "ipv6_path_broken",
+                "ipv6 to this host is broken while ipv4 works",
+                vec![match v6_only_broken {
+                    Some(true) => CheckResult::pass(
+                        "ipv6_fails_ipv4_works",
+                        "ipv6 fails but ipv4 works",
+                        "the v4 address connected",
+                    )
+                    .weighted(2.0),
+                    Some(false) => CheckResult::fail(
+                        "ipv6_fails_ipv4_works",
+                        "ipv6 fails but ipv4 works",
+                        "both families behave the same",
+                    )
+                    .weighted(2.0),
+                    None => CheckResult::skipped(
+                        "ipv6_fails_ipv4_works",
+                        "ipv6 fails but ipv4 works",
+                        "the name has only one address family",
+                    ),
+                }],
+            ),
+            Cause::new(
+                "proxy_required",
+                "direct connections are blocked; a proxy is required",
+                vec![
+                    proxy(),
+                    if timed_out {
+                        CheckResult::pass(
+                            "connection_timed_out",
+                            "the connection timed out",
+                            error.label(),
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "connection_timed_out",
+                            "the connection timed out",
+                            error.label(),
+                        )
+                    },
+                ],
+            ),
+        ];
+        d.remediation = vec![
+            Step::instruct(
+                "check the service is running",
+                "a refused connection means the host answered and nothing listens on that port",
+            ),
+            Step::instruct(
+                "try the path from outside this network",
+                "a timeout that only happens here points at a firewall, VPN route or required proxy",
+            ),
+        ];
+    } else if let Some(error) = stage_err(target.tls_stage.as_ref()) {
+        d = Detection::new("target.tls_failed", subject);
+        d.evidence
+            .push(Evidence::new("target.tls_ok", 0.0, "").with_window(0, 1));
+        let issuer_unknown = || {
+            if error == StageError::CertUntrusted {
+                CheckResult::pass(
+                    "issuer_unknown",
+                    "the certificate's issuer isn't trusted",
+                    error.label(),
+                )
+            } else {
+                CheckResult::fail(
+                    "issuer_unknown",
+                    "the certificate's issuer isn't trusted",
+                    error.label(),
+                )
+            }
+        };
+        d.causes = vec![
+            Cause::new(
+                "cert_untrusted",
+                "the server's certificate isn't from a trusted issuer",
+                vec![
+                    issuer_unknown(),
+                    match ctx.proxy_env {
+                        false => CheckResult::pass(
+                            "no_proxy_configured",
+                            "no proxy in the way",
+                            "no proxy configured",
+                        ),
+                        true => CheckResult::fail(
+                            "no_proxy_configured",
+                            "no proxy in the way",
+                            "a proxy is configured",
+                        ),
+                    },
+                ],
+            ),
+            Cause::new(
+                "clock_skew",
+                "this machine's clock is wrong",
+                vec![
+                    if matches!(error, StageError::CertExpired | StageError::CertNotYetValid) {
+                        CheckResult::pass(
+                            "certificate_outside_validity",
+                            "the certificate looks expired or not yet valid",
+                            error.label(),
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "certificate_outside_validity",
+                            "the certificate looks expired or not yet valid",
+                            error.label(),
+                        )
+                    },
+                    match ctx.clock_offset_secs {
+                        Some(o) if o.abs() > 300.0 => CheckResult::pass(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            format!("{o:+.0}s against the local NTP service"),
+                        ),
+                        Some(o) => CheckResult::fail(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            format!("{o:+.0}s"),
+                        ),
+                        None => CheckResult::skipped(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            "no synchronised local NTP status available",
+                        ),
+                    },
+                ],
+            ),
+            Cause::new(
+                "tls_intercepting_proxy",
+                "a proxy or security product is intercepting tls",
+                vec![issuer_unknown(), proxy()],
+            ),
+        ];
+        d.remediation = vec![Step::instruct(
+            "check the certificate chain and this machine's clock",
+            "`openssl s_client -connect host:port -servername host` shows the issuer; `timedatectl` shows sync",
+        )];
+    } else if let Some(StageError::HttpStatus { status }) = stage_err(target.http_stage.as_ref()) {
+        d = Detection::new("target.http_error", subject);
+        d.evidence
+            .push(Evidence::new("target.http_status", f64::from(status), "").with_window(0, 1));
+        d.evidence
+            .push(Evidence::new("target.http_ok", 0.0, "").with_window(0, 1));
+        d.causes = vec![
+            Cause::new(
+                "service_error",
+                "the service itself is failing — not a network fault",
+                vec![if (500..600).contains(&status) {
+                    CheckResult::pass(
+                        "status_5xx",
+                        "the server reports its own error",
+                        format!("http {status}"),
+                    )
+                    .weighted(2.0)
+                } else {
+                    CheckResult::fail(
+                        "status_5xx",
+                        "the server reports its own error",
+                        format!("http {status}"),
+                    )
+                    .weighted(2.0)
+                }],
+            ),
+            Cause::new(
+                "proxy_rejected",
+                "a proxy rejected the request",
+                vec![
+                    if status == 407 || status == 403 {
+                        CheckResult::pass(
+                            "status_407_or_403",
+                            "an access-denied status",
+                            format!("http {status}"),
+                        )
+                    } else {
+                        CheckResult::fail(
+                            "status_407_or_403",
+                            "an access-denied status",
+                            format!("http {status}"),
+                        )
+                    },
+                    proxy(),
+                ],
+            ),
+        ];
+        d.remediation = vec![Step::escalate(
+            "tell whoever runs the service",
+            "the network delivered the request; the answer was an error",
+        )];
+    } else {
+        // Everything worked. Slower than usual?
+        let stages = [
+            (
+                "dns_stage_slow",
+                "target.resolve_ms",
+                Some(&target.resolve),
+                "resolve",
+            ),
+            (
+                "connect_stage_slow",
+                "target.connect_ms",
+                target.connect.as_ref(),
+                "connect",
+            ),
+            (
+                "tls_stage_slow",
+                "target.tls_ms",
+                target.tls_stage.as_ref(),
+                "tls",
+            ),
+            (
+                "server_stage_slow",
+                "target.ttfb_ms",
+                target.http_stage.as_ref(),
+                "first byte",
+            ),
+        ];
+        let sigmas: Vec<_> = stages
+            .iter()
+            .map(|(cause, metric, stage, word)| {
+                let ms = stage.and_then(|s| s.ms);
+                let b = base.get(target.baseline_subject(), metric);
+                (
+                    *cause,
+                    *word,
+                    ms,
+                    b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
+                    b.map(|b| b.mean),
+                )
+            })
+            .collect();
+        let worst = sigmas
+            .iter()
+            .filter_map(|s| s.3.map(|sig| (s, sig)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        if worst.1 < t.sigma_k {
+            return None;
+        }
+        d = Detection::new("target.slow_stage", subject);
+        let (_, word, ms, _, mean) = worst.0;
+        let mut ev = Evidence::new(
+            format!("target.{}_ms", word.replace(' ', "_")),
+            ms.unwrap_or_default(),
+            "ms",
+        );
+        if let Some(mean) = mean {
+            ev = ev.with_baseline(*mean, 0.0);
+        }
+        d.evidence.push(ev);
+        d.evidence
+            .push(Evidence::new("target.worst_stage_sigma", worst.1, "σ"));
+        let stage_check = |id: &'static str, cause: &str| {
+            let (_, word, ms, sigma, _) = sigmas
+                .iter()
+                .find(|s| s.0 == cause)
+                .expect("every stage is listed");
+            stage_result(id, word, *ms, *sigma, t.sigma_k)
+        };
+        d.causes = vec![
+            Cause::new(
+                "dns_stage_slow",
+                "name resolution got slower",
+                vec![stage_check("dns_stage_above_baseline", "dns_stage_slow")],
+            ),
+            Cause::new(
+                "connect_stage_slow",
+                "connecting got slower",
+                vec![stage_check(
+                    "connect_stage_above_baseline",
+                    "connect_stage_slow",
+                )],
+            ),
+            Cause::new(
+                "tls_stage_slow",
+                "the tls handshake got slower",
+                vec![stage_check("tls_stage_above_baseline", "tls_stage_slow")],
+            ),
+            Cause::new(
+                "server_stage_slow",
+                "the server is slower to answer",
+                vec![stage_check(
+                    "server_stage_above_baseline",
+                    "server_stage_slow",
+                )],
+            ),
+        ];
+        d.remediation = vec![Step::instruct(
+            "compare with the service's own latency",
+            "a slow first byte with fast connect and tls is the server, not the network",
+        )];
+    }
+
+    // What isn't a network fault shouldn't read like one.
+    let top = d
+        .causes
+        .iter()
+        .filter_map(|c| c.score().map(|s| (c.id.as_str(), s)))
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((id, score)) = top {
+        if score >= 0.6 && ["service_down", "name_does_not_exist", "service_error"].contains(&id) {
+            d.severity = Severity::Info;
+            d.scope.note = Some("not a network fault".into());
+        }
+    }
+    Some(d)
+}
+
+/// One stage of a target against its baseline. Ids are literals at the call
+/// site, which the catalogue scan reads.
+fn stage_result(
+    id: &'static str,
+    word: &str,
+    ms: Option<f64>,
+    sigma: Option<f64>,
+    k: f64,
+) -> CheckResult {
+    let name = format!("{word} is slower than usual");
+    match sigma {
+        Some(s) if s >= k => CheckResult {
+            id: id.into(),
+            name,
+            passed: Some(true),
+            detail: format!("{:.0}ms, {s:.1}σ above baseline", ms.unwrap_or_default()),
+            weight: 1.0,
+        },
+        Some(s) => CheckResult {
+            id: id.into(),
+            name,
+            passed: Some(false),
+            detail: format!("{s:.1}σ"),
+            weight: 1.0,
+        },
+        None => CheckResult {
+            id: id.into(),
+            name,
+            passed: None,
+            detail: "no baseline for this stage yet".into(),
+            weight: 1.0,
+        },
+    }
 }
 
 /// Every cause id valid, unique within its detection and catalogued under its
@@ -1217,6 +1860,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     d.remediation = dns_remediation(dns);
     d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
     d.scope = Scope {
+        configuration: None,
         processes: vec![],
         destinations: 0,
         flows: 0,
@@ -1599,8 +2243,10 @@ fn socket_detection(
             let mut d = Detection::new("tcp.bufferbloat_remote", subject);
             d.evidence
                 .push(Evidence::new("tcp.socket_rtt", rtt, "ms").with_window(30, 30));
-            d.evidence
-                .push(Evidence::new("tcp.retrans", s.retrans as f64, "").with_window(30, 30));
+            if let Some(retrans) = s.retrans {
+                d.evidence
+                    .push(Evidence::new("tcp.retrans", retrans as f64, "").with_window(60, 60));
+            }
             d.causes = vec![
                 Cause::new(
                     "receiver_queueing",
@@ -1669,7 +2315,7 @@ fn socket_detection(
         SocketVerdict::RetransBurst => {
             let mut d = Detection::new("tcp.retrans_burst", subject);
             d.evidence.push(
-                Evidence::new("tcp.retrans_rate", s.retrans as f64, "/min").with_window(60, 60),
+                Evidence::new("tcp.retrans_rate", s.retrans? as f64, "/min").with_window(60, 60),
             );
             d.causes = vec![Cause::new(
                 "packet_loss",
@@ -1677,7 +2323,10 @@ fn socket_detection(
                 vec![CheckResult::pass(
                     "retransmits_observed",
                     "retransmits observed",
-                    format!("{} retransmits on this socket", s.retrans),
+                    format!(
+                        "{} retransmits in the last minute on this socket",
+                        s.retrans?
+                    ),
                 )],
             )];
             d.remediation = vec![Step::instruct(
@@ -1738,6 +2387,7 @@ fn socket_detection(
     };
 
     d.scope = Scope {
+        configuration: None,
         processes: s.process.iter().cloned().collect(),
         destinations: 1,
         flows: 1,
@@ -1982,6 +2632,7 @@ mod tests {
     #[test]
     fn weak_wifi_fires_on_signal_or_retries_and_only_on_wireless() {
         let iface = |wireless: bool, signal: Option<i32>, retry: Option<f64>| IfaceObs {
+            counter_window_secs: None,
             name: "wlan0".into(),
             carrier: true,
             rx_errors: 0,
@@ -2151,7 +2802,7 @@ mod tests {
             process: Some("ncat".into()),
             rtt_ms: Some(184.0),
             rttvar_ms: Some(40.0),
-            retrans: 12,
+            retrans: Some(12),
             cwnd: Some(10),
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),
@@ -2185,7 +2836,7 @@ mod tests {
         let mut s = bloated_socket();
         s.tx_bps = 0.0;
         s.rx_bps = 0.0;
-        s.retrans = 0;
+        s.retrans = Some(0);
         assert_eq!(
             classify_socket(&s, &Thresholds::default()),
             SocketVerdict::AppLimited,
@@ -2197,7 +2848,7 @@ mod tests {
     fn a_receiver_that_stops_reading_is_receiver_limited() {
         let mut s = bloated_socket();
         s.rtt_ms = Some(12.0);
-        s.retrans = 0;
+        s.retrans = Some(0);
         s.cwnd = Some(100); // 100 × 1448 = 144KB against a 32KB window
         s.rwnd = Some(32_000);
         assert_eq!(
@@ -2512,6 +3163,7 @@ mod tests {
     fn a_down_link_reports_nothing_else_about_that_interface() {
         let obs = Observations {
             iface: Some(IfaceObs {
+                counter_window_secs: None,
                 name: "eth0".into(),
                 carrier: false,
                 rx_errors: 0,
@@ -2626,6 +3278,7 @@ mod tests {
             ("CheckResult::pass(", false),
             ("CheckResult::fail(", false),
             ("CheckResult::skipped(", false),
+            ("stage_check(", false),
         ] {
             for (at, _) in body.match_indices(needle) {
                 let rest = body[at + needle.len()..].trim_start();
@@ -2683,5 +3336,256 @@ mod tests {
         // A recording from before a field existed still loads.
         let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
         assert_eq!(old.now, "2026-09-14 10:00:00");
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use crate::diagnose::targets::{
+        Lookup, LookupOutcome, Stage, StageError, TargetContext, TargetObs,
+    };
+
+    fn ok(ms: f64) -> Option<Stage> {
+        Some(Stage {
+            ms: Some(ms),
+            error: None,
+        })
+    }
+    fn err(e: StageError) -> Option<Stage> {
+        Some(Stage {
+            ms: Some(3000.0),
+            error: Some(e),
+        })
+    }
+
+    fn healthy() -> TargetObs {
+        TargetObs {
+            baseline_key: None,
+            name: "api".into(),
+            host: "api.corp.internal".into(),
+            port: 443,
+            tls: true,
+            http: true,
+            expect_status: None,
+            probed_at: "2026-09-15 10:00:00".into(),
+            resolve: Stage {
+                ms: Some(2.0),
+                error: None,
+            },
+            addresses: vec!["10.1.2.3".into()],
+            lookups: vec![],
+            connect: ok(12.0),
+            connect_v4: ok(12.0),
+            connect_v6: None,
+            tls_stage: ok(30.0),
+            http_stage: ok(40.0),
+            status: Some(200),
+            context: TargetContext::default(),
+        }
+    }
+
+    fn detect_one(t: TargetObs) -> Detection {
+        let obs = Observations {
+            targets: vec![t],
+            ..Default::default()
+        };
+        let base = crate::diagnose::fixture::baselines();
+        let mut found = detect(&obs, &base, &Thresholds::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let mut d = found.remove(0);
+        d.causes.sort_by(|a, b| {
+            b.score()
+                .unwrap_or(-1.0)
+                .total_cmp(&a.score().unwrap_or(-1.0))
+        });
+        d
+    }
+
+    #[test]
+    fn a_healthy_target_raises_nothing() {
+        let obs = Observations {
+            targets: vec![healthy()],
+            ..Default::default()
+        };
+        assert!(detect(
+            &obs,
+            &crate::diagnose::fixture::baselines(),
+            &Thresholds::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_vpn_name_the_system_resolver_misses_points_at_split_dns() {
+        let mut t = healthy();
+        t.resolve = Stage {
+            ms: Some(4.0),
+            error: Some(StageError::NxDomain),
+        };
+        t.connect = None;
+        t.tls_stage = None;
+        t.http_stage = None;
+        t.context.vpn_ifaces = vec!["wg0".into()];
+        t.lookups = vec![
+            Lookup {
+                resolver: "127.0.0.53".into(),
+                link: None,
+                outcome: LookupOutcome::NxDomain,
+            },
+            Lookup {
+                resolver: "10.8.0.1".into(),
+                link: Some("wg0".into()),
+                outcome: LookupOutcome::Answered,
+            },
+        ];
+        let d = detect_one(t);
+        assert_eq!(d.rule, "target.resolve_failed");
+        assert_eq!(d.causes[0].id, "vpn_split_dns_missing");
+        assert_ne!(d.severity, Severity::Info);
+    }
+
+    #[test]
+    fn a_name_nobody_knows_is_information_not_a_network_fault() {
+        let mut t = healthy();
+        t.resolve = Stage {
+            ms: Some(4.0),
+            error: Some(StageError::NxDomain),
+        };
+        t.connect = None;
+        t.lookups = vec![
+            Lookup {
+                resolver: "192.168.0.1".into(),
+                link: None,
+                outcome: LookupOutcome::NxDomain,
+            },
+            Lookup {
+                resolver: "1.1.1.1".into(),
+                link: None,
+                outcome: LookupOutcome::NxDomain,
+            },
+        ];
+        let d = detect_one(t);
+        assert_eq!(d.causes[0].id, "name_does_not_exist");
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(d.scope.note.as_deref(), Some("not a network fault"));
+    }
+
+    #[test]
+    fn a_refused_port_is_a_stopped_service_not_the_network() {
+        let mut t = healthy();
+        t.connect = err(StageError::Refused);
+        t.connect_v4 = err(StageError::Refused);
+        let d = detect_one(t);
+        assert_eq!(d.rule, "target.connect_failed");
+        assert_eq!(d.causes[0].id, "service_down");
+        assert_eq!(d.severity, Severity::Info);
+    }
+
+    #[test]
+    fn ipv6_timing_out_while_ipv4_connects_is_named() {
+        let mut t = healthy();
+        t.addresses = vec!["2001:db8::5".into(), "10.1.2.3".into()];
+        t.connect = err(StageError::Timeout);
+        t.connect_v6 = err(StageError::Timeout);
+        t.connect_v4 = ok(12.0);
+        let d = detect_one(t);
+        assert_eq!(d.causes[0].id, "ipv6_path_broken");
+        assert_ne!(d.severity, Severity::Info);
+    }
+
+    #[test]
+    fn a_certificate_not_yet_valid_with_a_skewed_clock_is_the_clock() {
+        let mut t = healthy();
+        t.tls_stage = err(StageError::CertNotYetValid);
+        t.http_stage = None;
+        t.context.clock_offset_secs = Some(-3_600.0);
+        let d = detect_one(t);
+        assert_eq!(d.rule, "target.tls_failed");
+        assert_eq!(d.causes[0].id, "clock_skew");
+    }
+
+    #[test]
+    fn an_untrusted_issuer_behind_a_proxy_reads_as_interception() {
+        let mut t = healthy();
+        t.tls_stage = err(StageError::CertUntrusted);
+        t.http_stage = None;
+        t.context.proxy_env = true;
+        let d = detect_one(t);
+        assert_eq!(d.causes[0].id, "tls_intercepting_proxy");
+    }
+
+    #[test]
+    fn a_503_is_the_service_not_the_network() {
+        let mut t = healthy();
+        t.http_stage = err(StageError::HttpStatus { status: 503 });
+        t.status = Some(503);
+        let d = detect_one(t);
+        assert_eq!(d.rule, "target.http_error");
+        assert_eq!(d.causes[0].id, "service_error");
+        assert_eq!(d.severity, Severity::Info);
+    }
+
+    #[test]
+    fn remaining_target_causes_have_distinguishing_observation_scenarios() {
+        let mut resolver = healthy();
+        resolver.resolve = err(StageError::ResolverFailed).unwrap();
+        resolver.lookups = vec![Lookup {
+            resolver: "192.168.0.1".into(),
+            link: None,
+            outcome: LookupOutcome::ServFail,
+        }];
+        let mut route = healthy();
+        route.connect = err(StageError::Unreachable);
+        route.connect_v4 = err(StageError::Unreachable);
+        let mut proxy = route.clone();
+        proxy.context.proxy_env = true;
+        let mut trust = healthy();
+        trust.tls_stage = err(StageError::CertUntrusted);
+        let mut rejected = healthy();
+        rejected.http_stage = err(StageError::HttpStatus { status: 407 });
+        rejected.status = Some(407);
+        rejected.context.proxy_env = true;
+        for (target, expected) in [
+            (resolver, "resolver_failing"),
+            (route, "firewall_or_route"),
+            (proxy, "proxy_required"),
+            (trust, "cert_untrusted"),
+            (rejected, "proxy_rejected"),
+        ] {
+            let detection = detect_one(target);
+            assert_eq!(detection.causes[0].id, expected, "{:#?}", detection.causes);
+        }
+    }
+
+    #[test]
+    fn a_slow_first_byte_against_its_baseline_points_at_the_server() {
+        let mut base = crate::diagnose::fixture::baselines();
+        for (metric, mean) in [
+            ("target.resolve_ms", 2.0),
+            ("target.connect_ms", 12.0),
+            ("target.tls_ms", 30.0),
+            ("target.ttfb_ms", 40.0),
+        ] {
+            base.seed("api", metric, mean, mean / 10.0, 2_400);
+        }
+        let mut t = healthy();
+        t.http_stage = ok(900.0);
+        let obs = Observations {
+            targets: vec![t],
+            ..Default::default()
+        };
+        let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+        assert_eq!(d.rule, "target.slow_stage");
+        let top = d
+            .causes
+            .iter()
+            .max_by(|a, b| {
+                a.score()
+                    .unwrap_or(-1.0)
+                    .total_cmp(&b.score().unwrap_or(-1.0))
+            })
+            .unwrap();
+        assert_eq!(top.id, "server_stage_slow");
     }
 }

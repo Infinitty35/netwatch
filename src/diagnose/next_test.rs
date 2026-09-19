@@ -26,6 +26,14 @@ use serde::{Deserialize, Serialize};
 
 use super::issue::{Capability, CheckResult, Issue};
 
+thread_local! { static PROBE_CANCEL: std::cell::RefCell<super::probe_io::Cancel> = std::cell::RefCell::new(super::probe_io::Cancel::default()); }
+fn cancelled() -> bool {
+    PROBE_CANCEL.with(|c| c.borrow().cancelled())
+}
+fn cancellation() -> super::probe_io::Cancel {
+    PROBE_CANCEL.with(|c| c.borrow().clone())
+}
+
 /// Test results older than this no longer count as evidence.
 pub const VALID_SECS: i64 = 15 * 60;
 /// Causes this close to the top score are still in contention.
@@ -384,7 +392,7 @@ impl Context {
 
 /// Run `test` to completion. Blocking; call from a worker thread.
 pub fn run(test: &str, ctx: &Context, now: impl Fn() -> String) -> TestRun {
-    let (outcome, detail, measurements) = match test {
+    let (mut outcome, mut detail, mut measurements) = match test {
         "dns.alt_resolver" => alt_resolver(ctx),
         "dns.tcp_fallback" => tcp_fallback(ctx),
         "dns.cached_vs_cold" => cached_vs_cold(ctx),
@@ -399,6 +407,11 @@ pub fn run(test: &str, ctx: &Context, now: impl Fn() -> String) -> TestRun {
             BTreeMap::new(),
         ),
     };
+    if cancelled() {
+        outcome = Outcome::Inconclusive;
+        detail = "test cancelled; partial measurements discarded".into();
+        measurements.clear();
+    }
     TestRun {
         test: test.to_string(),
         at: now(),
@@ -437,6 +450,9 @@ fn random_label() -> String {
 /// One UDP query; the round trip in ms and the reply.
 fn udp_query(server: SocketAddr, name: &str) -> Option<(f64, crate::collectors::health::DnsReply)> {
     use crate::collectors::health::{build_dns_query, dns_exchange, dns_socket};
+    if cancelled() {
+        return None;
+    }
     let sock = dns_socket(server.ip())?;
     let id = (uuid::Uuid::new_v4().as_u128() & 0xffff) as u16;
     let query = build_dns_query(id, name, 1, false);
@@ -453,9 +469,11 @@ fn udp_times(server: SocketAddr, name: &str, n: usize) -> Vec<f64> {
 fn tcp_query(server: SocketAddr, name: &str, timeout: Duration) -> Option<f64> {
     use std::io::{Read, Write};
     let started = Instant::now();
-    let mut stream = std::net::TcpStream::connect_timeout(&server, timeout).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    if cancelled() {
+        return None;
+    }
+    let tcp = std::net::TcpStream::connect_timeout(&server, timeout).ok()?;
+    let mut stream = super::probe_io::Stream::new(tcp, started + timeout, cancellation()).ok()?;
     let id = (uuid::Uuid::new_v4().as_u128() & 0xffff) as u16;
     let query = crate::collectors::health::build_dns_query(id, name, 1, false);
     let mut framed = (query.len() as u16).to_be_bytes().to_vec();
@@ -606,6 +624,9 @@ fn gateway_tcp(ctx: &Context) -> Result3 {
         );
     };
     for port in [80u16, 443, 53, 22] {
+        if cancelled() {
+            break;
+        }
         let (rtt, loss) = crate::collectors::health::run_tcp_probe_port(gw, port);
         if loss < 100.0 {
             return (
@@ -626,6 +647,9 @@ fn connect_times(dest: SocketAddr, n: usize, timeout: Duration) -> (Vec<f64>, us
     let mut times = Vec::new();
     let mut lost = 0;
     for _ in 0..n {
+        if cancelled() {
+            break;
+        }
         let t = Instant::now();
         match std::net::TcpStream::connect_timeout(&dest, timeout) {
             Ok(_) => times.push(t.elapsed().as_secs_f64() * 1000.0),
@@ -754,11 +778,15 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
     };
 
     struct Zeros {
+        cancel: super::probe_io::Cancel,
         left: u64,
         until: Instant,
     }
     impl std::io::Read for Zeros {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.cancel.cancelled() {
+                return Err(std::io::Error::other("upload cancelled"));
+            }
             if self.left == 0 || Instant::now() >= self.until {
                 return Ok(0);
             }
@@ -770,18 +798,37 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
     }
     let url = ctx.upload_url.clone();
     let bytes = ctx.upload_bytes;
+    let cancel = cancellation();
     let upload = std::thread::spawn(move || {
         let body = Zeros {
+            cancel: cancel.clone(),
             left: bytes,
             until: Instant::now() + Duration::from_secs(10),
         };
-        ureq::post(&url)
+        ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(14))
+            .redirects(0)
+            .resolver(move |netloc: &str| {
+                let u =
+                    url::Url::parse(&format!("http://{netloc}")).map_err(std::io::Error::other)?;
+                super::probe_io::resolve(
+                    u.host_str().unwrap_or("").trim_matches(['[', ']']),
+                    u.port_or_known_default().unwrap_or(80),
+                    &cancel,
+                )
+            })
+            .build()
+            .post(&url)
             .set("content-type", "application/octet-stream")
             .send(body)
             .is_ok()
     });
-    std::thread::sleep(Duration::from_secs(2));
+    for _ in 0..20 {
+        if cancelled() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let (loaded, _) = connect_times(dest, 5, Duration::from_secs(3));
     let uploaded = upload.join().unwrap_or(false);
     let Some(loaded) = median(loaded) else {
@@ -792,7 +839,11 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
         );
     };
     (
-        decide_load(idle, loaded, ctx.loaded_rtt_delta_ms),
+        if uploaded {
+            decide_load(idle, loaded, ctx.loaded_rtt_delta_ms)
+        } else {
+            Outcome::Inconclusive
+        },
         format!(
             "idle {idle:.0}ms, under upload {loaded:.0}ms{}",
             if uploaded {
@@ -801,7 +852,11 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
                 " (upload did not complete)"
             }
         ),
-        measured(&[("idle_rtt_ms", Some(idle)), ("loaded_rtt_ms", Some(loaded))]),
+        if uploaded {
+            measured(&[("idle_rtt_ms", Some(idle)), ("loaded_rtt_ms", Some(loaded))])
+        } else {
+            BTreeMap::new()
+        },
     )
 }
 
@@ -814,6 +869,7 @@ pub struct Runner {
     rx: std::sync::mpsc::Receiver<(String, TestRun)>,
     running: std::collections::HashSet<(String, String)>,
     reruns: Vec<(Instant, String, String)>,
+    cancellations: std::collections::HashMap<(String, String), super::probe_io::Cancel>,
 }
 
 impl Default for Runner {
@@ -824,11 +880,24 @@ impl Default for Runner {
             rx,
             running: Default::default(),
             reruns: Vec::new(),
+            cancellations: Default::default(),
         }
     }
 }
 
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
 impl Runner {
+    pub fn cancel_all(&mut self) {
+        for cancel in self.cancellations.values() {
+            cancel.cancel();
+        }
+        self.reruns.clear();
+    }
     pub fn is_running(&self, issue: &str, test: &str) -> bool {
         self.running
             .contains(&(issue.to_string(), test.to_string()))
@@ -860,11 +929,20 @@ impl Runner {
         if lookup(test).is_none() {
             return Err(format!("no test named {test}"));
         }
+        if self.running.len() >= 2 || self.running.iter().any(|(_, id)| id == test) {
+            return Err(
+                "a diagnostic measurement is already running; wait for it to finish".into(),
+            );
+        }
         if !self.running.insert((issue.to_string(), test.to_string())) {
             return Err(format!("{test} is already running"));
         }
+        let cancel = super::probe_io::Cancel::default();
+        self.cancellations
+            .insert((issue.to_string(), test.to_string()), cancel.clone());
         let (tx, issue, test) = (self.tx.clone(), issue.to_string(), test.to_string());
         crate::sandbox::worker::spawn("diagnose-test", move || {
+            PROBE_CANCEL.with(|slot| *slot.borrow_mut() = cancel);
             let mut run = run(&test, &ctx, || {
                 super::engine::format_ts(chrono::Local::now())
             });
@@ -876,9 +954,20 @@ impl Runner {
 
     /// Finished runs since the last call.
     pub fn poll(&mut self) -> Vec<(String, TestRun)> {
-        let done: Vec<_> = self.rx.try_iter().collect();
-        for (issue, run) in &done {
+        let mut done: Vec<_> = self.rx.try_iter().collect();
+        for (issue, run) in &mut done {
+            if self
+                .cancellations
+                .get(&(issue.clone(), run.test.clone()))
+                .is_some_and(|c| c.cancelled())
+            {
+                run.outcome = Outcome::Inconclusive;
+                run.detail = "test cancelled; late result discarded".into();
+                run.measurements.clear();
+            }
             self.running.remove(&(issue.clone(), run.test.clone()));
+            self.cancellations
+                .remove(&(issue.clone(), run.test.clone()));
         }
         done
     }
@@ -948,6 +1037,52 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    #[test]
+    fn cancellation_discards_a_result_already_queued_for_delivery() {
+        let mut runner = Runner::default();
+        let token = super::super::probe_io::Cancel::default();
+        let key = ("coverage".to_string(), "load.idle_vs_loaded".to_string());
+        runner.running.insert(key.clone());
+        runner.cancellations.insert(key.clone(), token);
+        runner
+            .tx
+            .send((
+                key.0,
+                TestRun {
+                    test: key.1,
+                    at: "test".into(),
+                    outcome: Outcome::Positive,
+                    detail: "completed just before cancel".into(),
+                    measurements: measured(&[
+                        ("idle_rtt_ms", Some(2.0)),
+                        ("loaded_rtt_ms", Some(100.0)),
+                    ]),
+                    after_action: false,
+                },
+            ))
+            .unwrap();
+        runner.cancel_all();
+        let done = runner.poll();
+        assert_eq!(done[0].1.outcome, Outcome::Inconclusive);
+        assert!(done[0].1.measurements.is_empty());
+    }
+
+    #[test]
+    fn cancellation_discards_measurements_and_stops_new_io() {
+        let token = super::super::probe_io::Cancel::default();
+        token.cancel();
+        PROBE_CANCEL.with(|slot| *slot.borrow_mut() = token);
+        let mut ctx = Context::new("127.0.0.1".parse().unwrap());
+        ctx.resolver = Some(ctx.reference);
+        let start = Instant::now();
+        let result = run("dns.alt_resolver", &ctx, || "test".into());
+        assert_eq!(result.outcome, Outcome::Inconclusive);
+        assert!(result.measurements.is_empty());
+        assert!(result.detail.contains("cancelled"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        PROBE_CANCEL.with(|slot| *slot.borrow_mut() = Default::default());
     }
 
     #[test]

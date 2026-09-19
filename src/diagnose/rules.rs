@@ -61,7 +61,7 @@ pub const CATALOGUE: &[Rule] = &[
         category: "dns",
         severity: Severity::High,
         trigger: "servfail/timeout rate > 5%, or the pipeline dns stage fails",
-        suppresses: &["dns.slow_resolver"],
+        suppresses: &["dns.slow_resolver", "target.resolve_failed"],
         status: RuleStatus::Active,
     },
     Rule {
@@ -98,6 +98,11 @@ pub const CATALOGUE: &[Rule] = &[
             "path.rtt_spike",
             "tcp.retrans_burst",
             "tcp.connect_failures",
+            "target.resolve_failed",
+            "target.connect_failed",
+            "target.tls_failed",
+            "target.http_error",
+            "target.slow_stage",
         ],
         status: RuleStatus::Active,
     },
@@ -219,18 +224,18 @@ pub const CATALOGUE: &[Rule] = &[
         title: "connections failing",
         category: "tcp",
         severity: Severity::Medium,
-        trigger: "more than 5 syn timeouts or connect resets per minute",
+        trigger: "more than 5 failed active or passive TCP handshakes per minute in this namespace",
         suppresses: &[],
-        status: RuleStatus::Planned("connect-failure detector not wired into Diagnose"),
+        status: RuleStatus::Active,
     },
     Rule {
         id: "tcp.timewait_exhaustion",
         title: "time-wait pressure",
         category: "tcp",
-        severity: Severity::Medium,
-        trigger: "time-wait sockets exceed 60% of the ephemeral port range",
+        severity: Severity::Info,
+        trigger: "distinct TIME_WAIT local ports exceed 60% of the ephemeral range for one address; not exhaustion proof",
         suppresses: &[],
-        status: RuleStatus::Planned("TIME_WAIT detector not wired into Diagnose"),
+        status: RuleStatus::Active,
     },
     // ------------------------------------------------- mtu / nat / v6 / cap
     Rule {
@@ -238,9 +243,9 @@ pub const CATALOGUE: &[Rule] = &[
         title: "path mtu blackhole",
         category: "mtu",
         severity: Severity::High,
-        trigger: "large DF probes fail while small probes pass",
-        suppresses: &["tcp.retrans_burst"],
-        status: RuleStatus::Planned("PMTU probe detector not wired into Diagnose"),
+        trigger: "small DF probes work, large probes time out, and reducing TCP MSS restores a transfer to the same endpoint",
+        suppresses: &[],
+        status: RuleStatus::Active,
     },
     Rule {
         id: "nat.symmetric",
@@ -258,7 +263,7 @@ pub const CATALOGUE: &[Rule] = &[
         severity: Severity::Medium,
         trigger: "a v6 default route exists but v6 probes fail while v4 works",
         suppresses: &[],
-        status: RuleStatus::Planned("dual-stack comparison not wired into Diagnose"),
+        status: RuleStatus::Active,
     },
     Rule {
         id: "captive.portal",
@@ -266,9 +271,60 @@ pub const CATALOGUE: &[Rule] = &[
         category: "captive",
         severity: Severity::High,
         trigger: "the http 204 probe is redirected",
-        // A portal breaks DNS and TCP in ways that are its fault, not theirs.
-        suppresses: &["dns.hijack_suspect", "tcp.connect_failures", "dns.failing"],
-        status: RuleStatus::Planned("captive portal test not wired into Diagnose"),
+        // Selected-endpoint HTTP evidence cannot establish global causality.
+        suppresses: &[],
+        status: RuleStatus::Active,
+    },
+    // ------------------------------------------------------------- targets
+    Rule {
+        id: "target.resolve_failed",
+        title: "target name does not resolve",
+        category: "target",
+        severity: Severity::Medium,
+        trigger: "a configured target's name fails to resolve for 3 probes",
+        suppresses: &[
+            "target.connect_failed",
+            "target.tls_failed",
+            "target.http_error",
+            "target.slow_stage",
+        ],
+        status: RuleStatus::Active,
+    },
+    Rule {
+        id: "target.connect_failed",
+        title: "target refuses or drops connections",
+        category: "target",
+        severity: Severity::Medium,
+        trigger: "a configured target's first address fails to connect for 3 probes",
+        suppresses: &["target.tls_failed", "target.http_error", "target.slow_stage"],
+        status: RuleStatus::Active,
+    },
+    Rule {
+        id: "target.tls_failed",
+        title: "target tls handshake fails",
+        category: "target",
+        severity: Severity::Medium,
+        trigger: "a configured target's TLS handshake fails for 3 probes",
+        suppresses: &["target.http_error", "target.slow_stage"],
+        status: RuleStatus::Active,
+    },
+    Rule {
+        id: "target.http_error",
+        title: "target returns an error",
+        category: "target",
+        severity: Severity::Medium,
+        trigger: "a configured target answers 5xx, or not the expected status, for 3 probes",
+        suppresses: &[],
+        status: RuleStatus::Active,
+    },
+    Rule {
+        id: "target.slow_stage",
+        title: "target slower than usual",
+        category: "target",
+        severity: Severity::Medium,
+        trigger: "a target's dns, connect, tls or first-byte time > 3σ above its baseline for 3 probes",
+        suppresses: &[],
+        status: RuleStatus::Active,
     },
     // -------------------------------------------------------------- egress
     Rule {
@@ -276,18 +332,18 @@ pub const CATALOGUE: &[Rule] = &[
         title: "egress drift",
         category: "egress",
         severity: Severity::Info,
-        trigger: "a destination outside the learned egress baseline",
+        trigger: "a destination outside the learned egress baseline (only with alert = \"all\")",
         suppresses: &[],
-        status: RuleStatus::Planned("egress findings remain in the Egress tab"),
+        status: RuleStatus::Active,
     },
     Rule {
         id: "egress.policy_violation",
         title: "egress policy violation",
         category: "egress",
         severity: Severity::High,
-        trigger: "a flow denied by the loaded egress policy",
+        trigger: "an observed destination is blocked by the loaded policy, or with alert = \"all\" falls outside it (warning only)",
         suppresses: &["egress.drift"],
-        status: RuleStatus::Planned("egress policy findings remain in the Egress tab"),
+        status: RuleStatus::Active,
     },
 ];
 
@@ -322,6 +378,8 @@ fn scopes_overlap(root: &Subject, child: &Subject) -> bool {
         (Subject::Iface { name }, Subject::Iface { name: other }) => name == other,
         // A link/gateway problem on an interface covers what runs over it.
         (Subject::Iface { .. }, _) => true,
+        // A failing system resolver covers every name a target looks up.
+        (Subject::Resolver { .. }, Subject::Target { .. }) => true,
         (a, b) => a == b,
     }
 }
@@ -437,13 +495,18 @@ pub fn default_verify(id: &str) -> Option<Verify> {
             Verify::below("tcp.connect_failure_rate", 1.0, "/min").holding_for(120)
         }
         "tcp.timewait_exhaustion" => Verify::below("tcp.timewait_pct", 40.0, "%").holding_for(120),
-        "pmtu.blackhole" => Verify::above("pmtu.largest_ok", 1400.0, "B").holding_for(60),
+        "pmtu.blackhole" => Verify::above("pmtu.transfer_ok", 0.0, "").holding_for(30),
         "nat.symmetric" => Verify::below("nat.symmetric", 1.0, "").holding_for(300),
-        "ipv6.broken" => Verify::below("ipv6.probe_loss", 1.0, "%").holding_for(120),
+        "ipv6.broken" => Verify::below("ipv6.probe_loss", 1.0, "%").holding_for(30),
         "captive.portal" => Verify::above("captive.probe_204", 0.0, "").holding_for(30),
+        "target.resolve_failed" => Verify::above("target.resolve_ok", 0.5, "").holding_for(120),
+        "target.connect_failed" => Verify::above("target.connect_ok", 0.5, "").holding_for(120),
+        "target.tls_failed" => Verify::above("target.tls_ok", 0.5, "").holding_for(120),
+        "target.http_error" => Verify::above("target.http_ok", 0.5, "").holding_for(120),
+        "target.slow_stage" => Verify::below("target.worst_stage_sigma", 3.0, "σ").holding_for(180),
         "egress.drift" => Verify::below("egress.new_destinations", 1.0, "").holding_for(300),
         "egress.policy_violation" => {
-            Verify::below("egress.denied_flows", 1.0, "/min").holding_for(300)
+            Verify::below("egress.denied_flows", 1.0, "observed destinations").holding_for(300)
         }
         _ => return None,
     })
@@ -518,8 +581,8 @@ mod tests {
             label.starts_with(&format!("{} rules", CATALOGUE.len())),
             "{label}"
         );
-        assert_eq!(active_count(), 18, "{label}");
-        assert!(label.ends_with("7 planned"), "{label}");
+        assert_eq!(active_count(), 30, "{label}");
+        assert!(!label.contains("planned"), "{label}");
     }
 
     #[test]

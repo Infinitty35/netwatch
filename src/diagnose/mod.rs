@@ -19,22 +19,27 @@
 //! One `Vec<Issue>` feeds every surface, so the screen and the report cannot
 //! disagree. See [`issue`] for why no rendered number is ever stored.
 
+pub mod active;
 pub mod baseline;
 pub mod causes;
 pub mod coverage;
 pub mod demo;
 pub mod detectors;
+pub mod egress;
 pub mod engine;
 pub mod episode;
 pub mod export;
 pub mod features;
 pub mod fixture;
 pub mod issue;
+pub mod kernel;
 pub mod live;
 pub mod next_test;
+pub mod probe_io;
 pub mod remediation;
 pub mod report;
 pub mod rules;
+pub mod targets;
 
 pub use engine::{Engine, Verdict};
 pub use issue::{Issue, Severity};

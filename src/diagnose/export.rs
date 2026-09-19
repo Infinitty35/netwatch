@@ -29,6 +29,7 @@ pub struct Redactor {
     /// Hostnames seen in structured fields, longest first when replacing.
     names: Vec<String>,
     tokens: HashMap<String, String>,
+    target_names: HashMap<String, String>,
     pub counts: BTreeMap<&'static str, usize>,
 }
 
@@ -38,6 +39,7 @@ impl Redactor {
             key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret),
             names: Vec::new(),
             tokens: HashMap::new(),
+            target_names: HashMap::new(),
             counts: BTreeMap::new(),
         }
     }
@@ -60,15 +62,91 @@ impl Redactor {
     /// A redacted copy of `episode`.
     pub fn episode(&mut self, episode: &Episode) -> Episode {
         let mut ep = episode.clone();
+        // Display names can be single-label hosts or arbitrary user text.
+        // Map their identity references explicitly, never schema field names.
+        for frame in &ep.frames {
+            if let Some(egress) = &frame.obs.egress {
+                for flow in &egress.flows {
+                    let mut safe = flow.clone();
+                    safe.process = self.token("process", &flow.process);
+                    safe.destination = if flow.destination.parse::<IpAddr>().is_ok() {
+                        self.addresses(&flow.destination)
+                    } else {
+                        self.token("host", &flow.destination)
+                    };
+                    self.target_names
+                        .insert(flow.subject().label(), safe.subject().label());
+                }
+            }
+            for target in &frame.obs.targets {
+                let token = self.token("target", &target.name);
+                self.target_names.insert(target.name.clone(), token);
+                if let Some(key) = &target.baseline_key {
+                    let safe = self.token("target-config", key);
+                    self.target_names.insert(key.clone(), safe);
+                }
+            }
+        }
+        for label in &mut ep.labels {
+            if label.note.take().is_some() {
+                *self.counts.entry("free-text").or_default() += 1;
+            }
+        }
         for frame in &mut ep.frames {
             for s in &mut frame.obs.sockets {
                 if s.process.take().is_some() {
                     *self.counts.entry("process").or_default() += 1;
                 }
             }
+            for (_, reason) in frame.obs.coverage_hints.values_mut() {
+                *reason = "[collector/configuration detail removed]".into();
+            }
+            if let Some(egress) = &mut frame.obs.egress {
+                for flow in &mut egress.flows {
+                    flow.process = self.token("process", &flow.process);
+                    flow.destination = if flow.destination.parse::<IpAddr>().is_ok() {
+                        self.addresses(&flow.destination)
+                    } else {
+                        self.token("host", &flow.destination)
+                    };
+                }
+            }
             self.learn_names(&frame.obs);
+            // URL paths and query strings can contain names or credentials
+            // that appear nowhere else in an episode. Presence is the evidence.
+            if frame.obs.captive_portal_url.is_some() {
+                frame.obs.captive_portal_url = Some("[redacted portal URL]".into());
+            }
+            if let Some(cross) = frame.obs.dns.as_mut().and_then(|dns| dns.cross.as_mut()) {
+                cross.name = self.token("host", &cross.name);
+            }
+            for target in &mut frame.obs.targets {
+                target.baseline_key = target
+                    .baseline_key
+                    .as_ref()
+                    .map(|k| self.target_identity(k));
+                target.host = if target.host.parse::<IpAddr>().is_ok() {
+                    self.addresses(&target.host)
+                } else {
+                    self.token("host", &target.host)
+                };
+                for (_, domains) in &mut target.context.link_domains {
+                    for domain in domains {
+                        if domain != "~." && domain != "." {
+                            *domain = self.token("domain", domain);
+                        }
+                    }
+                }
+            }
         }
         for snap in &mut ep.issues {
+            if let super::issue::Subject::Process { name, pid } = &mut snap.issue.subject {
+                let old = pid.map_or_else(|| name.clone(), |p| format!("{name}[{p}]"));
+                let token = self.token("process", name);
+                self.target_names.insert(old, token.clone());
+                *name = token;
+                *pid = None;
+            }
             snap.issue.scope.processes.clear();
             snap.issue.artifacts.clear();
         }
@@ -87,6 +165,15 @@ impl Redactor {
                 self.names.push(name.to_string());
             }
         };
+        for target in &obs.targets {
+            add(&target.host);
+            add(&target.name);
+            for (_, domains) in &target.context.link_domains {
+                for domain in domains {
+                    add(domain.trim_start_matches('~'));
+                }
+            }
+        }
         if let Some(cross) = obs.dns.as_ref().and_then(|d| d.cross.as_ref()) {
             add(&cross.name);
         }
@@ -112,14 +199,104 @@ impl Redactor {
             Value::String(s) => *s = self.text(s),
             Value::Array(items) => items.iter_mut().for_each(|v| self.walk(v)),
             Value::Object(map) => {
+                if map.get("kind").and_then(Value::as_str) == Some("egress") {
+                    if let Some(Value::String(process)) = map.get_mut("process") {
+                        *process = self.token("process", process);
+                    }
+                    if let Some(Value::String(destination)) = map.get_mut("destination") {
+                        *destination = if destination.parse::<IpAddr>().is_ok() {
+                            self.addresses(destination)
+                        } else {
+                            self.token("host", destination)
+                        };
+                    }
+                }
                 let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
                 for (k, mut v) in entries {
-                    self.walk(&mut v);
-                    map.insert(self.text(&k), v);
+                    // These fields are prose, not evidence. Unknown names in
+                    // notes/errors cannot be discovered from structured fields.
+                    if matches!(
+                        k.as_str(),
+                        "detail"
+                            | "note"
+                            | "message"
+                            | "text"
+                            | "title"
+                            | "why"
+                            | "before"
+                            | "after"
+                    ) {
+                        if let Value::String(s) = &mut v {
+                            if !s.is_empty() {
+                                *self.counts.entry("free-text").or_default() += 1;
+                                s.clear();
+                            }
+                        }
+                    }
+                    if k == "reason" && !matches!(v.as_str(), Some("opened" | "closed" | "final")) {
+                        if let Value::String(s) = &mut v {
+                            s.clear();
+                        }
+                    }
+                    if k == "reviewer" {
+                        if let Value::String(s) = &mut v {
+                            *s = self.token("reviewer", s);
+                        }
+                    }
+                    if matches!(k.as_str(), "name" | "subject" | "issue" | "configuration")
+                        || (k == "key" && v.as_str().is_some_and(|s| s.contains('|')))
+                    {
+                        if let Value::String(s) = &mut v {
+                            *s = self.target_identity(s);
+                        }
+                    }
+                    // Stable identifiers are authored catalogue values, not hostnames.
+                    // A target named like a rule must not rewrite that rule's identity.
+                    if !matches!(
+                        k.as_str(),
+                        "id" | "rule"
+                            | "metric"
+                            | "test"
+                            | "cause"
+                            | "top_cause"
+                            | "kind"
+                            | "state"
+                            | "reason"
+                    ) {
+                        self.walk(&mut v);
+                    }
+                    let key = if k.contains('\u{1f}') {
+                        self.target_identity(&k)
+                    } else {
+                        k.clone()
+                    };
+                    let key = if key.contains('\u{1f}') {
+                        self.text(&key)
+                    } else {
+                        key
+                    };
+                    map.insert(key, v);
                 }
             }
             _ => {}
         }
+    }
+
+    fn target_identity(&self, s: &str) -> String {
+        if let Some(token) = self.target_names.get(s) {
+            return token.clone();
+        }
+        if let Some((prefix, name)) = s.rsplit_once('|') {
+            if let Some(token) = self.target_names.get(name) {
+                return format!("{prefix}|{token}");
+            }
+        }
+        if let Some((name, metric)) = s.split_once('\u{1f}') {
+            if let Some(token) = self.target_names.get(name) {
+                return format!("{token}\u{1f}{metric}");
+            }
+        }
+        s.to_string()
     }
 
     /// Replace every known hostname and every IP address in `s`.
@@ -214,7 +391,7 @@ pub struct Bundle {
 
 pub const REDACTION_NOTE: &str =
     "IP addresses and hostnames replaced with per-install keyed hashes \
-(pseudonymised, not anonymous); process names and artifact paths removed; interface names, \
+(pseudonymised, not anonymous); process names, artifact paths and free-text notes/details removed; target names and routing domains hashed; interface names, \
 timings, counts, rule and cause ids kept.";
 
 /// The per-install export key: 32 random bytes, created on first use,
@@ -293,13 +470,28 @@ pub fn build(
 
 pub fn write(bundle: &Bundle, path: &Path) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::File::create(path)?;
-    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    serde_json::to_writer(&mut gz, bundle).map_err(std::io::Error::other)?;
-    gz.finish()?.flush()
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&temp)?;
+        let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        serde_json::to_writer(&mut gz, bundle).map_err(std::io::Error::other)?;
+        gz.finish()?.flush()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// `netwatch diagnose export [--since DAYS] [--out FILE] [--dry-run] [DIR]`
@@ -430,6 +622,10 @@ mod tests {
     }
 
     fn fixture_episode() -> Episode {
+        fixture_episode_with_target(None)
+    }
+
+    fn fixture_episode_with_target(target: Option<super::super::targets::TargetObs>) -> Episode {
         use crate::diagnose::engine::{Clock, Engine, FixedClock, ObservationTimes};
         use crate::diagnose::fixture;
         let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:44:00"));
@@ -443,6 +639,11 @@ mod tests {
             for s in &mut obs.sockets {
                 s.process = Some("firefox".into());
             }
+            if let Some(target) = &target {
+                let mut target = target.clone();
+                target.probed_at = crate::diagnose::engine::format_ts(clock.now());
+                obs.targets.push(target);
+            }
             let now = start + std::time::Duration::from_secs(t);
             let mut times = ObservationTimes {
                 interface: Some(now),
@@ -450,6 +651,7 @@ mod tests {
                 path: Some(now),
                 ..Default::default()
             };
+            times.targets = target.as_ref().map(|_| now);
             times.health.dns = Some(now);
             times.health.gateway = Some(now);
             times.health.internet = Some(now);
@@ -499,6 +701,89 @@ mod tests {
     }
 
     #[test]
+    fn target_identities_and_unknown_free_text_are_redacted_without_changing_schema() {
+        use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
+        let mut ep = fixture_episode();
+        let target = TargetObs {
+            baseline_key: Some("target-config:private-test-revision".into()),
+            name: "dns".into(),     // deliberately collides with a schema field
+            host: "payroll".into(), // single-label internal hostname
+            port: 443,
+            tls: true,
+            http: true,
+            expect_status: None,
+            probed_at: ep.started.clone(),
+            resolve: Stage {
+                ms: Some(3.0),
+                error: Some(StageError::Other {
+                    message: "unknown-secret.internal from secret-process".into(),
+                }),
+            },
+            addresses: vec![],
+            lookups: vec![],
+            connect: None,
+            connect_v4: None,
+            connect_v6: None,
+            tls_stage: None,
+            http_stage: None,
+            status: None,
+            context: TargetContext {
+                link_domains: vec![("wg0".into(), vec!["~finance.internal".into()])],
+                ..Default::default()
+            },
+        };
+        ep = fixture_episode_with_target(Some(target));
+        for frame in &mut ep.frames {
+            frame.obs.coverage_hints.insert(
+                "target.connect_failed".into(),
+                (
+                    crate::diagnose::coverage::Availability::NotConfigured,
+                    "duplicate target secret-config-name".into(),
+                ),
+            );
+        }
+        ep.labels.push(episode::Label {
+            issue: "target.resolve_failed|dns".into(),
+            cause: "unknown".into(),
+            source: episode::LabelSource::User,
+            ts: ep.started.clone(),
+            note: Some("another-secret.internal from secret-process".into()),
+        });
+        let mut r = Redactor::new(b"install");
+        let safe = r.episode(&ep);
+        let text = serde_json::to_string(&safe).unwrap();
+        for secret in [
+            "payroll",
+            "finance.internal",
+            "unknown-secret.internal",
+            "another-secret.internal",
+            "secret-process",
+            "secret-config-name",
+            "target-config:private-test-revision",
+        ] {
+            assert!(!text.contains(secret), "{secret} escaped redaction");
+        }
+        assert!(safe.frames[0].obs.targets[0].name.starts_with("target:"));
+        assert!(safe.labels[0]
+            .issue
+            .starts_with("target.resolve_failed|target:"));
+        assert!(
+            safe.frames[0].obs.dns.is_some(),
+            "field name must survive target-name collision"
+        );
+        assert_eq!(
+            ep.frames[0].obs.targets[0].host, "payroll",
+            "local recording stays intact"
+        );
+        assert!(safe
+            .issues
+            .iter()
+            .any(|s| s.issue.rule.starts_with("target.")));
+        let replay = episode::replay(&safe);
+        assert!(replay.matches(), "{:#?}", replay.divergences.first());
+    }
+
+    #[test]
     fn bundles_include_recent_episodes_and_write_privately_keyed() {
         let root = std::env::temp_dir().join(format!("nw-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -523,6 +808,14 @@ mod tests {
         assert!(preview.counts.get("process").copied().unwrap_or(0) > 0);
         let out = root.join("bundle.json.gz");
         write(&preview.bundle, &out).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&out).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
         let mut text = String::new();
         use std::io::Read;
         flate2::read::GzDecoder::new(std::fs::File::open(&out).unwrap())

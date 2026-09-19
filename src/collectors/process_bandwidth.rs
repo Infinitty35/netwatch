@@ -384,6 +384,7 @@ mod tests {
             tx_retries: None,
             rx_history: VecDeque::new(),
             tx_history: VecDeque::new(),
+            sample_times: Default::default(),
         }
     }
 

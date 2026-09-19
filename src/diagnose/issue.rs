@@ -63,6 +63,12 @@ impl fmt::Display for Severity {
 pub enum Subject {
     /// The host itself — no narrower subject applies.
     Host,
+    /// One attributed public destination; process identity is name-scoped.
+    Egress {
+        process: String,
+        destination: String,
+        port: u16,
+    },
     Resolver {
         addr: String,
     },
@@ -80,6 +86,10 @@ pub enum Subject {
         name: String,
         pid: Option<u32>,
     },
+    /// A developer target from `[[diagnose_targets]]`, by its configured name.
+    Target {
+        name: String,
+    },
 }
 
 impl Subject {
@@ -87,6 +97,11 @@ impl Subject {
     pub fn label(&self) -> String {
         match self {
             Subject::Host => "host".to_string(),
+            Subject::Egress {
+                process,
+                destination,
+                port,
+            } => format!("{process} → {destination}:{port}"),
             Subject::Resolver { addr } => addr.clone(),
             Subject::Path { target } => target.clone(),
             Subject::Socket { local, remote } => format!("{local} → {remote}"),
@@ -95,6 +110,7 @@ impl Subject {
                 Some(p) => format!("{name}[{p}]"),
                 None => name.clone(),
             },
+            Subject::Target { name } => name.clone(),
         }
     }
 
@@ -666,6 +682,9 @@ impl IssueState {
 /// What the issue touches. Rendered as the `scope` line.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scope {
+    /// Opaque configured-target revision; changing endpoints is not recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<String>,
     pub processes: Vec<String>,
     pub destinations: u32,
     pub flows: u32,
@@ -685,10 +704,18 @@ impl Scope {
             parts.push(format!("{} processes", self.processes.len()));
         }
         if self.destinations > 0 {
-            parts.push(format!("{} destinations", self.destinations));
+            parts.push(format!(
+                "{} destination{}",
+                self.destinations,
+                if self.destinations == 1 { "" } else { "s" }
+            ));
         }
         if self.flows > 0 {
-            parts.push(format!("{} flows", self.flows));
+            parts.push(format!(
+                "{} flow{}",
+                self.flows,
+                if self.flows == 1 { "" } else { "s" }
+            ));
         }
         if let Some(n) = &self.note {
             parts.push(n.clone());

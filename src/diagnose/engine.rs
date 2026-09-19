@@ -85,7 +85,17 @@ impl Clock for std::sync::Arc<FixedClock> {
 /// `None` for rules with no single sampling collector; `Some(None)` when the
 /// collector exists but hasn't completed.
 fn sample_time(rule: &str, times: &ObservationTimes) -> Option<Option<std::time::Instant>> {
-    if rule.starts_with("dns.") {
+    if rule == "ipv6.broken" {
+        Some(times.ipv6)
+    } else if rule == "captive.portal" {
+        Some(times.portal)
+    } else if rule == "pmtu.blackhole" {
+        Some(times.pmtu)
+    } else if matches!(rule, "tcp.connect_failures" | "tcp.timewait_exhaustion") {
+        Some(times.kernel)
+    } else if rule.starts_with("egress.") {
+        Some(times.egress)
+    } else if rule.starts_with("dns.") {
         Some(times.health.dns)
     } else if rule.starts_with("gateway.") {
         Some(times.health.gateway)
@@ -97,6 +107,8 @@ fn sample_time(rule: &str, times: &ObservationTimes) -> Option<Option<std::time:
         Some(times.path)
     } else if rule.starts_with("tcp.") && rule != "tcp.bufferbloat_local" {
         Some(times.sockets)
+    } else if rule.starts_with("target.") {
+        Some(times.targets)
     } else {
         None
     }
@@ -143,10 +155,17 @@ impl Default for Settings {
 
 #[derive(Clone, Debug, Default)]
 pub struct ObservationTimes {
+    pub ipv6: Option<std::time::Instant>,
+    pub portal: Option<std::time::Instant>,
+    pub pmtu: Option<std::time::Instant>,
+    pub kernel: Option<std::time::Instant>,
+    pub egress: Option<std::time::Instant>,
     pub interface: Option<std::time::Instant>,
     pub health: crate::collectors::health::ProbeTimes,
     pub sockets: Option<std::time::Instant>,
     pub path: Option<std::time::Instant>,
+    /// The newest developer-target probe result.
+    pub targets: Option<std::time::Instant>,
 }
 
 /// Something done to an issue from outside the detection loop: a user action,
@@ -184,6 +203,9 @@ pub enum EngineEvent {
         at: String,
     },
 }
+
+/// No target result newer than this means target rules have no input.
+const TARGET_STALE_SECS: u64 = 900;
 
 /// Test runs kept per issue.
 const MAX_TEST_RUNS: usize = 20;
@@ -326,13 +348,48 @@ impl Engine {
         if !fresh(times.path, 120) {
             observed.paths.clear();
         }
+        if !fresh(times.targets, TARGET_STALE_SECS) {
+            observed.targets.clear();
+        }
+        if !fresh(times.ipv6, 120) {
+            observed.active.ipv6 = None;
+        }
+        if !fresh(times.portal, 120) {
+            observed.active.portal = None;
+        }
+        if !fresh(times.pmtu, 120) {
+            observed.active.pmtu = None;
+        }
+        if !fresh(times.kernel, 15) {
+            observed.kernel = None;
+        }
+        if !fresh(times.egress, 30) {
+            observed.egress = None;
+        }
         self.observe_inner(&observed, base, Some(times));
         self.coverage.mark_stale_probes(&times.health, now);
         for row in &mut self.coverage.rules {
-            if row.status == super::coverage::Availability::Unsupported {
+            if matches!(
+                row.status,
+                super::coverage::Availability::Unsupported
+                    | super::coverage::Availability::NotImplemented
+            ) {
                 continue;
             }
-            let sample = if row.rule.starts_with("path.") {
+            let sample = if row.rule == "ipv6.broken" {
+                Some((times.ipv6, 120))
+            } else if row.rule == "captive.portal" {
+                Some((times.portal, 120))
+            } else if row.rule == "pmtu.blackhole" {
+                Some((times.pmtu, 120))
+            } else if matches!(
+                row.rule.as_str(),
+                "tcp.connect_failures" | "tcp.timewait_exhaustion"
+            ) {
+                Some((times.kernel, 15))
+            } else if row.rule.starts_with("egress.") {
+                Some((times.egress, 30))
+            } else if row.rule.starts_with("path.") {
                 Some((times.path, 120))
             } else if row.rule.starts_with("tcp.") && row.rule != "tcp.bufferbloat_local" {
                 Some((times.sockets, 30))
@@ -341,6 +398,8 @@ impl Engine {
                 || row.rule.starts_with("wifi.")
             {
                 Some((times.interface, 15))
+            } else if row.rule.starts_with("target.") {
+                Some((times.targets, TARGET_STALE_SECS))
             } else {
                 None
             };
@@ -553,7 +612,8 @@ impl Engine {
                     }))
                 }
                 super::issue::Subject::Path { target } => {
-                    scoped.paths.retain(|p| &p.target == target)
+                    scoped.paths.retain(|p| &p.target == target);
+                    scoped.active.pmtu = scoped.active.pmtu.filter(|p| p.target.as_ref() == Some(target))
                 }
                 super::issue::Subject::Socket { local, remote } => scoped
                     .sockets
@@ -561,16 +621,26 @@ impl Engine {
                 super::issue::Subject::Iface { name } => {
                     scoped.iface = scoped.iface.filter(|i| &i.name == name)
                 }
+                super::issue::Subject::Target { name } => {
+                    scoped.targets.retain(|t| &t.name == name && (issue.scope.configuration.is_none() || issue.scope.configuration == t.baseline_key))
+                }
                 _ => {}
             }
             let mut values = metric_values(&scoped);
             add_sigma_metrics(&mut values, &scoped, base);
-            let holding = self.coverage.rules.iter().any(|r| {
-                r.rule == issue.rule && r.status == super::coverage::Availability::Available
-            }) && match values.get(&issue.verify.metric) {
-                Some(v) => issue.verify.holds(*v),
-                // Missing evidence is not recovery; reset the hold timer.
-                None => false,
+            let holding = if issue.rule.starts_with("egress.") {
+                obs.egress
+                    .as_ref()
+                    .and_then(|o| o.recovered(&issue.subject, &issue.rule))
+                    == Some(true)
+            } else {
+                self.coverage.rules.iter().any(|r| {
+                    r.rule == issue.rule && r.status == super::coverage::Availability::Available
+                }) && match values.get(&issue.verify.metric) {
+                    Some(v) => issue.verify.holds(*v),
+                    // Missing evidence is not recovery; reset the hold timer.
+                    None => false,
+                }
             };
 
             if !holding {
@@ -589,6 +659,9 @@ impl Engine {
                     };
                     let max_gap = if issue.rule.starts_with("nat.") {
                         300
+                    } else if issue.rule.starts_with("target.") {
+                        // Targets are probed once a minute by default.
+                        TARGET_STALE_SECS / 3
                     } else if issue.rule.starts_with("path.") {
                         120
                     } else if issue.rule.starts_with("link.")
@@ -1095,6 +1168,18 @@ impl Verdict {
 /// back inside 3σ — not when it drops below some absolute number, which would
 /// be a different claim on every network.
 fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base: &BaselineStore) {
+    if let Some(t) = obs.targets.first() {
+        let readings = t.stage_readings();
+        let worst = readings
+            .iter()
+            .filter_map(|(metric, ms)| {
+                base.get(t.baseline_subject(), metric)
+                    .and_then(|b| b.sigma_above(*ms))
+            })
+            .reduce(f64::max);
+        // Every stage within its baseline, or none has one yet: nothing slow.
+        values.insert("target.worst_stage_sigma".into(), worst.unwrap_or(0.0));
+    }
     if let Some(gw) = &obs.gateway {
         if let (Some(addr), Some(rtt)) = (&gw.addr, gw.rtt_ms) {
             if let Some(sigma) = base
@@ -1126,6 +1211,42 @@ fn add_sigma_metrics(values: &mut HashMap<String, f64>, obs: &Observations, base
 /// vocabulary is what lets a rule declare its own success condition.
 fn metric_values(obs: &Observations) -> HashMap<String, f64> {
     let mut m = HashMap::new();
+    for (r, metric) in [
+        ("ipv6.broken", "ipv6.probe_loss"),
+        ("captive.portal", "captive.probe_204"),
+        ("pmtu.blackhole", "pmtu.transfer_ok"),
+    ] {
+        if let Some(o) = obs.active.get(r) {
+            if matches!(
+                o.outcome,
+                super::active::Outcome::Healthy | super::active::Outcome::Fault
+            ) {
+                let healthy = o.outcome == super::active::Outcome::Healthy;
+                m.insert(
+                    metric.into(),
+                    if r == "ipv6.broken" {
+                        if healthy {
+                            0.0
+                        } else {
+                            100.0
+                        }
+                    } else if healthy {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                );
+            }
+        }
+    }
+    if let Some(k) = &obs.kernel {
+        if let Some(v) = k.failures_per_minute {
+            m.insert("tcp.connect_failure_rate".into(), v);
+        }
+        if let Some(v) = k.timewait_port_pct {
+            m.insert("tcp.timewait_pct".into(), v);
+        }
+    }
     if let Some(dns) = &obs.dns {
         if let Some(p50) = dns.rtt_p50_ms {
             m.insert("dns.rtt_p50".to_string(), p50);
@@ -1180,6 +1301,20 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
     if let (Some(idle), Some(loaded)) = (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
         m.insert("tcp.loaded_rtt_delta".to_string(), loaded - idle);
     }
+    // Scoped to one target by the caller; outside that, the first target.
+    if let Some(t) = obs.targets.first() {
+        let flag = |ok: bool| if ok { 1.0 } else { 0.0 };
+        m.insert("target.resolve_ok".into(), flag(t.resolve.is_ok()));
+        if let Some(c) = &t.connect {
+            m.insert("target.connect_ok".into(), flag(c.is_ok()));
+        }
+        if let Some(s) = &t.tls_stage {
+            m.insert("target.tls_ok".into(), flag(s.is_ok()));
+        }
+        if let Some(h) = &t.http_stage {
+            m.insert("target.http_ok".into(), flag(h.is_ok()));
+        }
+    }
     for path in &obs.paths {
         if let Some(previous) = &path.previous {
             if !previous.is_empty()
@@ -1220,7 +1355,7 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
     {
         m.insert("tcp.socket_rtt".to_string(), worst);
     }
-    if let Some(worst) = obs.sockets.iter().map(|s| s.retrans).max() {
+    if let Some(worst) = obs.sockets.iter().filter_map(|s| s.retrans).max() {
         m.insert("tcp.retrans_rate".to_string(), worst as f64);
     }
     if let Some(min_rwnd) = obs.sockets.iter().filter_map(|s| s.rwnd).min() {
@@ -1545,6 +1680,74 @@ mod tests {
         assert_eq!(
             e.get(&id).unwrap().verification.as_ref().unwrap().outcome,
             Some(VerifyOutcome::Partial)
+        );
+    }
+
+    #[test]
+    fn a_target_issue_needs_three_probes_and_closes_when_the_target_recovers() {
+        use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
+        let (mut e, _clock) = hysteresis_engine_at("2026-09-15 10:00:00");
+        let b = base();
+        let target = |refused: bool| TargetObs {
+            baseline_key: None,
+            name: "api".into(),
+            host: "127.0.0.1".into(),
+            port: 8443,
+            tls: false,
+            http: false,
+            expect_status: None,
+            probed_at: String::new(),
+            resolve: Stage {
+                ms: Some(0.0),
+                error: None,
+            },
+            addresses: vec!["127.0.0.1".into()],
+            lookups: vec![],
+            connect: Some(Stage {
+                ms: Some(1.0),
+                error: refused.then_some(StageError::Refused),
+            }),
+            connect_v4: None,
+            connect_v6: None,
+            tls_stage: None,
+            http_stage: None,
+            status: None,
+            context: TargetContext::default(),
+        };
+        let obs = |refused| Observations {
+            targets: vec![target(refused)],
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let mut times = ObservationTimes::default();
+        let mut tick = |e: &mut Engine, refused: bool, probe: u64, secs: u64| {
+            times.targets = Some(start + std::time::Duration::from_secs(probe * 60));
+            e.observe_live_at(
+                &obs(refused),
+                &b,
+                &times,
+                start + std::time::Duration::from_secs(secs),
+            );
+        };
+        // One probe result seen on many ticks is one sample.
+        for s in 0..30 {
+            tick(&mut e, true, 0, s);
+        }
+        assert_eq!(e.open_count(), 0);
+        tick(&mut e, true, 1, 60);
+        tick(&mut e, true, 2, 120);
+        assert_eq!(e.open_count(), 1);
+        let issue = e.primary()[0].clone();
+        assert_eq!(issue.rule, "target.connect_failed");
+        assert_eq!(issue.subject.label(), "api");
+
+        for p in 3..6 {
+            tick(&mut e, false, p, p * 60);
+        }
+        assert!(
+            !e.get(&issue.id).unwrap().state.is_open(),
+            "{:?}",
+            e.get(&issue.id).unwrap().state
         );
     }
 
@@ -1906,7 +2109,7 @@ mod tests {
             process: Some("ncat".into()),
             rtt_ms: Some(rtt),
             rttvar_ms: Some(10.0),
-            retrans: 12,
+            retrans: Some(12),
             cwnd: Some(10),
             ssthresh: Some(u32::MAX),
             rwnd: Some(64_000),

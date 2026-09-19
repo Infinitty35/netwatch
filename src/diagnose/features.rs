@@ -40,6 +40,8 @@ pub enum Group {
     Check,
     /// Discriminating tests run against the issue.
     Test,
+    /// The developer target the issue is about.
+    Target,
     /// Which rule inputs were available.
     Coverage,
     /// The issue and the host it was raised on.
@@ -330,6 +332,113 @@ fn build(input: &Input<'_>) -> Builder {
                 super::next_test::Outcome::Inconclusive => 0.0,
             });
         b.put(format!("test.{}", spec.id), value);
+    }
+
+    // ------------------------------------------------------ target
+    b.group(Group::Target);
+    let target = match input.issue.map(|i| &i.subject) {
+        Some(super::issue::Subject::Target { name }) => {
+            obs.targets.iter().find(|t| &t.name == name)
+        }
+        _ => None,
+    };
+    let stage_ok = |s: Option<&super::targets::Stage>| s.map(|s| s.is_ok());
+    let stage_ms = |s: Option<&super::targets::Stage>| s.and_then(|s| s.ms);
+    b.flag("target.resolve_ok", target.map(|t| t.resolve.is_ok()));
+    b.flag(
+        "target.connect_ok",
+        target.and_then(|t| stage_ok(t.connect.as_ref())),
+    );
+    b.flag(
+        "target.tls_ok",
+        target.and_then(|t| stage_ok(t.tls_stage.as_ref())),
+    );
+    b.flag(
+        "target.http_ok",
+        target.and_then(|t| stage_ok(t.http_stage.as_ref())),
+    );
+    b.put("target.resolve_ms", target.and_then(|t| t.resolve.ms));
+    b.put(
+        "target.connect_ms",
+        target.and_then(|t| stage_ms(t.connect.as_ref())),
+    );
+    b.put(
+        "target.tls_ms",
+        target.and_then(|t| stage_ms(t.tls_stage.as_ref())),
+    );
+    b.put(
+        "target.ttfb_ms",
+        target.and_then(|t| stage_ms(t.http_stage.as_ref())),
+    );
+    b.put(
+        "target.status",
+        target.and_then(|t| t.status.map(f64::from)),
+    );
+    b.flag(
+        "target.v6_fails_v4_ok",
+        target.and_then(|t| match (&t.connect_v4, &t.connect_v6) {
+            (Some(v4), Some(v6)) => Some(v4.is_ok() && !v6.is_ok()),
+            _ => None,
+        }),
+    );
+    use super::targets::{LookupOutcome, StageError};
+    let lookups = |o: LookupOutcome| {
+        target.map(|t| t.lookups.iter().filter(|l| l.outcome == o).count() as f64)
+    };
+    b.put("target.lookups_answered", lookups(LookupOutcome::Answered));
+    b.put("target.lookups_nxdomain", lookups(LookupOutcome::NxDomain));
+    b.put(
+        "target.lookups_failed",
+        target.map(|t| {
+            t.lookups
+                .iter()
+                .filter(|l| matches!(l.outcome, LookupOutcome::ServFail | LookupOutcome::NoReply))
+                .count() as f64
+        }),
+    );
+    b.flag("target.proxy_env", target.map(|t| t.context.proxy_env));
+    b.flag(
+        "target.vpn_up",
+        target.map(|t| !t.context.vpn_ifaces.is_empty()),
+    );
+    b.put(
+        "target.clock_offset_secs",
+        target.and_then(|t| t.context.clock_offset_secs),
+    );
+    let first_error = target.and_then(|t| {
+        [
+            Some(&t.resolve),
+            t.connect.as_ref(),
+            t.tls_stage.as_ref(),
+            t.http_stage.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|s| s.error.clone())
+    });
+    for (label, matches) in [
+        (
+            "nxdomain",
+            (|e: &StageError| *e == StageError::NxDomain) as fn(&StageError) -> bool,
+        ),
+        ("resolver_failed", |e| *e == StageError::ResolverFailed),
+        ("timeout", |e| {
+            matches!(e, StageError::Timeout | StageError::Unreachable)
+        }),
+        ("refused", |e| *e == StageError::Refused),
+        ("cert_untrusted", |e| *e == StageError::CertUntrusted),
+        ("cert_validity", |e| {
+            matches!(e, StageError::CertExpired | StageError::CertNotYetValid)
+        }),
+        ("cert_name", |e| *e == StageError::CertNameMismatch),
+        ("http_status", |e| {
+            matches!(e, StageError::HttpStatus { .. })
+        }),
+    ] {
+        b.flag(
+            format!("target.error.{label}"),
+            target.map(|_| first_error.as_ref().is_some_and(matches)),
+        );
     }
 
     // ------------------------------------------------------ coverage

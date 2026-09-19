@@ -125,8 +125,322 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
     // and the body renders it in full a line below. Two copies of the same
     // sentence, stacked, reads as a rendering bug.
     crate::ui::widgets::render_header_without_verdict(f, app, chunk_header(area));
-    render_body(f, &view, chunk_body(area));
-    crate::ui::widgets::render_footer(f, app, chunk_footer(area), footer_hints(&view));
+    if app.diagnose.show_coverage {
+        render_coverage(f, app, chunk_body(area));
+    } else {
+        render_body(f, &view, chunk_body(area));
+    }
+    let hints = if app.diagnose.show_coverage {
+        vec![
+            crate::ui::widgets::hint("↑/↓", "select check"),
+            crate::ui::widgets::hint("t", "run"),
+            crate::ui::widgets::hint("x", "cancel"),
+            crate::ui::widgets::hint("r", "reload config"),
+            crate::ui::widgets::hint("[/]", "target"),
+            crate::ui::widgets::hint("c", "back to issues"),
+        ]
+    } else {
+        footer_hints(&view)
+    };
+    crate::ui::widgets::render_footer(f, app, chunk_footer(area), hints);
+}
+
+fn render_coverage(f: &mut Frame, app: &crate::app::App, area: Rect) {
+    let coverage = app.diagnose.engine.coverage();
+    let selected = app
+        .diagnose
+        .coverage_selected
+        .min(coverage.rules.len().saturating_sub(1));
+    let details = coverage
+        .rules
+        .get(selected)
+        .map(|row| coverage_details(app, row))
+        .unwrap_or_default();
+    draw_coverage(f, &app.theme, &coverage.rules, selected, &details, area);
+}
+
+/// Label/value rows for the selected check's detail panel.
+fn coverage_details(
+    app: &crate::app::App,
+    row: &crate::diagnose::coverage::RuleCoverage,
+) -> Vec<(&'static str, String)> {
+    let times = &app.diagnose.sampler.completed;
+    let at = match row.rule.split('.').next().unwrap_or("") {
+        "ipv6" => times.ipv6,
+        "captive" => times.portal,
+        "pmtu" => times.pmtu,
+        "tcp"
+            if matches!(
+                row.rule.as_str(),
+                "tcp.connect_failures" | "tcp.timewait_exhaustion"
+            ) =>
+        {
+            times.kernel
+        }
+        "dns" => times.health.dns,
+        "gateway" => times.health.gateway,
+        "link" | "iface" | "wifi" => times.interface,
+        "path" => times.path,
+        "nat" => times.health.nat,
+        "egress" => times.egress,
+        "target" => times.targets,
+        "tcp" if row.rule == "tcp.bufferbloat_local" => {
+            app.diagnose.sampler.load_test.map(|(at, _, _)| at)
+        }
+        "tcp" => times.sockets,
+        _ => None,
+    };
+    let age = at
+        .map(|at| format!("{}s ago", at.elapsed().as_secs()))
+        .unwrap_or_else(|| "no completed sample".into());
+    let mut out = vec![
+        ("Why", row.reason.clone()),
+        ("Source", format!("{} · {age}", row.source())),
+        ("Next", row.next_action().to_string()),
+    ];
+    if row.rule == "tcp.bufferbloat_local" {
+        out.push((
+            "Cost",
+            "t starts up to 25 MB upload to speed.cloudflare.com; ~15–45s, may slow other traffic"
+                .into(),
+        ));
+    }
+    let (active, _, progress) = app.diagnose.active_prober.snapshot();
+    if let Some(result) = active.get(&row.rule) {
+        out.push(("Result", result.detail.clone()));
+    }
+    if !progress.is_empty()
+        && matches!(
+            row.rule.as_str(),
+            "ipv6.broken" | "captive.portal" | "pmtu.blackhole"
+        )
+    {
+        out.push(("Progress", progress));
+    }
+    if row.rule.starts_with("target.") {
+        let (targets, _) = app
+            .diagnose
+            .target_prober
+            .fresh(&app.user_config.diagnose_targets);
+        if targets.is_empty() {
+            out.push((
+                "Setup",
+                "add [[diagnose_targets]] name, host, port, http, tls, path to config.toml; t probes now"
+                    .into(),
+            ));
+        }
+        let selected = app
+            .user_config
+            .diagnose_targets
+            .get(app.diagnose.target_selected);
+        if let Some(cfg) = selected {
+            out.push((
+                "Target",
+                format!(
+                    "{}/{}: {}{} ({}:{}) · [/] select · d enable/disable",
+                    app.diagnose.target_selected + 1,
+                    app.user_config.diagnose_targets.len(),
+                    cfg.name,
+                    if cfg.enabled { "" } else { " [disabled]" },
+                    cfg.host,
+                    cfg.port
+                ),
+            ));
+        }
+        for (_, t) in targets
+            .iter()
+            .filter(|(_, t)| selected.is_some_and(|cfg| cfg.name == t.name))
+        {
+            let stage = |s: Option<&crate::diagnose::targets::Stage>| {
+                s.map(|s| {
+                    if let Some(e) = &s.error {
+                        e.label()
+                    } else {
+                        format!("{:.0}ms", s.ms.unwrap_or_default())
+                    }
+                })
+                .unwrap_or_else(|| "not run".into())
+            };
+            out.push((
+                "Stages",
+                format!(
+                    "DNS {} · TCP {} · TLS {} · HTTP {}",
+                    stage(Some(&t.resolve)),
+                    stage(t.connect.as_ref()),
+                    stage(t.tls_stage.as_ref()),
+                    stage(t.http_stage.as_ref())
+                ),
+            ));
+        }
+    }
+    if app.diagnose.tests.any_running("coverage") {
+        out.push(("Running", "measurement in progress…".into()));
+    }
+    if let Some(status) = &app.diagnose.status {
+        out.push(("Status", status.clone()));
+    }
+    out
+}
+
+/// Colour for an availability: green when the rule can fire, amber when it is
+/// waiting on something that will come, muted when it is off by choice or has
+/// nothing to watch, red when a collector is broken.
+fn availability_color(t: &Theme, a: &crate::diagnose::coverage::Availability) -> Color {
+    use crate::diagnose::coverage::Availability as A;
+    match a {
+        A::Available => t.status_good,
+        A::Learning | A::AwaitingTest | A::Stale | A::NotMeasured => t.status_warn,
+        A::PermissionDenied | A::CollectorFailed => t.status_error,
+        A::NotConfigured
+        | A::NoSubjects
+        | A::NotApplicable
+        | A::Unsupported
+        | A::NotImplemented
+        | A::Unknown => t.text_muted,
+    }
+}
+
+/// The coverage view: every rule in a scrolling table grouped by area, and
+/// the selected rule's detail in a panel below it.
+fn draw_coverage(
+    f: &mut Frame,
+    t: &Theme,
+    rules: &[crate::diagnose::coverage::RuleCoverage],
+    selected: usize,
+    details: &[(&'static str, String)],
+    area: Rect,
+) {
+    use crate::diagnose::coverage::Availability;
+    use ratatui::widgets::{Cell, Row, Table, TableState};
+
+    // Detail panel sized to its content (label rows + borders),
+    // never more than half the body so the table stays the main thing.
+    let detail_h = (details.len() as u16 + 2).min(area.height / 2).max(4);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Min(6), Constraint::Length(detail_h)]).areas(area);
+
+    let ready = rules
+        .iter()
+        .filter(|r| r.status == Availability::Available)
+        .count();
+    // Titles only when there is room for them; the detail panel always names
+    // the selected rule's title, so narrow terminals lose nothing essential.
+    let wide = area.width >= 130;
+    let mut header = vec!["Area", "Check", "Title", "Status", "Why"];
+    if !wide {
+        header.remove(2);
+    }
+    let header = Row::new(header).style(Style::default().fg(t.key_hint).bold());
+    let mut previous_area = "";
+    let body: Vec<Row> = rules
+        .iter()
+        .map(|row| {
+            let (group, _) = row.rule.split_once('.').unwrap_or((row.rule.as_str(), ""));
+            // Name each area once, on its first row, so groups read as groups.
+            let group_cell = if group == previous_area {
+                String::new()
+            } else {
+                group.to_string()
+            };
+            previous_area = group;
+            let title = rules::lookup(&row.rule).map(|r| r.title).unwrap_or("");
+            let color = availability_color(t, &row.status);
+            let dot = if row.status == Availability::Available {
+                "●"
+            } else {
+                "○"
+            };
+            let mut cells = vec![
+                Cell::from(group_cell).style(Style::default().fg(t.text_secondary).bold()),
+                Cell::from(row.rule.clone()).style(Style::default().fg(t.text_primary)),
+                Cell::from(format!("{dot} {}", row.status.label()))
+                    .style(Style::default().fg(color)),
+                Cell::from(row.reason.clone()).style(Style::default().fg(t.text_muted)),
+            ];
+            if wide {
+                cells.insert(
+                    2,
+                    Cell::from(title).style(Style::default().fg(t.text_secondary)),
+                );
+            }
+            Row::new(cells)
+        })
+        .collect();
+
+    let position = if rules.is_empty() {
+        " no rules ".to_string()
+    } else {
+        format!(" {}/{} ", selected + 1, rules.len())
+    };
+    let mut widths = vec![
+        Constraint::Length(9),  // area
+        Constraint::Length(25), // check: "tcp.timewait_exhaustion" + gap
+        Constraint::Length(20), // status: "○ permission denied"
+        Constraint::Min(20),    // why
+    ];
+    if wide {
+        // "target refuses or drops connections"
+        widths.insert(2, Constraint::Length(36));
+    }
+    let table = Table::new(body, widths)
+        .header(header)
+        .highlight_style(Style::default().bg(t.selection_bg))
+        .highlight_symbol("› ")
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
+        .block(
+            widgets::panel_block(t)
+                .title_top(Line::from(vec![
+                    Span::styled(
+                        " diagnose coverage ",
+                        Style::default().fg(t.text_primary).bold(),
+                    ),
+                    Span::styled(
+                        format!("{ready}/{} ready ", rules.len()),
+                        Style::default().fg(t.status_good),
+                    ),
+                ]))
+                .title_top(
+                    Line::from(Span::styled(position, Style::default().fg(t.text_muted)))
+                        .right_aligned(),
+                ),
+        );
+    let mut state = TableState::default().with_selected((!rules.is_empty()).then_some(selected));
+    f.render_stateful_widget(table, table_area, &mut state);
+
+    let Some(row) = rules.get(selected) else {
+        f.render_widget(widgets::panel_block(t), detail_area);
+        return;
+    };
+    let label_w = details.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    let lines: Vec<Line> = details
+        .iter()
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {label:>label_w$}  "),
+                    Style::default().fg(t.key_hint),
+                ),
+                Span::styled(value.clone(), Style::default().fg(t.text_primary)),
+            ])
+        })
+        .collect();
+    let title = rules::lookup(&row.rule).map(|r| r.title).unwrap_or("");
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(widgets::panel_block(t).title_top(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", row.rule),
+                    Style::default().fg(t.text_primary).bold(),
+                ),
+                Span::styled(format!("{title} "), Style::default().fg(t.text_secondary)),
+                Span::styled(
+                    format!("· {} ", row.status.label()),
+                    Style::default().fg(availability_color(t, &row.status)),
+                ),
+            ]))),
+        detail_area,
+    );
 }
 
 fn chunk_header(area: Rect) -> Rect {
@@ -172,7 +486,12 @@ fn selected_issue(app: &crate::app::App) -> Option<String> {
 
 pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
     use crate::ui::widgets::hint;
-    let mut hints = vec![hint("↑↓", "issue")];
+    // Issue keys only when there is an issue to point them at.
+    let open = !view.engine.primary().is_empty();
+    let mut hints = Vec::new();
+    if open {
+        hints.push(hint("↑↓", "issue"));
+    }
     if view
         .current()
         .map(|i| has_applicable_step(i, view.capability))
@@ -191,8 +510,11 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
             hints.push(hint("d", "done it"));
         }
     }
-    hints.push(hint("a", "ack"));
-    hints.push(hint("m", "mute"));
+    hints.push(hint("c", "coverage"));
+    if open {
+        hints.push(hint("a", "ack"));
+        hints.push(hint("m", "mute"));
+    }
     // The same words the report panel puts on this key. Two labels for one
     // key is the defect the footer's deduplication exists to prevent; it
     // catches a key bound twice, not a key named twice.
@@ -232,25 +554,32 @@ fn has_applicable_step(issue: &Issue, cap: Capability) -> bool {
 /// Draw everything between the header and the footer.
 pub fn render_body(f: &mut Frame, view: &View, area: Rect) {
     let status_rows = if view.status.is_some() { 1 } else { 0 };
+    // The engine strip only earns its rows in demo mode, where it carries the
+    // banner. Otherwise baselines and coverage are one clause of the verdict
+    // line, not a second copy of it in a box.
+    let strip_rows = if view.demo_banner.is_some() { 3 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),           // verdict line
-            Constraint::Length(3),           // engine status strip
+            Constraint::Length(strip_rows),  // demo banner
             Constraint::Min(6),              // issues + detail, or the report
             Constraint::Length(status_rows), // transient status
         ])
         .split(area);
 
     render_verdict(f, view, chunks[0]);
-    render_engine_strip(f, view, chunks[1]);
-    // `o` swaps the working view for the whole report rather than opening a
-    // nine-row slot under it. The preview already fills whatever the detail
-    // pane leaves, so a toggle that merely revealed it would be showing the
-    // same thing twice; what it is for is reading the report at length.
+    if strip_rows > 0 {
+        render_engine_strip(f, view, chunks[1]);
+    }
+    // `o` swaps the working view for the whole report. With nothing open the
+    // page says so once and gets out of the way — no catalogue, no preview,
+    // no empty issue and detail boxes.
     if view.show_report {
         render_report_preview(f, view, chunks[2]);
+    } else if view.engine.primary().is_empty() {
+        render_nothing_open(f, view, chunks[2]);
     } else {
         render_main(f, view, chunks[2]);
     }
@@ -273,23 +602,46 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
     let t = view.theme;
     let verdict = view.engine.verdict(view.baselines);
 
+    let coverage = view.engine.coverage();
+    let watching = format!(
+        "watching {} of {} checks",
+        coverage
+            .rules
+            .iter()
+            .filter(|r| r.status == crate::diagnose::coverage::Availability::Available)
+            .count(),
+        coverage.rules.len()
+    );
     let spans: Vec<Span> = match &verdict {
-        Verdict::Clear => vec![
+        // "Nothing found", never "healthy": the clause after it says how much
+        // of the ruleset that is based on.
+        Verdict::Clear | Verdict::Incomplete { .. } => vec![
             Span::styled("● ", Style::default().fg(t.status_good)),
-            Span::styled(
-                "no issues open · baselines ready",
-                Style::default().fg(t.text_muted),
-            ),
+            Span::styled("no issues found", Style::default().fg(t.text_primary)),
+            Span::styled(format!(" · {watching}"), Style::default().fg(t.text_muted)),
         ],
-        // Not a health claim. A host that hasn't learned its network yet says
-        // so, rather than rendering the reassuring green it hasn't earned.
-        Verdict::Learning { detail } | Verdict::Incomplete { detail } => vec![
-            Span::styled("◌ ", Style::default().fg(t.text_muted)),
-            Span::styled(
-                format!("no issues detected · {detail}"),
-                Style::default().fg(t.text_muted),
-            ),
-        ],
+        // A host that hasn't learned its network yet says so, rather than
+        // rendering the reassuring green it hasn't earned.
+        Verdict::Learning { .. } => {
+            let readiness = view.baselines.overall_readiness();
+            let learning = if view.baselines.switched_network() {
+                format!(
+                    "new network {} · baselines {}",
+                    view.baselines.fingerprint().label(),
+                    readiness.label()
+                )
+            } else {
+                format!("baselines {}", readiness.label())
+            };
+            vec![
+                Span::styled("◌ ", Style::default().fg(t.text_muted)),
+                Span::styled("no issues found yet", Style::default().fg(t.text_primary)),
+                Span::styled(
+                    format!(" · {learning} · {watching}"),
+                    Style::default().fg(t.text_muted),
+                ),
+            ]
+        }
         Verdict::Issues {
             severity,
             count,
@@ -343,16 +695,10 @@ fn render_engine_strip(f: &mut Frame, view: &View, area: Rect) {
     // palette-deferring theme and a screenshot at any size.
     if let Some(banner) = &view.demo_banner {
         let block = widgets::panel_block(t).border_style(Style::default().fg(t.status_warn));
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {banner} "),
-                Style::default().fg(t.text_inverse).bg(t.status_warn).bold(),
-            ),
-            Span::styled(
-                format!("  ruleset {}", view.engine.coverage().label()),
-                Style::default().fg(t.text_muted),
-            ),
-        ]);
+        let line = Line::from(Span::styled(
+            format!(" {banner} "),
+            Style::default().fg(t.text_inverse).bg(t.status_warn).bold(),
+        ));
         f.render_widget(Paragraph::new(line).block(block), area);
         return;
     }
@@ -424,25 +770,22 @@ fn render_main(f: &mut Frame, view: &View, area: Rect) {
     // stays empty rather than being padded into one of them. A list panel
     // stretched to fill a column is the layout bug the v0.29 review found on
     // four tabs at once.
-    let chrono_rows = chronology_height(view);
-    let catalogue_rows = explainer_height();
+    // The chronology only adds something when there is an order to show:
+    // more than one tracked issue, or a consequence or closure the list omits.
+    let chrono_rows = if view.engine.issues().len() > 1 {
+        chronology_height(view)
+    } else {
+        0
+    };
     let list_needed = (issues.len().max(1) * ROWS_PER_ISSUE) as u16 + 2;
-    let list_height = list_needed.min(
-        area.height
-            .saturating_sub((chrono_rows + catalogue_rows).min(area.height)),
-    );
+    let list_height = list_needed.min(area.height.saturating_sub(chrono_rows.min(area.height)));
 
-    // The catalogue anchors to the bottom of the column. Every panel is still
-    // sized to its own content — the slack just sits between two boxes instead
-    // of trailing off the last one, which reads as spacing rather than as a
-    // column that ran out.
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(list_height),
             Constraint::Length(chrono_rows),
             Constraint::Min(0),
-            Constraint::Length(catalogue_rows),
         ])
         .split(columns[0]);
 
@@ -450,46 +793,112 @@ fn render_main(f: &mut Frame, view: &View, area: Rect) {
     if left[1].height >= MIN_CHRONOLOGY_ROWS {
         render_chronology(f, view, left[1]);
     }
-    if left[3].height >= MIN_EXPLAINER_ROWS {
-        render_explainer(f, view, left[3]);
+    // Content-sized; the space under it stays empty. The full report is one
+    // key away (`o`), not squeezed in as filler.
+    render_detail(f, view, columns[1]);
+}
+
+/// The page when nothing is open: one short panel saying so, plus the two
+/// things worth a look even on a quiet network — a collector that has broken,
+/// and issues that opened and closed while you were away. Neither appears
+/// unless it has something in it.
+fn render_nothing_open(f: &mut Frame, view: &View, area: Rect) {
+    use crate::diagnose::coverage::Availability;
+    let t = view.theme;
+    let coverage = view.engine.coverage();
+
+    let waiting = coverage
+        .rules
+        .iter()
+        .filter(|r| r.status != Availability::Available)
+        .count();
+    let mut quiet = vec![Line::from(Span::styled(
+        " Nothing to report. Diagnose re-checks continuously and raises an issue here when something breaks.",
+        Style::default().fg(t.text_secondary),
+    ))];
+    if waiting > 0 {
+        quiet.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    " {waiting} {} waiting on a test, configuration or more data — ",
+                    if waiting == 1 {
+                        "check is"
+                    } else {
+                        "checks are"
+                    }
+                ),
+                Style::default().fg(t.text_muted),
+            ),
+            Span::styled("c", Style::default().fg(t.key_hint).bold()),
+            Span::styled(" shows which.", Style::default().fg(t.text_muted)),
+        ]));
     }
 
-    // The detail pane takes the rows it needs; the report preview takes the
-    // rest. It is generated from the same `Vec<Issue>` the pane above it is
-    // reading, so the filler is the screen's own conclusions rather than
-    // padding — and there is always more of it than there is room.
-    let used = render_detail(f, view, columns[1]);
-    let rest = Rect {
-        y: columns[1].y + used,
-        height: columns[1].height.saturating_sub(used),
-        ..columns[1]
-    };
-    if rest.height >= MIN_REPORT_ROWS {
-        render_report_preview(f, view, rest);
+    let broken: Vec<_> = coverage
+        .rules
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                Availability::CollectorFailed | Availability::PermissionDenied
+            )
+        })
+        .collect();
+    let history = view.engine.issues().len();
+
+    let mut constraints = vec![Constraint::Length(quiet.len() as u16 + 2)];
+    if !broken.is_empty() {
+        constraints.push(Constraint::Length(broken.len() as u16 + 2));
+    }
+    if history > 0 {
+        constraints.push(Constraint::Length(chronology_height(view)));
+    }
+    constraints.push(Constraint::Min(0));
+    let rows = Layout::vertical(constraints).split(area);
+
+    f.render_widget(
+        Paragraph::new(quiet)
+            .wrap(Wrap { trim: false })
+            .block(widgets::Panel::new("diagnose").block(t)),
+        rows[0],
+    );
+    let mut next = 1;
+    if !broken.is_empty() {
+        let width = broken.iter().map(|r| r.rule.len()).max().unwrap_or(0);
+        let lines: Vec<Line> = broken
+            .iter()
+            .map(|r| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<width$}  ", r.rule),
+                        Style::default().fg(t.text_primary),
+                    ),
+                    Span::styled(
+                        format!("{:<18}", r.status.label()),
+                        Style::default().fg(t.status_error),
+                    ),
+                    Span::styled(r.reason.clone(), Style::default().fg(t.text_muted)),
+                ])
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(
+                widgets::Panel::new("needs attention")
+                    .meta("these checks cannot run")
+                    .block(t),
+            ),
+            rows[next],
+        );
+        next += 1;
+    }
+    if history > 0 && rows[next].height >= MIN_CHRONOLOGY_ROWS {
+        render_chronology(f, view, rows[next]);
     }
 }
 
 const ROWS_PER_ISSUE: usize = 3;
-/// Below this the catalogue cannot say anything useful, so it is not drawn.
-const MIN_EXPLAINER_ROWS: u16 = 6;
 /// Two borders and a row: below this the chronology has nowhere to draw.
-const MIN_CHRONOLOGY_ROWS: u16 = 4;
-/// Below this the report preview shows a heading and nothing under it, which
-/// is worse than leaving the space alone.
-const MIN_REPORT_ROWS: u16 = 5;
-
-/// Rows the catalogue panel needs: one per active category, the `?` line, and
-/// the two borders. Derived from the catalogue so adding a category cannot
-/// silently clip the panel.
-fn explainer_height() -> u16 {
-    let mut categories: Vec<&str> = rules::CATALOGUE
-        .iter()
-        .filter(|r| r.status.is_active())
-        .map(|r| r.category)
-        .collect();
-    categories.dedup();
-    categories.len() as u16 + 3
-}
+const MIN_CHRONOLOGY_ROWS: u16 = 3;
 
 /// Width the widest row of an issue actually needs, so the column is sized to
 /// its content instead of to a guess.
@@ -504,84 +913,6 @@ fn issue_row_width(i: &&Issue) -> usize {
         }
     }
     title.max(value)
-}
-
-/// What the engine is looking for, in the space the issue list doesn't need.
-///
-/// A user staring at an empty or short list deserves to know what netwatch
-/// would have caught. One line per category — the count, then the rule names
-/// in that category — derived from the catalogue so it cannot drift from what
-/// actually runs.
-///
-/// It used to print every rule's full plain-English trigger. In a column
-/// sized to the issue list that meant twenty-five lines, every one of them
-/// ending in `…`, which is a worse answer than a shorter one: the reader
-/// learns nothing from a truncated sentence and the panel outgrew the issues
-/// it sits beneath. The full triggers live behind `?`, where there is width
-/// for them.
-fn render_explainer(f: &mut Frame, view: &View, area: Rect) {
-    let t = view.theme;
-
-    let mut categories: Vec<&str> = rules::CATALOGUE
-        .iter()
-        .filter(|r| r.status.is_active())
-        .map(|r| r.category)
-        .collect();
-    categories.dedup();
-
-    // `dns` + count + two spaces of gutter, sized to the widest category so
-    // the name column lines up without a hardcoded width.
-    let label_w = categories.iter().map(|c| c.len()).max().unwrap_or(4);
-    let inner = area.width.saturating_sub(2) as usize;
-
-    let mut lines: Vec<Line> = Vec::new();
-    for category in categories {
-        let rules_in: Vec<&rules::Rule> = rules::CATALOGUE
-            .iter()
-            .filter(|r| r.category == category && r.status.is_active())
-            .collect();
-        if rules_in.is_empty() {
-            continue;
-        }
-        // The rule id minus its category prefix: `dns.slow_resolver` is
-        // already under the `dns` label, so repeating it wastes the width
-        // this panel is short of.
-        let names: Vec<&str> = rules_in
-            .iter()
-            .map(|r| r.id.split_once('.').map(|(_, n)| n).unwrap_or(r.id))
-            .collect();
-        let count = rules_in.len().to_string();
-        // Leading space + category + space + count + two-space gutter.
-        let prefix_w = 1 + label_w + 1 + count.len() + 2;
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {category:<label_w$} "),
-                Style::default().fg(t.text_secondary),
-            ),
-            Span::styled(count, Style::default().fg(t.text_muted)),
-            Span::styled(
-                format!(
-                    "  {}",
-                    ellipsise(&names.join(" · "), inner.saturating_sub(prefix_w))
-                ),
-                Style::default().fg(t.text_muted),
-            ),
-        ]));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled(" ?", Style::default().fg(t.key_hint).bold()),
-        Span::styled(
-            " every rule and what triggers it",
-            Style::default().fg(t.text_muted),
-        ),
-    ]));
-
-    let block = widgets::Panel::new("watching for")
-        .meta(view.engine.coverage().label())
-        .fit(area.width)
-        .block(t);
-    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Every tracked issue in the window, oldest first.
@@ -789,7 +1120,7 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
         let block = widgets::Panel::new("detail").block(t);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "No open issues. netwatch keeps watching; the verdict line above says what it is basing that on.",
+                "No open issues.",
                 Style::default().fg(t.text_muted),
             )))
             .wrap(Wrap { trim: true })
@@ -803,30 +1134,48 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
 
     // ── issue ────────────────────────────────────────────────
     lines.push(section(t, "issue"));
-    let mut ev_line = vec![Span::styled(
+    lines.push(Line::from(Span::styled(
         issue.subject.label(),
         Style::default().fg(t.text_primary).bold(),
-    )];
+    )));
+    // One row per metric, aligned, instead of every figure on one line.
+    let metric_w = issue
+        .evidence
+        .iter()
+        .map(|e| e.metric.chars().count())
+        .max()
+        .unwrap_or(0);
+    let value_w = issue
+        .evidence
+        .iter()
+        .map(|e| e.value_label().chars().count())
+        .max()
+        .unwrap_or(0);
     for e in &issue.evidence {
-        ev_line.push(Span::styled(
-            format!(" · {} {}", e.metric, e.value_label()),
-            Style::default().fg(t.text_primary),
-        ));
+        let mut row = vec![
+            Span::styled(
+                format!("  {:<metric_w$}  ", e.metric),
+                Style::default().fg(t.text_secondary),
+            ),
+            Span::styled(
+                format!("{:<value_w$}", e.value_label()),
+                Style::default().fg(t.text_primary),
+            ),
+        ];
         if let Some(b) = e.baseline_label() {
-            ev_line.push(Span::styled(
-                format!(" ({b}"),
+            row.push(Span::styled(
+                format!("  {b}"),
                 Style::default().fg(t.text_muted),
             ));
             if let Some(m) = e.multiple_label() {
-                ev_line.push(Span::styled(
-                    format!(", {m}"),
+                row.push(Span::styled(
+                    format!(" · {m}"),
                     Style::default().fg(severity_color(issue.severity, t)),
                 ));
             }
-            ev_line.push(Span::styled(")", Style::default().fg(t.text_muted)));
         }
+        lines.push(Line::from(row));
     }
-    lines.push(Line::from(ev_line));
 
     if let Some(e) = issue.headline() {
         if e.samples > 0 {
@@ -1278,6 +1627,48 @@ mod tests {
             .join("\n")
     }
 
+    fn draw_coverage_text(width: u16, selected: usize) -> String {
+        use crate::diagnose::coverage::{Availability, RuleCoverage};
+        let theme = crate::theme::by_name("default");
+        let rules: Vec<RuleCoverage> = rules::CATALOGUE
+            .iter()
+            .map(|r| RuleCoverage {
+                rule: r.id.into(),
+                status: Availability::Available,
+                reason: "inputs present".into(),
+            })
+            .collect();
+        let details = vec![("Why", "inputs present".to_string())];
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|f| draw_coverage(f, &theme, &rules, selected, &details, f.size()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn coverage_scrolls_to_the_selected_rule_and_names_it() {
+        let last = rules::CATALOGUE.len() - 1;
+        let s = draw_coverage_text(150, last);
+        let id = rules::CATALOGUE[last].id;
+        assert!(s.contains("› "), "{s}");
+        assert!(s.contains(&format!("{}/{}", last + 1, last + 1)), "{s}");
+        assert!(s.matches(id).count() >= 2, "row and detail title: {s}");
+        assert!(s.contains("Title"), "{s}");
+        // Narrow: titles drop out of the table but the check ids stay whole.
+        let s = draw_coverage_text(100, last);
+        assert!(!s.contains("Title"), "{s}");
+        assert!(s.contains(id), "{s}");
+    }
+
     #[test]
     fn the_verdict_line_leads_with_the_worst_issue() {
         let s = draw(150, 44, |_| {});
@@ -1346,14 +1737,20 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_strip_states_baseline_and_ruleset_coverage() {
+    fn the_issue_view_carries_no_catalogue_strip_or_preview() {
         let s = draw(150, 44, |_| {});
-        assert!(s.contains("baselines"), "{s}");
-        assert!(s.contains("ruleset"), "{s}");
-        assert!(
-            s.contains("rule inputs available"),
-            "coverage must be stated honestly:\n{s}"
-        );
+        assert!(s.contains("slow dns resolver"), "{s}");
+        for noise in [
+            "watching for",
+            "report.md",
+            "ruleset",
+            "rule inputs available",
+        ] {
+            assert!(
+                !s.contains(noise),
+                "{noise} is back on the issue view:\n{s}"
+            );
+        }
     }
 
     #[test]
@@ -1390,6 +1787,14 @@ mod tests {
             .join("\n");
         assert!(s.contains("no baseline"), "{s}");
         assert!(!s.contains("nominal"), "{s}");
+        assert!(!s.contains("healthy"), "{s}");
+        // Said once, then out of the way: no empty issue/detail boxes, no
+        // catalogue, no report preview.
+        assert!(s.contains("Nothing to report"), "{s}");
+        assert!(s.contains("watching"), "{s}");
+        for noise in ["watching for", "report.md", "nothing open", "detail"] {
+            assert!(!s.contains(noise), "{noise} on a quiet page:\n{s}");
+        }
     }
 
     #[test]
@@ -1532,25 +1937,6 @@ mod tests {
     /// sized to the issue titles, which produced twenty-five lines that all
     /// ended in `…`. A truncated sentence teaches nothing, so the panel now
     /// names categories and rule names and sends the reader to `?`.
-    #[test]
-    fn the_catalogue_summarises_instead_of_ellipsising_every_line() {
-        let s = draw(150, 44, |_| {});
-        assert!(s.contains("watching for"), "{s}");
-        // Real categories and real rule names, derived from the catalogue.
-        assert!(s.contains("dns"), "{s}");
-        assert!(s.contains("slow_resolver"), "{s}");
-        // And it points at where the full triggers live.
-        assert!(s.contains("every rule and what triggers it"), "{s}");
-
-        // No more than a couple of lines may need truncating; the old panel
-        // truncated every single one.
-        let cut = s.lines().filter(|l| l.contains('…')).count();
-        assert!(
-            cut <= 3,
-            "{cut} truncated lines is the old panel again:\n{s}"
-        );
-    }
-
     /// The chronology is the ordering argument the ranking rests on: the
     /// reroute came first, the resolver slowed four minutes later.
     #[test]
@@ -1686,23 +2072,6 @@ mod tests {
     /// the space the detail pane does not need goes to the report — which is
     /// generated from the same issues and is always longer than the room for
     /// it, rather than being padding.
-    #[test]
-    fn the_report_fills_what_the_detail_pane_leaves() {
-        let s = draw(150, 44, |_| {});
-        assert!(s.contains("report.md"), "no preview on a tall screen:\n{s}");
-        // Both columns reach the bottom: the last row carries two closing
-        // corners, not one panel and a run of blank space beside it.
-        let last = s
-            .lines()
-            .rfind(|l| l.contains('╯'))
-            .expect("a closed panel");
-        assert_eq!(
-            last.matches('╯').count(),
-            2,
-            "only one column reaches the bottom:\n{last}"
-        );
-    }
-
     /// A short screen has nothing to spare, so the preview stays away rather
     /// than squeezing the pane it is meant to be filling around.
     #[test]

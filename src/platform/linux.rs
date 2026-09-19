@@ -39,6 +39,57 @@ fn parse_wireless(text: &str) -> HashMap<String, (Option<i32>, u64)> {
     out
 }
 
+/// Modern drivers can expose nl80211 while omitting /proc/net/wireless.
+/// `iw link` queries that interface without requiring root. Its output is
+/// bounded by a kill deadline; only the signal value is retained.
+fn iw_signal(iface: &str) -> Option<i32> {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    if !iface
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    {
+        return None;
+    }
+    let mut child = Command::new("iw")
+        .args(["dev", iface, "link"])
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < Duration::from_millis(500) => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_iw_signal(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_iw_signal(text: &str) -> Option<i32> {
+    text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("signal:")?;
+        let mut words = value.split_whitespace();
+        let level = words.next()?.parse::<i32>().ok()?;
+        (words.next() == Some("dBm") && (-127..=-1).contains(&level)).then_some(level)
+    })
+}
+
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     let mut stats = HashMap::new();
     let net_dir = Path::new("/sys/class/net");
@@ -61,7 +112,7 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
         stats.insert(
             name.clone(),
             InterfaceStats {
-                name,
+                name: name.clone(),
                 rx_bytes: read("rx_bytes"),
                 tx_bytes: read("tx_bytes"),
                 rx_packets: read("rx_packets"),
@@ -70,7 +121,14 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
                 tx_errors: read("tx_errors"),
                 rx_drops: read("rx_dropped"),
                 tx_drops: read("tx_dropped"),
-                signal_dbm: wifi.and_then(|w| w.0),
+                signal_dbm: wifi.and_then(|w| w.0).or_else(|| {
+                    net_dir
+                        .join(&name)
+                        .join("wireless")
+                        .exists()
+                        .then(|| iw_signal(&name))
+                        .flatten()
+                }),
                 tx_retries: wifi.map(|w| w.1),
             },
         );
@@ -245,5 +303,25 @@ mod wireless_tests {
         // A positive level is a legacy percentage, not dBm.
         assert_eq!(m["wlan1"], (None, 7));
         assert!(parse_wireless("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod iw_tests {
+    use super::*;
+    #[test]
+    fn only_signed_signal_in_dbm_is_accepted() {
+        assert_eq!(
+            parse_iw_signal("Connected\n\tsignal: -50 dBm\n\ttx bitrate: 1200.9 MBit/s"),
+            Some(-50)
+        );
+        for text in [
+            "Not connected.",
+            "signal: 50 %",
+            "signal: -300 dBm",
+            "signal: unknown",
+        ] {
+            assert_eq!(parse_iw_signal(text), None);
+        }
     }
 }

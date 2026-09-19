@@ -31,8 +31,8 @@ mod policy;
 use policy::write_owner_only;
 pub use policy::{
     default_policy_path, load_policy_file, merge_rules_into_policy_file,
-    remove_rules_from_policy_file, rule_diff, save_policy_file, wildcard_suggestions, EgressPolicy,
-    ProcessRule,
+    remove_rules_from_policy_file, rule_diff, save_policy_file, wildcard_suggestions, AlertMode,
+    BlockList, EgressPolicy, ProcessRule,
 };
 use policy::{ip_matches, sni_matches};
 
@@ -155,6 +155,10 @@ pub enum Verdict {
     /// Encrypted ClientHello: the real name is hidden by design, so this is
     /// "cannot judge", not "bad".
     Ech,
+    /// Matched an explicit block entry. Carries the reason (which entry).
+    /// Checked before the allowlist, so a blocked destination is never
+    /// reported as merely allowed or drifting.
+    Blocked(String),
     /// Outside the allowlist.
     Drift,
     /// The process has no rule, so nothing was checked. Distinct from
@@ -178,6 +182,7 @@ impl Verdict {
             Verdict::Ip => "\u{2713} ip",
             Verdict::Asn(_) => "~ asn",
             Verdict::Ech => "? ech",
+            Verdict::Blocked(_) => "\u{2717} blocked",
             Verdict::Drift => "\u{2717} drift",
             Verdict::NoRule => "\u{2014} no rule",
             Verdict::Undeclared => "\u{2717} undeclared",
@@ -189,7 +194,11 @@ impl Verdict {
     pub fn is_notable(&self) -> bool {
         matches!(
             self,
-            Verdict::Asn(_) | Verdict::Drift | Verdict::NoRule | Verdict::Undeclared
+            Verdict::Asn(_)
+                | Verdict::Blocked(_)
+                | Verdict::Drift
+                | Verdict::NoRule
+                | Verdict::Undeclared
         )
     }
 }
@@ -249,6 +258,8 @@ pub struct Violation {
     pub dest: String,
     pub port: u16,
     pub reason: String,
+    /// Matched an explicit block entry, rather than missing the allowlist.
+    pub blocked: bool,
 }
 
 /// A retained violation for on-screen display (the Egress tab shows these,
@@ -271,6 +282,9 @@ pub struct EgressProfiler {
     profiles: HashMap<String, EgressProfile>,
     /// Declared egress policy, if any. `None` ⇒ pure observe mode.
     policy: Option<EgressPolicy>,
+    policy_error: Option<String>,
+    policy_revision: Option<String>,
+    last_wall: Option<SystemTime>,
     /// Cooldown per violating (process, dest, port) so a steady violation
     /// warns periodically, not every tick. Configurable via
     /// `egress_violation_cooldown_secs` in config.toml.
@@ -296,6 +310,9 @@ impl Default for EgressProfiler {
         Self {
             profiles: HashMap::new(),
             policy: None,
+            policy_error: None,
+            policy_revision: None,
+            last_wall: None,
             violation_cooldown: HashMap::new(),
             cooldown: Duration::from_secs(VIOLATION_COOLDOWN_SECS),
             pending: Vec::new(),
@@ -324,7 +341,7 @@ impl EgressProfiler {
     pub fn with_default_policy() -> Self {
         let mut profiler = Self::new();
         if let Some(path) = default_policy_path() {
-            profiler.set_policy(load_policy_file(&path));
+            profiler.reload_policy(&path);
         }
         if let Some(path) = default_profiles_path() {
             profiler.load_profiles(&path);
@@ -339,6 +356,7 @@ impl EgressProfiler {
     pub fn observe(&mut self, connections: &[Connection], geo: &GeoCache) {
         let now = Instant::now();
         let wall = SystemTime::now();
+        self.last_wall = Some(wall);
         // Seconds since the previous observe, used to turn the connection
         // table's per-second rates into a byte delta for this tick. Clamped:
         // a long stall (laptop sleep, a slow lsof) must not credit a
@@ -431,14 +449,22 @@ impl EgressProfiler {
             .process
             .get(process)
             .or_else(|| policy.process.get(canonical.as_str()));
-        let mut reason = match rule {
-            Some(rule) => match rule.violation(sni.as_deref(), asn_org.as_deref(), ip, port) {
-                Some(r) => r,
-                None => return,
-            },
+        let blocked = policy.blocked(rule, sni.as_deref(), asn_org.as_deref(), ip, port);
+        let is_blocked = blocked.is_some();
+        let mut reason = match (blocked, rule) {
+            (Some(r), _) => r,
+            // Anything short of an explicit block only alerts when the policy
+            // opted in to allowlist alerting.
+            (None, _) if policy.alert == AlertMode::Blocked => return,
+            (None, Some(rule)) => {
+                match rule.violation(sni.as_deref(), asn_org.as_deref(), ip, port) {
+                    Some(r) => r,
+                    None => return,
+                }
+            }
             // No rule. In observe mode that is silence by design; in strict
             // mode it is the whole point of the feature.
-            None => {
+            (None, None) => {
                 if !policy.strict || !settled {
                     return;
                 }
@@ -471,6 +497,7 @@ impl EgressProfiler {
             dest: dest.clone(),
             port,
             reason: reason.clone(),
+            blocked: is_blocked,
         });
         // Retain for the on-screen warnings panel (bounded ring).
         self.recent.push_front(RecentViolation {
@@ -509,12 +536,62 @@ impl EgressProfiler {
 
     /// Install (or clear) the declared egress policy.
     pub fn set_policy(&mut self, policy: Option<EgressPolicy>) {
+        let revision = policy.as_ref().map(|p| {
+            let ordered: std::collections::BTreeMap<_, _> = p.process.iter().collect();
+            // `alert` and the global block join the digest only when set, so a
+            // policy that uses neither keeps the revision it had before they existed.
+            let canonical = if p.alert == AlertMode::Blocked && p.block.is_empty() {
+                serde_json::to_vec(&(p.strict, ordered))
+            } else {
+                serde_json::to_vec(&(p.strict, ordered, p.alert, &p.block))
+            }
+            .expect("policy serializes");
+            ring::digest::digest(&ring::digest::SHA256, &canonical)
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        });
+        if self.policy_revision != revision {
+            self.violation_cooldown.clear();
+            self.pending.clear();
+        }
+        self.policy_revision = revision;
+        self.policy_error = None;
         self.policy = policy;
+    }
+
+    /// Observe policy state without treating a failed load as an allow decision.
+    pub fn reload_policy(&mut self, path: &Path) {
+        let loaded = load_policy_file(path);
+        let failed = loaded.is_none()
+            && !matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        self.set_policy(loaded);
+        if failed {
+            self.policy_error =
+                Some("egress policy is unreadable, invalid, or has unsafe permissions".into());
+        }
+    }
+
+    pub fn policy_revision(&self) -> Option<&str> {
+        self.policy_revision.as_deref()
+    }
+    pub fn policy_error(&self) -> Option<&str> {
+        self.policy_error.as_deref()
+    }
+    pub fn last_observation_wall(&self) -> Option<SystemTime> {
+        self.last_wall
     }
 
     /// Whether a policy is currently loaded.
     pub fn has_policy(&self) -> bool {
         self.policy.is_some()
+    }
+
+    /// Which findings alert. Blocked-only when no policy is loaded, so the
+    /// default install alerts on nothing.
+    pub fn alert_mode(&self) -> AlertMode {
+        self.policy.as_ref().map(|p| p.alert).unwrap_or_default()
     }
 
     /// Policy verdict for one observed destination, for display: `None` when
@@ -528,7 +605,9 @@ impl EgressProfiler {
             // "unreadable"; only the presentation differs from real drift.
             // `Undeclared` is a miss too — under a policy that claims to be
             // complete, "no rule" is a finding rather than a blind spot.
-            Verdict::Drift | Verdict::Ech | Verdict::Undeclared => Some(false),
+            Verdict::Blocked(_) | Verdict::Drift | Verdict::Ech | Verdict::Undeclared => {
+                Some(false)
+            }
             _ => Some(true),
         }
     }
@@ -545,11 +624,20 @@ impl EgressProfiler {
         // Same both-spellings lookup as `check_policy`, so the table verdict
         // and the warnings panel can never disagree about a truncated name.
         let canonical = self.canonical_process(process);
-        let Some(rule) = policy
+        let rule = policy
             .process
             .get(process)
-            .or_else(|| policy.process.get(canonical.as_str()))
-        else {
+            .or_else(|| policy.process.get(canonical.as_str()));
+        if let Some(reason) = policy.blocked(
+            rule,
+            dest.sni.as_deref(),
+            dest.asn_org.as_deref(),
+            &dest.last_ip,
+            dest.port,
+        ) {
+            return Verdict::Blocked(reason);
+        }
+        let Some(rule) = rule else {
             // Same fact, two readings: unchecked when the policy is partial,
             // a finding when it claims to be complete.
             return if policy.strict {
@@ -938,6 +1026,7 @@ impl EgressProfiler {
                 let v = self.verdict(&profile.process, dest);
                 let verdict = match &v {
                     Verdict::Ech => "unreadable",
+                    Verdict::Blocked(_) => "blocked",
                     Verdict::Drift => "drift",
                     // Its own value, not folded into `drift`: nothing was
                     // compared, so calling it drift would overstate what the
@@ -1234,6 +1323,7 @@ fn rule_from_profile(profile: &EgressProfile) -> ProcessRule {
         allow_asn: allow_asn.into_iter().collect(),
         allow_ip: allow_ip.into_iter().collect(),
         allow_ports: allow_ports.into_iter().collect(),
+        ..Default::default()
     }
 }
 
@@ -1478,6 +1568,7 @@ mod tests {
             allow_asn: vec!["Cloudflare, Inc.".into()],
             allow_ip: vec!["203.0.113.5".into()],
             allow_ports: vec![443],
+            ..Default::default()
         };
         let ip = "198.51.100.1"; // an IP NOT in allow_ip, unless stated
                                  // Allowed: matching SNI on an allowed port.
@@ -1563,6 +1654,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         );
         let s = toml::to_string_pretty(&policy).unwrap();
@@ -1575,7 +1667,10 @@ mod tests {
     #[test]
     fn observe_warns_on_drift_with_cooldown() {
         let mut p = EgressProfiler::new();
-        let mut policy = EgressPolicy::default();
+        let mut policy = EgressPolicy {
+            alert: AlertMode::All,
+            ..Default::default()
+        };
         policy.process.insert(
             "app".into(),
             ProcessRule {
@@ -1583,6 +1678,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         );
         p.set_policy(Some(policy));
@@ -1784,6 +1880,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         )];
         merge_rules_into_policy_file(&rules, &path).unwrap();
@@ -1807,6 +1904,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         )];
         merge_rules_into_policy_file(&rules2, &path).unwrap();
@@ -1924,6 +2022,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         )];
         merge_rules_into_policy_file(&rules, &path).unwrap();
@@ -2041,6 +2140,7 @@ mod tests {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![443],
+                ..Default::default()
             },
         )];
         merge_rules_into_policy_file(&rules, &path).unwrap();
@@ -2103,7 +2203,10 @@ mod tests {
     #[test]
     fn ech_violation_reason_names_the_encryption() {
         let mut p = EgressProfiler::new();
-        let mut policy = EgressPolicy::default();
+        let mut policy = EgressPolicy {
+            alert: AlertMode::All,
+            ..Default::default()
+        };
         policy.process.insert(
             "app".into(),
             ProcessRule {
@@ -2130,7 +2233,10 @@ mod tests {
     fn zero_cooldown_rewarns_every_check_and_totals_accumulate() {
         let mut p = EgressProfiler::new();
         p.set_violation_cooldown(0);
-        let mut policy = EgressPolicy::default();
+        let mut policy = EgressPolicy {
+            alert: AlertMode::All,
+            ..Default::default()
+        };
         policy.process.insert(
             "app".into(),
             ProcessRule {
@@ -2445,7 +2551,10 @@ mod tests {
     #[test]
     fn violations_are_retained_for_the_on_screen_panel() {
         let mut p = EgressProfiler::new();
-        let mut policy = EgressPolicy::default();
+        let mut policy = EgressPolicy {
+            alert: AlertMode::All,
+            ..Default::default()
+        };
         policy.process.insert(
             "app".into(),
             ProcessRule {
@@ -2481,6 +2590,7 @@ mod tests {
             allow_asn: vec![],
             allow_ip: vec![],
             allow_ports: vec![443],
+            ..Default::default()
         };
         assert_eq!(
             rule_diff(None, &new),
@@ -2492,6 +2602,7 @@ mod tests {
             allow_asn: vec![],
             allow_ip: vec![],
             allow_ports: vec![443],
+            ..Default::default()
         };
         assert_eq!(
             rule_diff(Some(&old), &new),
@@ -2594,6 +2705,7 @@ mod blank_and_split_regressions {
             allow_asn: vec![],
             allow_ip: vec![],
             allow_ports: vec![],
+            ..Default::default()
         };
         let msg = rule.violation(None, None, "", 443).unwrap();
         assert_eq!(msg, "unknown destination not in allowlist");
@@ -2720,6 +2832,7 @@ mod blank_and_split_regressions {
                 allow_asn: vec![],
                 allow_ip: vec![],
                 allow_ports: vec![],
+                ..Default::default()
             },
         );
         p.set_policy(Some(policy));
@@ -2749,12 +2862,160 @@ mod blank_and_split_regressions {
 mod verdict_tests {
     use super::*;
 
+    fn blocking_policy() -> EgressPolicy {
+        let mut policy = EgressPolicy {
+            block: BlockList {
+                sni: vec!["*.tracker.example".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        policy.process.insert(
+            "app".into(),
+            ProcessRule {
+                allow_sni: vec!["api.example.com".into()],
+                block: BlockList {
+                    ip: vec!["203.0.113.0/24".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn default_policy_alerts_only_on_blocked_destinations() {
+        let mut p = EgressProfiler::new();
+        p.set_policy(Some(blocking_policy()));
+        let now = Instant::now();
+        let sni = |s: &str| Some(s.to_string());
+        // Allowlist miss: visible as drift, but no alert.
+        p.check_policy(
+            "app",
+            "1.1.1.1",
+            443,
+            &sni("elsewhere.com"),
+            &None,
+            false,
+            now,
+        );
+        // No rule at all: silent.
+        p.check_policy(
+            "other",
+            "1.1.1.1",
+            443,
+            &sni("elsewhere.com"),
+            &None,
+            false,
+            now,
+        );
+        assert!(p.take_violations().is_empty());
+        assert_eq!(p.recent_violation_count(), 0);
+        // Global block applies to a process with no rule.
+        p.check_policy(
+            "other",
+            "1.1.1.1",
+            443,
+            &sni("x.tracker.example"),
+            &None,
+            false,
+            now,
+        );
+        // Per-process block, by CIDR, even on an allowed hostname.
+        p.check_policy(
+            "app",
+            "203.0.113.9",
+            443,
+            &sni("api.example.com"),
+            &None,
+            false,
+            now,
+        );
+        let v = p.take_violations();
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v[0].reason.contains("blocked"));
+    }
+
+    #[test]
+    fn blocked_outranks_allowed_in_the_verdict() {
+        let mut p = EgressProfiler::new();
+        p.set_policy(Some(blocking_policy()));
+        let mut d = dest(Some("api.example.com"), None, "203.0.113.9", false);
+        assert!(matches!(p.verdict("app", &d), Verdict::Blocked(_)));
+        d.last_ip = "198.51.100.1".into();
+        assert_eq!(p.verdict("app", &d), Verdict::Sni);
+        d.sni = Some("tracker.example".into());
+        assert!(matches!(p.verdict("unlisted", &d), Verdict::Blocked(_)));
+    }
+
+    #[test]
+    fn alert_mode_and_global_block_change_the_revision() {
+        let mut p = EgressProfiler::new();
+        p.set_policy(Some(EgressPolicy::default()));
+        let plain = p.policy_revision.clone();
+        p.set_policy(Some(EgressPolicy {
+            alert: AlertMode::All,
+            ..Default::default()
+        }));
+        assert_ne!(p.policy_revision, plain);
+        p.set_policy(Some(blocking_policy()));
+        let blocked = p.policy_revision.clone();
+        let mut widened = blocking_policy();
+        widened.block.ports = vec![23];
+        p.set_policy(Some(widened));
+        assert_ne!(p.policy_revision, blocked);
+    }
+
+    #[test]
+    fn block_tables_parse_and_survive_promotion() {
+        let policy: EgressPolicy = toml::from_str(
+            r#"
+[block]
+sni = ["*.tracker.example"]
+ports = [23]
+
+[process.app]
+allow_sni = ["api.example.com"]
+
+[process.app.block]
+ip = ["203.0.113.0/24"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(policy.alert, AlertMode::Blocked);
+        assert_eq!(policy.block.ports, vec![23]);
+        assert_eq!(policy.process["app"].block.ip, vec!["203.0.113.0/24"]);
+
+        let dir = std::env::temp_dir().join(format!("netwatch-block-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress-policy.toml");
+        std::fs::write(
+            &path,
+            "[process.app]\nallow_sni = [\"a.example.com\"]\n\n[process.app.block]\nip = [\"203.0.113.0/24\"]\n",
+        )
+        .unwrap();
+        let rules = [(
+            "app".to_string(),
+            ProcessRule {
+                allow_sni: vec!["b.example.com".into()],
+                ..Default::default()
+            },
+        )];
+        merge_rules_into_policy_file(&rules, &path).unwrap();
+        let reread = load_policy_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reread.process["app"].block.ip, vec!["203.0.113.0/24"]);
+        assert_eq!(reread.process["app"].allow_sni.len(), 2);
+    }
+
     fn rule(sni: &[&str], asn: &[&str], ip: &[&str], ports: &[u16]) -> ProcessRule {
         ProcessRule {
             allow_sni: sni.iter().map(|s| s.to_string()).collect(),
             allow_asn: asn.iter().map(|s| s.to_string()).collect(),
             allow_ip: ip.iter().map(|s| s.to_string()).collect(),
             allow_ports: ports.to_vec(),
+            ..Default::default()
         }
     }
 
@@ -2960,6 +3221,7 @@ mod verdict_tests {
         let mut p = profiler(rule(&["api.example.com"], &[], &[], &[]));
         let mut policy = p.policy.clone().unwrap();
         policy.strict = true;
+        policy.alert = AlertMode::All;
         p.set_policy(Some(policy));
         p.set_violation_cooldown(0);
         let now = Instant::now();
@@ -3125,5 +3387,200 @@ mod verdict_tests {
 
     fn sni(h: &str) -> Option<String> {
         Some(h.to_string())
+    }
+}
+
+#[cfg(test)]
+mod diagnose_bridge_tests {
+    use super::*;
+    use crate::diagnose::egress::{PolicyState, Tracker};
+
+    #[test]
+    fn fresh_install_learns_then_freezes_and_ignores_duplicate_samples() {
+        let mut profiler = EgressProfiler::new();
+        let mut policy = EgressPolicy::default();
+        policy.process.insert(
+            "tool".into(),
+            ProcessRule {
+                allow_sni: vec!["known.example".into()],
+                ..Default::default()
+            },
+        );
+        profiler.set_policy(Some(policy));
+        let mut tracker = Tracker::default();
+        let origin = Instant::now();
+        let wall = SystemTime::now();
+        for seconds in 0..=600 {
+            let stamp = wall + Duration::from_secs(seconds);
+            profiler.record_flow(
+                "tool",
+                "8.8.8.8",
+                443,
+                Some("known.example".into()),
+                None,
+                false,
+                stamp,
+                0,
+                0,
+            );
+            profiler.last_wall = Some(stamp);
+            let obs = tracker.sample(&profiler, origin + Duration::from_secs(seconds), true);
+            assert!(!obs.flows[0].novel);
+            assert_eq!(
+                obs.flows[0].verdict,
+                crate::diagnose::egress::PolicyVerdict::Allowed
+            );
+            if seconds < 600 {
+                assert!(!obs.flows[0].baseline_ready);
+            } else {
+                assert!(obs.flows[0].baseline_ready);
+            }
+        }
+        let stamp = wall + Duration::from_secs(601);
+        profiler.record_flow(
+            "tool",
+            "9.9.9.9",
+            443,
+            Some("new.example".into()),
+            None,
+            false,
+            stamp,
+            0,
+            0,
+        );
+        profiler.last_wall = Some(stamp);
+        let cached = tracker.sample(&profiler, origin + Duration::from_secs(600), true);
+        assert_eq!(cached.flows[0].destination, "known.example");
+        let changed = tracker.sample(&profiler, origin + Duration::from_secs(601), true);
+        assert_eq!(changed.flows.len(), 1);
+        assert!(changed.flows[0].novel);
+        assert_eq!(
+            changed.flows[0].verdict,
+            crate::diagnose::egress::PolicyVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn persisted_mature_baseline_flags_a_new_destination_without_relearning() {
+        let mut profiler = EgressProfiler::new();
+        let wall = SystemTime::now();
+        profiler.record_flow(
+            "tool",
+            "8.8.8.8",
+            443,
+            Some("known.example".into()),
+            None,
+            false,
+            wall,
+            0,
+            0,
+        );
+        let known = profiler
+            .profiles
+            .get_mut("tool")
+            .unwrap()
+            .dests
+            .values_mut()
+            .next()
+            .unwrap();
+        known.first_seen = wall - Duration::from_secs(700);
+        known.count = 700;
+        let stamp = wall + Duration::from_secs(1);
+        profiler.record_flow(
+            "tool",
+            "9.9.9.9",
+            443,
+            Some("new.example".into()),
+            None,
+            false,
+            stamp,
+            0,
+            0,
+        );
+        profiler.last_wall = Some(stamp);
+        let obs = Tracker::default().sample(&profiler, Instant::now(), true);
+        assert_eq!(obs.flows.len(), 1);
+        assert!(obs.flows[0].baseline_ready && obs.flows[0].novel);
+    }
+
+    #[test]
+    fn unchanged_policy_digest_is_order_independent_and_preserves_cooldown() {
+        let mut profiler = EgressProfiler::new();
+        let rule = ProcessRule {
+            allow_ip: vec!["8.8.8.8".into()],
+            ..Default::default()
+        };
+        let mut first = EgressPolicy::default();
+        first.process.insert("a".into(), rule.clone());
+        first.process.insert("b".into(), rule.clone());
+        let mut reversed = EgressPolicy::default();
+        reversed.process.insert("b".into(), rule.clone());
+        reversed.process.insert("a".into(), rule);
+        profiler.set_policy(Some(first));
+        let revision = profiler.policy_revision.clone();
+        profiler
+            .violation_cooldown
+            .insert(("a".into(), "9.9.9.9".into(), 443), Instant::now());
+        profiler.set_policy(Some(reversed));
+        assert_eq!(profiler.policy_revision, revision);
+        assert_eq!(profiler.violation_cooldown.len(), 1);
+    }
+
+    #[test]
+    fn strict_policy_only_reports_settled_observed_processes() {
+        let mut profiler = EgressProfiler::new();
+        profiler.set_policy(Some(EgressPolicy {
+            strict: true,
+            ..Default::default()
+        }));
+        let origin = Instant::now();
+        let wall = SystemTime::now();
+        let mut tracker = Tracker::default();
+        for n in 0..3 {
+            let stamp = wall + Duration::from_secs(n);
+            profiler.record_flow("new-tool", "8.8.8.8", 443, None, None, false, stamp, 0, 0);
+            profiler.last_wall = Some(stamp);
+            let obs = tracker.sample(&profiler, origin + Duration::from_secs(n), true);
+            assert_eq!(obs.flows[0].alerts(true), n == 2);
+        }
+    }
+
+    #[test]
+    fn invalid_missing_and_reloaded_policies_have_distinct_revisions() {
+        let dir =
+            std::env::temp_dir().join(format!("netwatch-egress-diagnose-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        let mut profiler = EgressProfiler::new();
+        profiler.reload_policy(&path);
+        assert!(!profiler.has_policy());
+        assert!(profiler.policy_error().is_none());
+        std::fs::write(&path, "not a toml policy {{{").unwrap();
+        profiler.reload_policy(&path);
+        assert!(profiler.policy_error().is_some());
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.sample(&profiler, Instant::now(), true).policy,
+            PolicyState::Invalid
+        );
+        let mut policy = EgressPolicy::default();
+        policy.process.insert(
+            "tool".into(),
+            ProcessRule {
+                allow_ip: vec!["8.8.8.8".into()],
+                ..Default::default()
+            },
+        );
+        save_policy_file(&policy, &path).unwrap();
+        profiler.reload_policy(&path);
+        assert!(profiler.policy_error().is_none());
+        let first = profiler.policy_revision().unwrap().to_string();
+        profiler.reload_policy(&path);
+        assert_eq!(profiler.policy_revision(), Some(first.as_str()));
+        policy.strict = true;
+        save_policy_file(&policy, &path).unwrap();
+        profiler.reload_policy(&path);
+        assert_ne!(profiler.policy_revision(), Some(first.as_str()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

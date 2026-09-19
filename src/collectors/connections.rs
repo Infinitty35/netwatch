@@ -243,6 +243,9 @@ pub struct ConnectionCollector {
     /// startup (see [`ProcSnapshot`]). `None` until attached.
     #[cfg(target_os = "linux")]
     proc_snapshot: Option<Arc<ProcSnapshot>>,
+    /// Unconfined `/proc` scanner (see [`ProcBroker`]). `None` until attached.
+    #[cfg(target_os = "linux")]
+    proc_broker: Option<Arc<ProcBroker>>,
 }
 
 impl ConnectionCollector {
@@ -261,6 +264,8 @@ impl ConnectionCollector {
             ebpf: None,
             #[cfg(target_os = "linux")]
             proc_snapshot: None,
+            #[cfg(target_os = "linux")]
+            proc_broker: None,
         }
     }
 
@@ -319,6 +324,11 @@ impl ConnectionCollector {
     /// before `sandbox::apply`. Reuse still requires current socket and identity
     /// validation; blocked or expired entries remain unknown.
     #[cfg(target_os = "linux")]
+    pub fn with_proc_broker(mut self, broker: Arc<ProcBroker>) -> Self {
+        self.proc_broker = Some(broker);
+        self
+    }
+
     pub fn with_proc_snapshot(mut self, snapshot: Arc<ProcSnapshot>) -> Self {
         self.proc_snapshot = Some(snapshot);
         self
@@ -353,11 +363,19 @@ impl ConnectionCollector {
         let ebpf = self.ebpf.clone();
         #[cfg(target_os = "linux")]
         let proc_snapshot = self.proc_snapshot.clone();
+        #[cfg(target_os = "linux")]
+        let brokered = self.proc_broker.as_ref().and_then(|b| b.latest());
         crate::sandbox::worker::spawn("connections", move || {
             #[cfg(target_os = "macos")]
             let mut result = parse_lsof();
             #[cfg(target_os = "linux")]
-            let mut result = parse_linux_connections();
+            let collected = parse_linux_connections_result(brokered.as_deref());
+            #[cfg(target_os = "linux")]
+            let collection_succeeded = collected.is_ok();
+            #[cfg(target_os = "linux")]
+            let mut result = collected.unwrap_or_default();
+            #[cfg(not(target_os = "linux"))]
+            let collection_succeeded = false;
             #[cfg(target_os = "windows")]
             let mut result = parse_windows_connections();
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -468,8 +486,9 @@ impl ConnectionCollector {
                     flow.capture_generation = capture_generation;
                 }
             }
-            *safe_write(&coverage, "connections::coverage") =
-                measure_coverage(&result, &increments);
+            let mut measured = measure_coverage(&result, &increments);
+            measured.collection_succeeded = collection_succeeded;
+            *safe_write(&coverage, "connections::coverage") = measured;
             let count = result.len();
             *safe_write(&snapshot, "connections::publish") = Arc::new(result);
             tracing::trace!(target: "netwatch::connections", count, "published connection snapshot");
@@ -547,7 +566,7 @@ fn canonicalize_process_names(connections: &mut [Connection]) {
             .evidence
             .process
             .as_ref()
-            .is_some_and(|expected| before.as_ref() != Some(expected))
+            .is_some_and(|expected| !super::attribution::same_process(before.as_ref(), expected))
         {
             conn.pid = None;
             conn.process_name = None;
@@ -928,11 +947,32 @@ fn parse_lsof() -> Vec<Connection> {
     connections
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn parse_linux_connections() -> Vec<Connection> {
-    let mut connections = Vec::new();
+    parse_linux_connections_result(None).unwrap_or_default()
+}
 
-    if let Ok(output) = Command::new("ss").args(["-tunap"]).output() {
+#[cfg(target_os = "linux")]
+fn parse_linux_connections_result(
+    brokered: Option<&ProcSnapshot>,
+) -> Result<Vec<Connection>, String> {
+    let output = Command::new("ss")
+        .args(["-tunap"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    parse_ss_command_output(output, brokered)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ss_command_output(
+    output: std::process::Output,
+    brokered: Option<&ProcSnapshot>,
+) -> Result<Vec<Connection>, String> {
+    let mut connections = Vec::new();
+    if !output.status.success() {
+        return Err("ss did not complete successfully".into());
+    }
+    {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines().skip(1) {
             let cols: Vec<&str> = line.split_whitespace().collect();
@@ -985,9 +1025,9 @@ fn parse_linux_connections() -> Vec<Connection> {
     // /proc/<pid>/fd/* maps that inode → owning process. Same source ss uses,
     // no subprocess, and it degrades to "attribute what this uid can see"
     // instead of the current all-or-nothing.
-    overlay_proc_attribution(&mut connections);
+    overlay_proc_attribution(&mut connections, brokered);
 
-    connections
+    Ok(connections)
 }
 
 #[cfg(target_os = "linux")]
@@ -1219,18 +1259,43 @@ fn apply_owner(conn: &mut Connection, owner: &SocketOwner) {
 }
 /// Revalidate every Linux polling match, including ss-provided PIDs. A PID name
 /// alone cannot establish that the socket still belongs to that process.
+///
+/// A sandboxed worker cannot read other processes' `/proc/<pid>/fd` (Landlock
+/// denies ptrace-mode access outside its domain), so when a [`ProcBroker`]
+/// snapshot no older than `MAX_MATCH_AGE` is supplied, owners come from it.
+/// The broker validated identity around each fd scan; here the socket inode
+/// must still be the one the broker saw for this exact 5-tuple.
 #[cfg(target_os = "linux")]
-fn overlay_proc_attribution(connections: &mut [Connection]) {
+fn overlay_proc_attribution(connections: &mut [Connection], brokered: Option<&ProcSnapshot>) {
     let index = proc_net_inode_index();
-    let owners = socket_inode_owners();
+    let brokered =
+        brokered.filter(|s| s.captured_at.elapsed() <= super::attribution::MAX_MATCH_AGE);
+    let owners = if brokered.is_some() {
+        HashMap::new()
+    } else {
+        socket_inode_owners()
+    };
     for conn in connections {
         conn.pid = None;
         conn.process_name = None;
         conn.evidence.observe();
-        let inode = socket_key(conn).and_then(|key| index.by_pair.get(&key).copied());
+        let key = socket_key(conn);
+        let inode = key.and_then(|key| index.by_pair.get(&key).copied());
         if inode == Some(0) {
             conn.evidence.unknown_reason =
                 Some(super::attribution::UnknownReason::AmbiguousEndpoint);
+        }
+        if let Some(snap) = brokered {
+            let Some((seen, owner)) = key.and_then(|key| snap.entries.get(&key)) else {
+                continue;
+            };
+            if inode == Some(*seen) {
+                apply_owner(conn, owner);
+            } else if inode.is_some_and(|i| i != 0) {
+                conn.evidence.unknown_reason =
+                    Some(super::attribution::UnknownReason::IdentityChanged);
+            }
+            continue;
         }
         if let Some((inode, owner)) =
             inode.and_then(|i| owners.get(&i).and_then(|o| o.as_ref()).map(|o| (i, o)))
@@ -1244,6 +1309,48 @@ fn overlay_proc_attribution(connections: &mut [Connection]) {
         }
     }
 }
+
+/// Socket ownership scanned on a thread outside the worker sandbox.
+///
+/// Landlock confines per thread. The collector worker parses packet-derived
+/// data and runs confined, which blocks reading other processes' socket fds;
+/// this broker is started before any confinement (from `App::prepare`) and
+/// only reads kernel procfs tables, never packet data. It holds no strong
+/// reference to itself, so its thread exits when the collector is dropped.
+#[cfg(target_os = "linux")]
+pub struct ProcBroker {
+    latest: RwLock<Option<Arc<ProcSnapshot>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcBroker {
+    /// Must be called from a thread that has not applied the sandbox.
+    pub fn start(interval: std::time::Duration) -> Arc<Self> {
+        let broker = Arc::new(Self {
+            latest: RwLock::new(Some(Arc::new(capture_proc_snapshot()))),
+        });
+        let weak = Arc::downgrade(&broker);
+        let spawned = std::thread::Builder::new()
+            .name("netwatch-proc-broker".into())
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                let Some(broker) = weak.upgrade() else {
+                    break;
+                };
+                let snapshot = Arc::new(capture_proc_snapshot());
+                *safe_write(&broker.latest, "proc_broker::publish") = Some(snapshot);
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "proc attribution broker did not start");
+        }
+        broker
+    }
+
+    pub fn latest(&self) -> Option<Arc<ProcSnapshot>> {
+        safe_read(&self.latest, "proc_broker::latest").clone()
+    }
+}
+
 /// Pre-sandbox evidence is a hint, never authority based on endpoint reuse.
 #[cfg(target_os = "linux")]
 pub struct ProcSnapshot {
@@ -1661,6 +1768,56 @@ mod tests {
             c.evidence.unknown_reason,
             Some(super::super::attribution::UnknownReason::IdentityChanged)
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn brokered_snapshot_attributes_without_local_fd_scan_and_rejects_stale_or_reused() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect("127.0.0.1:45679").unwrap();
+        let local = socket.local_addr().unwrap().to_string();
+        let mut snap = capture_proc_snapshot();
+        let conn = || make_conn("UDP", &local, "127.0.0.1:45679", "", 1);
+
+        let mut c = conn();
+        overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+        assert_eq!(c.pid, Some(std::process::id()));
+        assert_eq!(c.attribution, AttributionSource::Procfs);
+
+        // A stale broker snapshot is ignored in favour of the local scan.
+        snap.captured_at = Instant::now() - std::time::Duration::from_secs(10);
+        let mut c = conn();
+        overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+        assert_eq!(c.pid, Some(std::process::id()));
+
+        // An owner recorded for a different inode on the same 5-tuple is not applied.
+        snap.captured_at = Instant::now();
+        let key = socket_key(&conn()).unwrap();
+        snap.entries.get_mut(&key).unwrap().0 += 1;
+        let mut c = conn();
+        overlay_proc_attribution(std::slice::from_mut(&mut c), Some(&snap));
+        assert!(c.pid.is_none());
+        assert_eq!(
+            c.evidence.unknown_reason,
+            Some(super::super::attribution::UnknownReason::IdentityChanged)
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_broker_publishes_fresh_snapshots_and_stops_with_its_owner() {
+        let broker = ProcBroker::start(std::time::Duration::from_millis(20));
+        // A /proc scan can take a while on a loaded test runner: poll, don't race.
+        let eventually = |done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !done() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done()
+        };
+        let first = broker.latest().unwrap().captured_at;
+        assert!(eventually(&|| broker.latest().unwrap().captured_at > first));
+        let weak = Arc::downgrade(&broker);
+        drop(broker);
+        assert!(eventually(&|| weak.upgrade().is_none()));
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -2364,5 +2521,23 @@ mod tests {
         assert_eq!(state.rate_for(&key, LocalSide::A), Some((2000.0, 1000.0)));
         // Local is addr_b (10.0.0.2): rx = a_to_b = 1000, tx = b_to_a = 2000.
         assert_eq!(state.rate_for(&key, LocalSide::B), Some((1000.0, 2000.0)));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod diagnose_poll_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    #[test]
+    fn failed_socket_dump_is_not_a_successful_empty_dump() {
+        let output = |status| std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: b"Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+                .to_vec(),
+            stderr: vec![],
+        };
+        assert!(parse_ss_command_output(output(256), None).is_err());
+        assert!(parse_ss_command_output(output(0), None).unwrap().is_empty());
+        assert!(!super::super::attribution::Coverage::default().collection_succeeded);
     }
 }
