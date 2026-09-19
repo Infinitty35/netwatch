@@ -15,3 +15,8 @@ demo-linkedin.*
 
 # Agent worktrees and scratch — never part of the repo
 .claude/
+
+# Profiling output
+perf.data
+perf.data.old
+flamegraph.svg
