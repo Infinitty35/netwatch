@@ -4,6 +4,45 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-19
+
+### Changed
+- **Egress alerting is blocked-only by default.** Alerts, and the Diagnose
+  `egress.policy_violation` rule, now fire only for destinations you block
+  explicitly in `egress-policy.toml`. Allowlist drift, undeclared processes under
+  `strict = true` and new destinations stay visible in the Egress tab but no
+  longer alert. Set `alert = "all"` at the top of the policy to restore the old
+  behaviour; the Diagnose `egress.drift` rule is off unless you do.
+- The status line under the tab bar reads `● no issues` (or `◌ no issues ·
+  learning`) instead of the Diagnose coverage breakdown.
+- The Diagnose tab shows one short panel when nothing is open, plus a "needs
+  attention" panel for broken collectors and the session's history only when
+  they have something in them. The engine strip, rule catalogue and report
+  preview are gone from the working view; `o` still opens the full report.
+- `report.md` renders issues, evidence, cause checks, the timeline and the
+  environment as tables. It lists only the checks that could not run, and a
+  report with nothing open is a single summary sentence.
+
+### Added
+- `[block]` (every process) and `[process.<name>.block]` tables in
+  `egress-policy.toml`: `sni` (exact or `*.` wildcard), `asn`, `ip` (address or
+  CIDR) and `ports`. A match is a `✗ blocked` verdict that outranks any allowlist
+  match, sorts first in the Egress tab and exports as `"blocked"`. Promoting a
+  baseline keeps hand-written block tables.
+- Diagnose active experiments (IPv6 reachability, captive portal, path MTU),
+  developer target probes (`[[diagnose_targets]]`: DNS, TCP, TLS and HTTP
+  stages), namespace TCP accounting and egress rules. See `docs/DIAGNOSE.md`.
+- Incident episodes are recorded and can be replayed, labelled and exported as a
+  pseudonymised bundle (`netwatch diagnose episodes | replay | export`).
+- After a manual fix, Diagnose suggests the next test and verifies recovery.
+- Diagnose coverage (`9`, then `c`) is a scrolling table grouped by area, with
+  coloured statuses and a detail panel for the selected check.
+
+### Fixed
+- Baselines no longer learn an ongoing incident away, and an issue needs
+  consecutive samples before it opens.
+- Scope counts are pluralised correctly ("1 destination", "1 flow").
+
 ## [0.31.4] - 2026-09-14
 
 0.31.3 was tagged but never published: its release build failed. Everything
