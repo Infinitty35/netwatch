@@ -574,14 +574,18 @@ pub fn build_verdict_line(app: &App) -> Line<'static> {
         Line::from(out)
     };
 
+    // Nothing open: a status, not a coverage breakdown. The counts live on
+    // the Diagnose tab, one keypress away, and are noise on every other tab.
     match &verdict {
-        crate::diagnose::Verdict::Clear => with_demo(vec![Span::styled(
-            " ● no issues · baselines ready",
-            Style::default().fg(t.text_muted),
-        )]),
-        crate::diagnose::Verdict::Learning { detail }
-        | crate::diagnose::Verdict::Incomplete { detail } => with_demo(vec![Span::styled(
-            format!(" ◌ no issues detected · {detail}"),
+        crate::diagnose::Verdict::Clear | crate::diagnose::Verdict::Incomplete { .. } => {
+            with_demo(vec![
+                Span::styled(" ● ", Style::default().fg(t.status_good)),
+                Span::styled("no issues", Style::default().fg(t.text_muted)),
+            ])
+        }
+        // Not green: still learning is an absence of information, not health.
+        crate::diagnose::Verdict::Learning { .. } => with_demo(vec![Span::styled(
+            " ◌ no issues · learning",
             Style::default().fg(t.text_muted),
         )]),
         crate::diagnose::Verdict::Issues {
