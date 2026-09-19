@@ -135,3 +135,59 @@ nix = { version = "0.29", features = ["net", "ioctl", "hostname", "uio", "poll"]
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 caps = "0.5"
+
+# ── Distro packages ───────────────────────────────────────────────────
+#
+# `cargo deb` and `cargo generate-rpm` build these from the already-compiled
+# musl-static binary in CI (see .github/workflows/release.yml). Both install
+# the same set: binary, three completions, the man page and the fleet-agent
+# unit. Neither grants capabilities — see packaging/debian/postinst.
+[package.metadata.deb]
+name = "netwatch"
+maintainer = "Matt Hartley <matthew.t.hartley@gmail.com>"
+copyright = "2026, Matt Hartley"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+# The Linux release binaries are musl-static with libpcap linked in, so the
+# package has no runtime dependencies at all. Left explicit: cargo-deb would
+# otherwise run dpkg-shlibdeps and attach whatever the builder happened to
+# link against, which is exactly the bug the static build fixed (#53).
+depends = ""
+extended-description = """\
+Live per-connection throughput with application-protocol decoding, process \
+attribution where the platform allows it, packet and interface views, and a \
+diagnostic engine that learns a per-network baseline and opens an issue when \
+that baseline breaks. Runs in a terminal, needs no configuration."""
+maintainer-scripts = "packaging/debian/"
+assets = [
+    ["target/release/netwatch", "usr/bin/", "755"],
+    ["completions/netwatch.bash", "usr/share/bash-completion/completions/netwatch", "644"],
+    ["completions/_netwatch", "usr/share/zsh/site-functions/_netwatch", "644"],
+    ["completions/netwatch.fish", "usr/share/fish/vendor_completions.d/netwatch.fish", "644"],
+    ["docs/netwatch.1", "usr/share/man/man1/netwatch.1", "644"],
+    ["packaging/systemd/netwatch.service", "usr/lib/systemd/system/netwatch.service", "644"],
+    ["README.md", "usr/share/doc/netwatch/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/netwatch/CHANGELOG.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "netwatch"
+summary = "Real-time network diagnostics in your terminal"
+license = "MIT"
+# Same reasoning as the deb: a static binary needs nothing, and letting the
+# builder's own links leak into Requires is how a package breaks on a
+# minimal host.
+auto-req = "no"
+post_install_script = "packaging/rpm/post_install.sh"
+assets = [
+    { source = "target/release/netwatch", dest = "/usr/bin/netwatch", mode = "755" },
+    { source = "completions/netwatch.bash", dest = "/usr/share/bash-completion/completions/netwatch", mode = "644" },
+    { source = "completions/_netwatch", dest = "/usr/share/zsh/site-functions/_netwatch", mode = "644" },
+    { source = "completions/netwatch.fish", dest = "/usr/share/fish/vendor_completions.d/netwatch.fish", mode = "644" },
+    { source = "docs/netwatch.1", dest = "/usr/share/man/man1/netwatch.1", mode = "644", doc = true },
+    { source = "packaging/systemd/netwatch.service", dest = "/usr/lib/systemd/system/netwatch.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/netwatch/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/netwatch/CHANGELOG.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/netwatch/LICENSE", mode = "644", doc = true },
+]

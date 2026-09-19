@@ -386,6 +386,26 @@ Some detached workers still lack bounded shutdown; see the
 
 ---
 
+## Distro packages
+
+From v0.33.0 every release carries `.deb` and `.rpm` packages for x86_64 and
+aarch64, built from the same musl-static binary as the tarball:
+
+```sh
+sudo apt install ./netwatch_0.33.0-1_amd64.deb     # Debian, Ubuntu
+sudo dnf install ./netwatch-0.33.0-1.x86_64.rpm    # Fedora, RHEL
+```
+
+They install the binary, all three shell completions, the man page, the
+fleet-agent systemd unit (not enabled) and the docs. They have **no**
+dependencies — libpcap is linked into the binary.
+
+Neither package grants capabilities. `netwatch` still needs elevated access to
+capture, so either run it with `sudo` or grant them yourself once (see
+[Permissions](#permissions)); the package prints that command on install. A
+package that silently gives a binary raw-socket access is the administrator's
+decision to make, not the packager's.
+
 ## Verifying a download
 
 Every release ships `SHA256SUMS` alongside the binaries, and each artifact

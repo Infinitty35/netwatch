@@ -5,6 +5,10 @@ All notable changes to NetWatch will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `.deb` and `.rpm` packages for x86_64 and aarch64 on every release, built
+  from the same static binary as the tarball. They install the binary, the
+  shell completions, the man page and the agent unit, depend on nothing, and
+  print the `setcap` command rather than granting capabilities themselves.
 - Releases ship a `SHA256SUMS` file and signed build provenance for every
   artifact (`gh attestation verify <file> -R matthart1983/netwatch`).
 - Shell completions for bash, zsh and fish in `completions/`, and a man page at

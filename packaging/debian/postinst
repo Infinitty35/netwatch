@@ -1,0 +1,23 @@
+#!/bin/sh
+# Deliberately does NOT grant capabilities.
+#
+# netwatch needs CAP_NET_RAW (and CAP_BPF/CAP_PERFMON for eBPF attribution) to
+# capture. A package that silently hands a binary raw-socket access is a
+# decision for the administrator, not the packager, so this prints the command
+# instead of running it. `sudo netwatch` works without it.
+set -e
+
+if [ "$1" = "configure" ]; then
+    cat <<'MSG'
+
+netwatch is installed. Packet capture needs elevated access:
+
+  sudo netwatch                       # works as-is, or grant it once:
+  sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/bin/netwatch
+
+Capabilities attach to the file, so re-apply after each upgrade.
+
+MSG
+fi
+
+exit 0
