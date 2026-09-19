@@ -1,0 +1,82 @@
+#compdef netwatch
+#
+# zsh completion for netwatch
+#
+# Kept in step with src/cli.rs by `completions_and_man_cover_every_option`
+# in that file: adding an option there fails the test until it is listed
+# here too.
+#
+# Install: put this file on $fpath as `_netwatch` (the .deb and .rpm
+# packages install it to /usr/share/zsh/site-functions/).
+
+_netwatch_interfaces() {
+    local -a ifaces
+    ifaces=(${(f)"$(ls /sys/class/net 2>/dev/null)"})
+    _describe 'interface' ifaces
+}
+
+_netwatch() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '--remote=[Remote URL (requires API key)]:url:_urls' \
+        '--api-key=[Remote API key]:key:' \
+        '--view=[full, lite, or dense]:view:(full lite dense)' \
+        '--lite[Start in Lite view]' \
+        '--demo[Replay the Diagnose demo]' \
+        '--no-sandbox[Disable sandbox]' \
+        '--sandbox-strict[Require sandbox enforcement]' \
+        '--metrics[Daemon metrics on 127.0.0.1:9464]' \
+        '--metrics-addr=[Daemon metrics address]:addr:' \
+        '--daemon[Headless mode (alias: --headless)]' \
+        '--headless[Alias for --daemon]' \
+        '--generate-config[Write default config and exit]' \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '(-V --version)'{-V,--version}'[Show version]' \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command)
+            local -a subcommands
+            subcommands=(
+                'daemon:Headless agent, no TUI'
+                'doctor:Read-only setup report'
+                'diagnose:Diagnose coverage, episodes and exports'
+                'resolver:Inspect or change the DNS resolver'
+            )
+            _describe 'command' subcommands
+            ;;
+        args)
+            case $line[1] in
+                doctor)
+                    _arguments \
+                        '--json[JSON capability report]' \
+                        '--check-capture[Try a real capture]' \
+                        '--interface=[Interface to check]:iface:_netwatch_interfaces'
+                    ;;
+                diagnose)
+                    _arguments \
+                        '1: :(coverage episodes replay features export)' \
+                        '--json[JSON output]' \
+                        '--seconds=[Sampling window, 1..120]:seconds:' \
+                        '--test=[Run one check]:check:' \
+                        '--out=[Write to file]:file:_files' \
+                        '--schema=[Write the feature schema]:file:_files' \
+                        '--since=[Days of history]:days:' \
+                        '--dry-run[Preview without writing]' \
+                        '*:file:_files'
+                    ;;
+                resolver)
+                    _arguments \
+                        '1: :(status set recover)' \
+                        '--unmanaged[Confirm the resolver file is unmanaged]' \
+                        '--seconds=[Revert after N seconds, 1..3600]:seconds:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_netwatch "$@"

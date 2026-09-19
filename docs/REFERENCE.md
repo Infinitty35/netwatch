@@ -386,6 +386,40 @@ Some detached workers still lack bounded shutdown; see the
 
 ---
 
+## Verifying a download
+
+Every release ships `SHA256SUMS` alongside the binaries, and each artifact
+carries signed build provenance tying it to the workflow run and commit that
+produced it.
+
+```sh
+# Checksums
+curl -LO https://github.com/matthart1983/netwatch/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+
+# Provenance (needs the GitHub CLI)
+gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch
+```
+
+Checksums and attestations are produced from v0.33.0 onward; earlier releases
+have neither.
+
+## Shell completions and the man page
+
+The repository ships completions for bash, zsh and fish in `completions/`, and
+a man page at `docs/netwatch.1`. Package installs put them in place for you;
+for a manual install:
+
+```sh
+sudo install -m0644 completions/netwatch.bash /etc/bash_completion.d/netwatch
+sudo install -m0644 completions/_netwatch /usr/share/zsh/site-functions/_netwatch
+install -m0644 completions/netwatch.fish ~/.config/fish/completions/netwatch.fish
+sudo install -m0644 docs/netwatch.1 /usr/share/man/man1/netwatch.1
+```
+
+A test in `src/cli.rs` fails if an option is added to the parser without being
+added to all three completions and the man page.
+
 ## Permissions
 
 | Feature | `netwatch` | `sudo netwatch` |

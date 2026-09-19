@@ -214,4 +214,39 @@ mod tests {
             }
         ));
     }
+
+    /// Shipped completions and the man page must cover every option the
+    /// parser accepts. A flag that exists but cannot be completed, or is
+    /// undocumented in the man page a distro installs, is the packaging
+    /// equivalent of a missing help line — and nobody notices until a user
+    /// reports it. Adding to OPTIONS fails this test until both are updated.
+    #[test]
+    fn completions_and_man_cover_every_option() {
+        const BASH: &str = include_str!("../completions/netwatch.bash");
+        const ZSH: &str = include_str!("../completions/_netwatch");
+        const FISH: &str = include_str!("../completions/netwatch.fish");
+        const MAN: &str = include_str!("../docs/netwatch.1");
+
+        for (name, _, _) in OPTIONS {
+            for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+                assert!(
+                    text.contains(name) || text.contains(name.trim_start_matches("--")),
+                    "{what} completion is missing {name}"
+                );
+            }
+            // roff escapes every hyphen: `--api-key` is written `\-\-api\-key`.
+            let roff = name.replace('-', "\\-");
+            assert!(
+                MAN.contains(&roff) || MAN.contains(name),
+                "man page is missing {name}"
+            );
+        }
+
+        // The subcommands the parser routes on, which are not in OPTIONS.
+        for sub in ["daemon", "doctor", "diagnose", "resolver"] {
+            for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH), ("man", MAN)] {
+                assert!(text.contains(sub), "{what} is missing the {sub} subcommand");
+            }
+        }
+    }
 }

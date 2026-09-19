@@ -4,6 +4,19 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Releases ship a `SHA256SUMS` file and signed build provenance for every
+  artifact (`gh attestation verify <file> -R matthart1983/netwatch`).
+- Shell completions for bash, zsh and fish in `completions/`, and a man page at
+  `docs/netwatch.1`. A test fails if an option is added to the parser without
+  being added to both.
+
+### Changed
+- `brew install netwatch` now comes from homebrew-core, which Homebrew's
+  autobump updates within hours of each release. The formula in
+  `matthart1983/homebrew-tap` is deprecated and no longer updated by the
+  release workflow; existing installs keep working.
+
 ## [0.32.0] - 2026-09-19
 
 ### Changed
