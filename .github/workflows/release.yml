@@ -29,6 +29,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Linux ships musl-static only (issue #53): a dynamically-linked
@@ -53,16 +54,56 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: netwatch-windows-x86_64.exe
+          # Not musl-static like the other Linux targets: Debian's armel
+          # port (what Trixie ships for Marvell Kirkwood NAS boxes like
+          # the Iomega ix2-dl) is glibc, and Ubuntu's runners have no armel
+          # sysroot to build a musl target against. libpcap is still
+          # static, so the only runtime dependency this binary picks up
+          # beyond the other Linux builds is glibc itself.
+          #
+          # Built inside a `debian:bookworm` container, not on the
+          # ubuntu-latest host directly, for two reasons:
+          #
+          # 1. glibc floor. Ubuntu 24.04's gcc-arm-linux-gnueabi links
+          #    against glibc 2.39, which a Kirkwood box still on bookworm
+          #    (glibc 2.36, a supported armel release) can't run.
+          #
+          # 2. time_t ABI. Do not bump this to trixie or a newer Ubuntu.
+          #    Their armel gcc defaults to _TIME_BITS=64, which grows
+          #    libpcap's `struct pcap_pkthdr` from 16 to 24 bytes and moves
+          #    `caplen` from offset 8 to 16. Rust's `libc` crate still uses
+          #    32-bit time_t on this target, so the `pcap` crate would read
+          #    tv_usec as `caplen` and segfault seconds into a capture.
+          #    Bookworm's gcc 12 predates Debian's 64-bit time_t switch. The
+          #    build step asserts the 16-byte layout, so a toolchain change
+          #    fails the release build instead of shipping a crashing binary.
+          #
+          # zig (cargo-zigbuild) was tried first, since it's already how
+          # the musl targets pin an old glibc/musl floor -- rejected after
+          # testing: zig's "generic" ARM baseline emits `bx lr`, which its
+          # own assembler then rejects as an invalid instruction on this
+          # architecture, and armv5te/arm926ej-s-specific cpu profiles are
+          # missing the `__sync_*` atomic intrinsics parking_lot-alike
+          # deps need -- the same wall the musl build already hit for this
+          # target (see PR discussion).
+          - target: armv5te-unknown-linux-gnueabi
+            os: ubuntu-latest
+            name: netwatch-linux-armv5te
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+      # armv5te builds entirely inside a debian:bookworm container (see the
+      # matrix comment above), including its own rustup install, so the
+      # host-level toolchain/cache setup below is skipped for it.
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target != 'armv5te-unknown-linux-gnueabi'
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        if: matrix.target != 'armv5te-unknown-linux-gnueabi'
 
       - name: Install zig + cargo-zigbuild (Linux musl)
         if: contains(matrix.target, 'linux-musl')
@@ -129,7 +170,59 @@ jobs:
       # picks up `pre-built/netwatch_sdk_ebpf.o` automatically. This also
       # means `cargo install netwatch-tui` now gets working eBPF too.
 
+      - name: Build armv5te in debian:bookworm (Iomega ix2-dl / Marvell Kirkwood, Debian armel)
+        if: matrix.target == 'armv5te-unknown-linux-gnueabi'
+        run: |
+          docker run --rm -v "$PWD:/work" debian:bookworm bash -c '
+            set -ex
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq gcc-arm-linux-gnueabi flex bison curl build-essential ca-certificates pkg-config
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal -t armv5te-unknown-linux-gnueabi
+            . "$HOME/.cargo/env"
+
+            LIBPCAP_VERSION=1.10.5
+            cd /tmp
+            curl -sSLO https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz
+            tar xzf libpcap-${LIBPCAP_VERSION}.tar.gz
+            cd libpcap-${LIBPCAP_VERSION}
+            CC=arm-linux-gnueabi-gcc ./configure \
+              --host=arm-linux-gnueabi \
+              --prefix=/tmp/pcap-out \
+              --with-pcap=linux \
+              --disable-shared \
+              --disable-dbus \
+              --disable-bluetooth \
+              --disable-rdma \
+              --disable-usb \
+              --without-libnl
+            make -j"$(nproc)"
+            make install
+
+            # libpcap must use the 32-bit time_t layout Rust expects on
+            # this target. See the matrix comment for why.
+            printf "%s\n" "#include <pcap/pcap.h>" \
+              "_Static_assert(sizeof(struct pcap_pkthdr) == 16, \"pcap_pkthdr is not the 32-bit time_t layout Rust expects\");" \
+              > /tmp/pkthdr_abi.c
+            arm-linux-gnueabi-gcc -I/tmp/pcap-out/include -fsyntax-only /tmp/pkthdr_abi.c
+
+            export CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_GNUEABI_LINKER=arm-linux-gnueabi-gcc
+            # mimalloc-sys and ring compile C/asm sources from scratch, so
+            # cc-rs needs to be told which cross compiler to use rather
+            # than guessing from the host toolchain.
+            export CC_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-gcc
+            export AR_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-ar
+            export LIBPCAP_LIBDIR=/tmp/pcap-out/lib
+            # pcap cannot read the version of an ARM library from this
+            # x86_64 host, so pin it like the musl builds do.
+            export LIBPCAP_VER=${LIBPCAP_VERSION}
+            cd /work
+            cargo build --release --target armv5te-unknown-linux-gnueabi
+          '
+
       - name: Build
+        if: matrix.target != 'armv5te-unknown-linux-gnueabi'
         shell: bash
         run: |
           if [[ "${{ matrix.target }}" == *"linux-musl" ]]; then

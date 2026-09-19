@@ -12,7 +12,7 @@
 //!   recovering backend doesn't get a thundering herd from a reconnecting fleet.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,7 +21,11 @@ use std::time::Duration;
 pub struct SnapshotQueue {
     inner: Mutex<VecDeque<serde_json::Value>>,
     cap: usize,
-    dropped: AtomicU64,
+    // u32, not u64: this counts overflow drops of whole snapshots (one push
+    // per agent tick, seconds apart), so wrapping would take centuries even
+    // under sustained overload. armv5te (old Kirkwood NAS boxes) has no
+    // native 64-bit atomics.
+    dropped: AtomicU32,
 }
 
 impl SnapshotQueue {
@@ -29,7 +33,7 @@ impl SnapshotQueue {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(cap.min(1024))),
             cap: cap.max(1),
-            dropped: AtomicU64::new(0),
+            dropped: AtomicU32::new(0),
         }
     }
 
@@ -70,7 +74,7 @@ impl SnapshotQueue {
     /// Total snapshots dropped to overflow since start. Reported in the wire
     /// envelope so the backend can flag a struggling agent.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.load(Ordering::Relaxed) as u64
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<serde_json::Value>> {

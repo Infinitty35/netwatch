@@ -7,7 +7,7 @@
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/d/netwatch-tui.svg" alt="downloads"></a>
     <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Release"></a>
-    <a href="https://repology.org/project/netwatch-tui/versions"><img src="https://repology.org/badge/tiny-repos/netwatch-tui.svg" alt="Packaging status"></a>
+    <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/downloads/matthart1983/netwatch/total?label=GitHub%20downloads" alt="GitHub release downloads"></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="Platform">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   </p>
@@ -36,7 +36,7 @@ scoop install netwatch                # Windows (needs Npcap)
 cargo install netwatch-tui            # anywhere with Rust and libpcap headers
 ```
 
-Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux binary is static with libpcap bundled in, so it needs nothing installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
+Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux x86_64/aarch64 binaries are static with libpcap bundled in, so they need nothing installed. There's also an armv5te build for older Marvell Kirkwood NAS boxes (e.g. Iomega ix2-dl) running Debian — libpcap is bundled the same way, but it links against glibc and libatomic, so it needs Debian 12 (bookworm) or newer with `libatomic1` installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). Details in the [install reference](docs/REFERENCE.md#permissions).
 
 ## Run
 

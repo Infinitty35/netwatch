@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEvent};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -16,13 +16,16 @@ pub struct EventHandler {
     /// Polling interval for the background thread, in milliseconds.
     /// Shared with the thread so settings changes apply within one
     /// poll cycle without requiring a restart.
-    tick_rate_ms: Arc<AtomicU64>,
+    // u32, not u64: the value is clamped to 100..=5000 right below, which
+    // fits comfortably, and armv5te (old Kirkwood NAS boxes) has no native
+    // 64-bit atomics.
+    tick_rate_ms: Arc<AtomicU32>,
 }
 
 impl EventHandler {
     pub fn start(tick_rate_ms: u64) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let tick_rate_ms = Arc::new(AtomicU64::new(tick_rate_ms.clamp(100, 5000)));
+        let tick_rate_ms = Arc::new(AtomicU32::new(tick_rate_ms.clamp(100, 5000) as u32));
         let tick_rate_thread = Arc::clone(&tick_rate_ms);
 
         // Use a dedicated OS thread instead of tokio::spawn, since
@@ -33,7 +36,7 @@ impl EventHandler {
                 // Re-read the tick rate each iteration so the settings popup
                 // can change refresh_rate_ms at runtime and have it take
                 // effect on the next poll without a restart.
-                let dur = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed));
+                let dur = Duration::from_millis(tick_rate_thread.load(Ordering::Relaxed) as u64);
                 if event::poll(dur).unwrap_or(false) {
                     match event::read() {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -62,7 +65,7 @@ impl EventHandler {
     /// iteration without tracking previous state.
     pub fn set_tick_rate(&self, ms: u64) {
         self.tick_rate_ms
-            .store(ms.clamp(100, 5000), Ordering::Relaxed);
+            .store(ms.clamp(100, 5000) as u32, Ordering::Relaxed);
     }
 
     pub async fn next(&mut self) -> Result<AppEvent> {

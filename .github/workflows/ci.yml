@@ -54,3 +54,40 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  # Only the release workflow actually builds for armv5te (Iomega ix2-dl /
+  # Marvell Kirkwood), and that only runs on a tag push. Without this, a
+  # change like re-introducing an AtomicU64 (armv5te has no native 64-bit
+  # atomics) would stay green here and only surface as a broken release
+  # build days or weeks later, on a tag. A `check` catches the same class
+  # of regression without paying for a full cross build on every push.
+  armv5te-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv5te-unknown-linux-gnueabi
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install armv5te cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi
+          echo "CARGO_TARGET_ARMV5TE_UNKNOWN_LINUX_GNUEABI_LINKER=arm-linux-gnueabi-gcc" >> $GITHUB_ENV
+          # mimalloc-sys and ring compile C/asm sources from scratch, so
+          # cc-rs needs to be told which cross compiler to use rather than
+          # guessing from the host toolchain.
+          echo "CC_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-gcc" >> $GITHUB_ENV
+          echo "AR_armv5te_unknown_linux_gnueabi=arm-linux-gnueabi-ar" >> $GITHUB_ENV
+          # `cargo check` never links, so the `pcap` crate's build.rs only
+          # needs a LIBPCAP_LIBDIR to point at -- given one, it tries to
+          # load a library there to read its version and falls back to
+          # assuming the latest on failure, which is exactly what happens
+          # here (there's nothing at this path, and it's an x86_64 host
+          # trying to load an ARM library either way). No real libpcap
+          # build needed for a check-only job.
+          echo "LIBPCAP_LIBDIR=/tmp" >> $GITHUB_ENV
+
+      - name: cargo check armv5te
+        run: cargo check --target armv5te-unknown-linux-gnueabi
