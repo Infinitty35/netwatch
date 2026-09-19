@@ -68,11 +68,15 @@ impl Report {
     pub fn summary_line(&self) -> String {
         let primary = self.primary();
         if primary.is_empty() {
-            return format!(
-                "no open findings · {} · {} retained closed findings",
-                self.coverage.label(),
-                self.issues.iter().filter(|i| !i.state.is_open()).count()
-            );
+            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
+            let mut line = format!("no open findings · {}", self.coverage.label());
+            if closed > 0 {
+                line.push_str(&format!(
+                    " · {closed} retained closed finding{}",
+                    if closed == 1 { "" } else { "s" }
+                ));
+            }
+            return line;
         }
         let worst = primary
             .iter()
@@ -115,84 +119,164 @@ impl Report {
             title.push_str(&format!(" — {where_}"));
         }
         if !self.window_start.is_empty() && !self.window_end.is_empty() {
-            title.push_str(&format!(
-                "{} {} to {}",
-                if where_.is_empty() { " —" } else { " ·" },
-                time_of(&self.window_start),
-                time_of(&self.window_end)
-            ));
+            let sep = if where_.is_empty() { " —" } else { " ·" };
+            let (start, end) = (time_of(&self.window_start), time_of(&self.window_end));
+            // A snapshot has no window; "13:35:06 to 13:35:06" reads as a bug.
+            if start == end {
+                title.push_str(&format!("{sep} {start}"));
+            } else {
+                title.push_str(&format!("{sep} {start} to {end}"));
+            }
         }
         m.push_str(&format!("{title}\n\n"));
-        m.push_str(&format!("**Summary** — {}.\n\n", self.summary_line()));
-
         let primary = self.primary();
+        let total = self.coverage.rules.len();
+        let ready = self
+            .coverage
+            .rules
+            .iter()
+            .filter(|r| r.status == super::coverage::Availability::Available)
+            .count();
+
         if primary.is_empty() {
-            m.push_str("No findings are currently open. This does not establish health for unmeasured checks.\n\n");
+            m.push_str("**Summary:** No findings are currently open.");
+            if total == 0 {
+                m.push_str(" Coverage was not recorded, so this does not establish health.");
+            } else if ready < total {
+                m.push_str(&format!(
+                    " {ready} of {total} checks had their inputs; this does not establish health for the other {}, listed below.",
+                    total - ready
+                ));
+            } else {
+                m.push_str(&format!(" All {total} checks had their inputs."));
+            }
+            m.push_str("\n\n");
+            let closed = self.issues.iter().filter(|i| !i.state.is_open()).count();
+            if closed > 0 {
+                m.push_str(&format!(
+                    "{} closed during this session; see Retained closed findings.\n\n",
+                    plural(closed, "finding")
+                ));
+            }
+        } else {
+            m.push_str(&format!("**Summary:** {}.\n\n", self.summary_line()));
+            m.push_str(&format!("**Coverage:** {}.\n\n", self.coverage.label()));
+            let rows: Vec<Vec<String>> = primary
+                .iter()
+                .enumerate()
+                .map(|(n, i)| {
+                    vec![
+                        (n + 1).to_string(),
+                        i.title.clone(),
+                        i.severity.long_label().to_string(),
+                        time_of(&i.since).to_string(),
+                        i.subject.label(),
+                        i.state.label().to_string(),
+                    ]
+                })
+                .collect();
+            m.push_str(&md_table(
+                &["#", "Issue", "Severity", "Since", "Subject", "State"],
+                &rows,
+            ));
         }
 
-        m.push_str(&format!("**Coverage** — {}.\n\n", self.coverage.label()));
         for (n, issue) in primary.iter().enumerate() {
             m.push_str(&self.issue_section(n + 1, issue));
         }
 
-        m.push_str("## Diagnostic coverage\n\n");
-        for row in &self.coverage.rules {
-            m.push_str(&format!(
-                "- `{}`: {:?} — {}\n",
-                row.rule, row.status, row.reason
-            ));
-        }
-        m.push('\n');
-        for issue in self.issues.iter().filter(|i| !i.state.is_open()) {
-            m.push_str(&format!(
-                "Retained closed finding: `{}` — {} ({:?})\n\n",
-                issue.id, issue.title, issue.state
-            ));
-        }
-
         if !self.timeline.is_empty() {
             m.push_str("## Timeline\n\n");
-            for e in &self.timeline {
-                m.push_str(&format!(
-                    "- `{}` **{}** {}\n",
-                    time_of(&e.at),
-                    e.kind,
-                    e.text
-                ));
-            }
-            m.push('\n');
+            let rows: Vec<Vec<String>> = self
+                .timeline
+                .iter()
+                .map(|e| vec![time_of(&e.at).to_string(), e.kind.clone(), e.text.clone()])
+                .collect();
+            m.push_str(&md_table(&["Time", "Event", "Detail"], &rows));
+        }
+
+        let closed: Vec<Vec<String>> = self
+            .issues
+            .iter()
+            .filter(|i| !i.state.is_open())
+            .map(|i| {
+                vec![
+                    format!("`{}`", i.id),
+                    i.title.clone(),
+                    i.state.label().to_string(),
+                ]
+            })
+            .collect();
+        if !closed.is_empty() {
+            m.push_str("## Retained closed findings\n\n");
+            m.push_str(&md_table(&["ID", "Issue", "State"], &closed));
+        }
+
+        // Only the checks that could not run: a table of thirty "ready" rows
+        // buries the few that matter. The ready count stands in for the rest.
+        if total > 0 && ready < total {
+            m.push_str("## Checks not running\n\n");
+            m.push_str("These could not run, so their silence is not a result.\n\n");
+            let mut previous = "";
+            let rows: Vec<Vec<String>> = self
+                .coverage
+                .rules
+                .iter()
+                .filter(|r| r.status != super::coverage::Availability::Available)
+                .map(|row| {
+                    let area = row.rule.split('.').next().unwrap_or("");
+                    // Name each area once so the groups read as groups.
+                    let shown = if area == previous { "" } else { area };
+                    previous = area;
+                    vec![
+                        shown.to_string(),
+                        format!("`{}`", row.rule),
+                        row.status.label().to_string(),
+                        row.reason.clone(),
+                    ]
+                })
+                .collect();
+            m.push_str(&md_table(&["Area", "Check", "Status", "Why"], &rows));
         }
 
         m.push_str("## Environment\n\n");
-        m.push_str(&format!("- host: {}\n", env.host));
-        m.push_str(&format!("- interface: {}", env.iface));
-        if let Some(d) = &env.driver {
-            m.push_str(&format!(" ({d})"));
-        }
-        m.push('\n');
-        if let Some(k) = &env.kernel {
-            m.push_str(&format!("- kernel: {k}\n"));
-        }
-        if let Some(q) = &env.qdisc {
-            m.push_str(&format!("- qdisc: {q}\n"));
-        }
-        if let Some(g) = &env.gateway {
-            m.push_str(&format!("- gateway: {g}\n"));
+        let mut rows = vec![vec!["host".to_string(), env.host.clone()]];
+        rows.push(vec![
+            "interface".into(),
+            match &env.driver {
+                Some(d) => format!("{} ({d})", env.iface),
+                None => env.iface.clone(),
+            },
+        ]);
+        for (k, v) in [
+            ("kernel", &env.kernel),
+            ("qdisc", &env.qdisc),
+            ("gateway", &env.gateway),
+        ] {
+            if let Some(v) = v {
+                rows.push(vec![k.into(), v.clone()]);
+            }
         }
         if !env.resolvers.is_empty() {
-            m.push_str(&format!("- resolvers: {}\n", env.resolvers.join(", ")));
+            rows.push(vec!["resolvers".into(), env.resolvers.join(", ")]);
         }
-        m.push_str(&format!("- baselines: {}\n", env.baseline_state));
-        m.push_str(&format!(
-            "- netwatch {} · ruleset {} ({})\n\n",
-            env.netwatch_version,
-            env.ruleset_version,
-            rules::catalogue_label()
-        ));
+        rows.push(vec!["baselines".into(), env.baseline_state.clone()]);
+        rows.push(vec!["netwatch".into(), env.netwatch_version.clone()]);
+        rows.push(vec![
+            "ruleset".into(),
+            format!("{} ({})", env.ruleset_version, rules::catalogue_label()),
+        ]);
+        m.push_str(&md_table(&["Field", "Value"], &rows));
 
-        if !self.artifacts.is_empty() {
-            m.push_str("## Evidence\n\n");
-            for a in &self.artifacts {
+        // The report's own files sit next to it; listing them is noise.
+        let artifacts: Vec<&String> = self
+            .artifacts
+            .iter()
+            .filter(|a| !matches!(a.as_str(), "report.json" | "report.md"))
+            .collect();
+        if !artifacts.is_empty() {
+            m.push_str("## Evidence files\n\n");
+            for a in artifacts {
                 m.push_str(&format!("- `{a}`\n"));
             }
             m.push('\n');
@@ -214,52 +298,63 @@ impl Report {
         }
         m.push_str(&format!(" · `{}`\n\n", issue.id));
 
-        // --- issue: the evidence, rendered by the same accessors the TUI uses
-        m.push_str("**Issue** — ");
-        m.push_str(&issue.subject.label());
-        for (i, e) in issue.evidence.iter().enumerate() {
-            if i == 0 {
-                m.push_str(&format!(" · {} {}", e.metric, e.value_label()));
-            } else {
-                m.push_str(&format!(", {} {}", e.metric, e.value_label()));
-            }
-            if let Some(b) = e.baseline_label() {
-                m.push_str(&format!(" ({b}"));
-                if let Some(mult) = e.multiple_label() {
-                    m.push_str(&format!(", {mult}"));
-                }
-                m.push(')');
-            }
-        }
-        if let Some(e) = issue.headline() {
-            if e.samples > 0 {
-                m.push_str(&format!(
-                    " · {} samples over {}",
-                    e.samples,
-                    super::issue::format_duration(e.window_secs)
-                ));
-            }
-        }
+        // --- subject and scope
+        m.push_str(&format!("**Subject:** {}", issue.subject.label()));
         let scope = issue.scope.label();
         if !scope.is_empty() {
-            m.push_str(&format!("\n\n**Scope** — {scope}."));
+            m.push_str(&format!("  \n**Scope:** {scope}"));
         }
         m.push_str("\n\n");
+
+        // --- evidence, rendered by the same accessors the TUI uses
+        if !issue.evidence.is_empty() {
+            let rows: Vec<Vec<String>> = issue
+                .evidence
+                .iter()
+                .map(|e| {
+                    vec![
+                        format!("`{}`", e.metric),
+                        e.value_label(),
+                        e.baseline_label().unwrap_or_else(|| "—".into()),
+                        e.baseline_label()
+                            .and(e.multiple_label())
+                            .unwrap_or_else(|| "—".into()),
+                    ]
+                })
+                .collect();
+            m.push_str(&md_table(
+                &["Metric", "Value", "Baseline", "vs baseline"],
+                &rows,
+            ));
+            if let Some(e) = issue.headline() {
+                if e.samples > 0 {
+                    m.push_str(&format!(
+                        "{} over {}.\n\n",
+                        plural(e.samples as usize, "sample"),
+                        super::issue::format_duration(e.window_secs)
+                    ));
+                }
+            }
+        }
 
         // --- probable cause
         if let Some(top) = issue.top_cause() {
             m.push_str(&format!(
-                "**Probable cause** — {} ({}, {}).\n\n",
+                "**Probable cause:** {} ({}, {}).\n\n",
                 top.label,
                 top.confidence().label(),
                 top.checks_label()
             ));
-            for c in &top.checks {
-                m.push_str(&format!("- {} {} — {}\n", c.glyph(), c.name, c.detail));
+            if !top.checks.is_empty() {
+                let rows: Vec<Vec<String>> = top
+                    .checks
+                    .iter()
+                    .map(|c| vec![c.glyph().to_string(), c.name.clone(), c.detail.clone()])
+                    .collect();
+                m.push_str(&md_table(&["", "Check", "Result"], &rows));
             }
-            m.push('\n');
             if issue.causes.len() > 1 {
-                m.push_str("Ruled out or ranked lower: ");
+                m.push_str("**Ruled out or ranked lower:** ");
                 let rest: Vec<String> = issue.causes[1..]
                     .iter()
                     .map(|c| format!("{} ({})", c.label, c.confidence().label()))
@@ -305,7 +400,7 @@ impl Report {
             m.push('\n');
         }
 
-        m.push_str(&format!("**Verify** — {}", issue.verify.label()));
+        m.push_str(&format!("**Verify:** {}", issue.verify.label()));
         match &issue.state {
             IssueState::AutoClosed { at } => {
                 m.push_str(&format!(" · held; auto-closed {}", time_of(at)))
@@ -322,33 +417,76 @@ impl Report {
         m.push_str("\n\n");
 
         // --- consequences: symptoms that were this issue all along
-        if !issue.consequences.is_empty() {
+        let consequences: Vec<Vec<String>> = issue
+            .consequences
+            .iter()
+            .filter_map(|cid| self.find(cid))
+            .map(|c| {
+                vec![
+                    c.title.clone(),
+                    c.severity.long_label().to_string(),
+                    c.subject.label(),
+                    format!("`{}`", c.id),
+                ]
+            })
+            .collect();
+        if !consequences.is_empty() {
             m.push_str(
-                "**Consequences of this issue** — reported here rather than as separate findings:\n\n",
+                "**Consequences of this issue** (reported here rather than as separate findings):\n\n",
             );
-            for cid in &issue.consequences {
-                if let Some(c) = self.find(cid) {
-                    m.push_str(&format!(
-                        "- {} ({}) · {} · `{}`\n",
-                        c.title,
-                        c.severity.long_label(),
-                        c.subject.label(),
-                        c.id
-                    ));
-                }
-            }
-            m.push('\n');
+            m.push_str(&md_table(
+                &["Issue", "Severity", "Subject", "ID"],
+                &consequences,
+            ));
         }
 
         if !issue.artifacts.is_empty() {
             m.push_str(&format!(
-                "**Evidence** — {}\n\n",
+                "**Evidence files:** {}\n\n",
                 issue.artifacts.join(", ")
             ));
         }
 
         m
     }
+}
+
+/// A GitHub-flavoured markdown table, padded so the raw text lines up too —
+/// the Diagnose tab previews this file as plain text. Pipes in cells are
+/// escaped, and newlines flattened, so a detail string can't break the table.
+fn md_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let clean = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| clean(c)).collect())
+        .collect();
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .chain([headers[i].chars().count(), 3])
+                .max()
+                .unwrap_or(3)
+        })
+        .collect();
+    let line = |cells: Vec<String>| {
+        let padded: Vec<String> = cells
+            .iter()
+            .zip(&widths)
+            .map(|(c, w)| format!("{c}{}", " ".repeat(w - c.chars().count())))
+            .collect();
+        format!("| {} |\n", padded.join(" | "))
+    };
+    let mut out = line(headers.iter().map(|h| h.to_string()).collect());
+    out.push_str(&line(widths.iter().map(|w| "-".repeat(*w)).collect()));
+    for r in rows {
+        let mut r = r;
+        r.resize(headers.len(), String::new());
+        out.push_str(&line(r));
+    }
+    out.push('\n');
+    out
 }
 
 fn severity_counts(issues: &[&Issue]) -> String {
@@ -437,7 +575,7 @@ mod tests {
         }
         let md = report.to_markdown();
         assert!(report.summary_line().contains("retained closed findings"));
-        assert!(md.contains("Retained closed finding"));
+        assert!(md.contains("## Retained closed findings"));
         assert!(!md.contains("No issues were open in this window"));
         for issue in &report.issues {
             assert!(md.contains(&issue.id));
@@ -445,9 +583,37 @@ mod tests {
     }
 
     #[test]
+    fn tables_are_well_formed_and_coverage_uses_readable_labels() {
+        let mut r = report();
+        let base = crate::diagnose::baseline::BaselineStore::new(
+            crate::diagnose::baseline::NetworkFingerprint::new("test", None, vec![], None),
+        );
+        r.coverage = crate::diagnose::coverage::Coverage::from_observations(
+            &crate::diagnose::detectors::Observations::default(),
+            &base,
+        );
+        let md = r.to_markdown();
+        assert!(md.contains("| Area "), "{md}");
+        assert!(md.contains("## Checks not running"), "{md}");
+        assert!(md.contains("not measured"), "{md}");
+        assert!(!md.contains("NotMeasured"), "enum debug names leaked: {md}");
+        // Every row of a table has the same number of unescaped pipes as its header.
+        let mut expected = None;
+        for line in md.lines() {
+            if !line.starts_with('|') {
+                expected = None;
+                continue;
+            }
+            let pipes = line.replace("\\|", "").matches('|').count();
+            let want = *expected.get_or_insert(pipes);
+            assert_eq!(pipes, want, "ragged table row: {line}");
+        }
+    }
+
+    #[test]
     fn markdown_summary_states_the_verdict() {
         let md = report().to_markdown();
-        let first = md.lines().find(|l| l.starts_with("**Summary**")).unwrap();
+        let first = md.lines().find(|l| l.starts_with("**Summary:**")).unwrap();
         assert!(first.contains("degraded"), "{first}");
         assert!(first.contains("1 high"), "{first}");
     }
@@ -487,11 +653,21 @@ mod tests {
                 }
             }
         }
-        // Each evidence line in the markdown must quote one of those.
-        for line in md.lines().filter(|l| l.starts_with("**Issue** —")) {
+        // Each evidence table row must quote one of those.
+        let metrics: Vec<String> = r
+            .issues
+            .iter()
+            .flat_map(|i| i.evidence.iter().map(|e| format!("| `{}`", e.metric)))
+            .collect();
+        let rows: Vec<&str> = md
+            .lines()
+            .filter(|l| metrics.iter().any(|m| l.starts_with(m.as_str())))
+            .collect();
+        assert!(!rows.is_empty(), "no evidence rows rendered:\n{md}");
+        for line in rows {
             assert!(
                 allowed.iter().any(|a| line.contains(a.as_str())),
-                "issue line quotes a number no evidence supports:\n{line}"
+                "evidence row quotes a number no evidence supports:\n{line}"
             );
         }
     }
@@ -579,7 +755,7 @@ mod tests {
     #[test]
     fn the_environment_section_states_baseline_confidence() {
         let md = report().to_markdown();
-        assert!(md.contains("- baselines: "), "{md}");
+        assert!(md.contains("| baselines "), "{md}");
         assert!(md.contains("ruleset"), "{md}");
     }
 
