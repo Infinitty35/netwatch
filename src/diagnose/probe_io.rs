@@ -1,9 +1,10 @@
 //! Bounded, cancellable I/O shared by diagnostic probes. Linux NSS resolution
 //! runs in a killable child; other platforms share one native resolver worker.
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpStream},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
