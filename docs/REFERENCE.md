@@ -400,6 +400,9 @@ They install the binary, all three shell completions, the man page, the
 fleet-agent systemd unit (not enabled) and the docs. They have **no**
 dependencies — libpcap is linked into the binary.
 
+Where each package comes from, and what to do at release time, is in
+[PACKAGING.md](PACKAGING.md).
+
 Neither package grants capabilities. `netwatch` still needs elevated access to
 capture, so either run it with `sudo` or grant them yourself once (see
 [Permissions](#permissions)); the package prints that command on install. A
