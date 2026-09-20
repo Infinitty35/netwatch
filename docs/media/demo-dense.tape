@@ -38,6 +38,20 @@
 # Record with:  vhs docs/media/demo-dense.tape
 # Needs: ./target/release/netwatch, vhs, scripts/demo-dense-{env,traffic}.sh.
 
+# THEN RE-ENCODE IT, for the same reason the hero tape documents: vhs v0.11.0
+# ignores `Set Framerate` for the GIF and writes 25 fps whatever the tape says,
+# which is 2.5x the frames this needs. The 19 September take was 5.0 MB at
+# 25 fps; the same recording at 10 fps is 2.8 MB.
+#
+#   ffmpeg -i docs/media/demo-dense.gif \
+#     -vf "fps=10,palettegen=stats_mode=diff:max_colors=64" -y /tmp/pal.png
+#   ffmpeg -i docs/media/demo-dense.gif -i /tmp/pal.png \
+#     -lavfi "fps=10[x];[x][1:v]paletteuse=dither=none:diff_mode=rectangle" \
+#     -loop 0 -y docs/media/demo-dense.gif
+#
+# `dither=none` is deliberate: terminal output is flat colour, so dithering
+# buys nothing visible and costs most of the inter-frame compression.
+
 Output docs/media/demo-dense.gif
 
 Set Shell "bash"
