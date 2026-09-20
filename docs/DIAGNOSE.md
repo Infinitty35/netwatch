@@ -90,6 +90,33 @@ mapping. Current QuietSample recordings alone do not establish false alerts per
 device-week or supply a week of baseline history.
 
 
+## One bounded diagnosis
+
+```sh
+netwatch diagnose run --budget 30s
+netwatch diagnose run --target api --budget 2m --format json
+```
+
+Runs for the budget, then reports what it found and exits. Exit statuses are
+part of the interface:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | completed, no finding — the rules that could be evaluated did not fire |
+| 1 | completed, at least one open finding |
+| 2 | incomplete — no usable observation arrived inside the budget |
+| 3 | bad arguments, or the session could not start |
+
+Exit 0 and exit 2 are deliberately different. A run that gathered nothing has
+established nothing, and a script that treats silence as health will report a
+dead link as a healthy one. With `--target`, only that target's own probes
+count as evidence: another target completing says nothing about this one.
+
+Budgets accept `30s`, `2m` or a bare number of seconds, between 5s and 10m.
+JSON output carries the ruleset size, the sampling window, the coverage object
+and the issues, so a support engineer can see what was evaluated rather than
+inferring it from an empty list.
+
 ## Diagnose coverage in terminal Netwatch
 
 Press **9**, then **c** to inspect every check. Use **↑/↓** to select a row.
@@ -288,6 +315,31 @@ reset the sampler's histories. Cancellation stops new requests and discards
 late results; an operation already in progress may take its bounded timeout to
 return. STUN now reports resolution, send, receive and malformed-response errors,
 and only a complete two-server mapping comparison is usable.
+
+## Rule coverage document
+
+`docs/diagnostic-coverage.md` is generated from the catalogue:
+
+```sh
+netwatch diagnose coverage --doc
+```
+
+A test fails when the committed copy and the catalogue disagree, so the
+document cannot drift from the rules again.
+
+## Pinned replay corpus
+
+`tests/diagnose/corpus/` holds a recorded episode and the decisions it must
+keep producing — which issues open, when, and what each is blamed on. The
+replay test compares against that file rather than against the recording it
+just made, so a change that moves both sides still shows up.
+
+```sh
+netwatch diagnose corpus      # regenerate after an intended semantic change
+```
+
+A diff there is a change in what netwatch concludes, and belongs in the same
+review as the code that caused it.
 
 ## Reproducible verification
 

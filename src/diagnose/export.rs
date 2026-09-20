@@ -238,6 +238,19 @@ impl Redactor {
                             s.clear();
                         }
                     }
+                    // Per-target probe ages are keyed by target name, and a
+                    // map key is not a string value the walk would reach. Left
+                    // alone, the recording would carry real names and replay
+                    // would look for them under their redacted spelling.
+                    if k == "target_ages" {
+                        if let Value::Object(ages) = &mut v {
+                            let renamed: Vec<(String, Value)> = std::mem::take(ages)
+                                .into_iter()
+                                .map(|(name, age)| (self.target_identity(&name), age))
+                                .collect();
+                            *ages = renamed.into_iter().collect();
+                        }
+                    }
                     if k == "reviewer" {
                         if let Value::String(s) = &mut v {
                             *s = self.token("reviewer", s);
@@ -651,7 +664,11 @@ mod tests {
                 path: Some(now),
                 ..Default::default()
             };
-            times.targets = target.as_ref().map(|_| now);
+            times.targets = target
+                .as_ref()
+                .map(|t| (t.name.clone(), now))
+                .into_iter()
+                .collect();
             times.health.dns = Some(now);
             times.health.gateway = Some(now);
             times.health.internet = Some(now);
@@ -705,6 +722,11 @@ mod tests {
         use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
         let mut ep = fixture_episode();
         let target = TargetObs {
+            stale_after_secs: None,
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
             baseline_key: Some("target-config:private-test-revision".into()),
             name: "dns".into(),     // deliberately collides with a schema field
             host: "payroll".into(), // single-label internal hostname

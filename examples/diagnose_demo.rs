@@ -85,6 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // caption carries the provenance.
             demo_banner: None,
             running_tests: vec![],
+            // The stills render from a recorded engine, which carries no
+            // live probe history to chart.
+            history: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT))?;
         terminal.draw(|f| render_body(f, &view, f.size()))?;

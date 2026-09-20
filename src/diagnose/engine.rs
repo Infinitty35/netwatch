@@ -84,7 +84,14 @@ impl Clock for std::sync::Arc<FixedClock> {
 /// The completion time of the collector a rule's evidence comes from.
 /// `None` for rules with no single sampling collector; `Some(None)` when the
 /// collector exists but hasn't completed.
-fn sample_time(rule: &str, times: &ObservationTimes) -> Option<Option<std::time::Instant>> {
+///
+/// `subject` matters for the per-target rules: evidence about one target is
+/// not evidence about another, however recently the other was probed.
+fn sample_time(
+    rule: &str,
+    subject: &super::issue::Subject,
+    times: &ObservationTimes,
+) -> Option<Option<std::time::Instant>> {
     if rule == "ipv6.broken" {
         Some(times.ipv6)
     } else if rule == "captive.portal" {
@@ -108,7 +115,13 @@ fn sample_time(rule: &str, times: &ObservationTimes) -> Option<Option<std::time:
     } else if rule.starts_with("tcp.") && rule != "tcp.bufferbloat_local" {
         Some(times.sockets)
     } else if rule.starts_with("target.") {
-        Some(times.targets)
+        match subject {
+            super::issue::Subject::Target { name } => Some(times.targets.get(name).copied()),
+            // A target rule filed against something else has no per-target
+            // clock to read; treat it as unsampled rather than borrowing
+            // another target's.
+            _ => Some(None),
+        }
     } else {
         None
     }
@@ -164,8 +177,15 @@ pub struct ObservationTimes {
     pub health: crate::collectors::health::ProbeTimes,
     pub sockets: Option<std::time::Instant>,
     pub path: Option<std::time::Instant>,
-    /// The newest developer-target probe result.
-    pub targets: Option<std::time::Instant>,
+    /// When each developer target last published a result, by configured
+    /// name.
+    ///
+    /// This used to be one `Option<Instant>` holding the newest completion
+    /// across all targets, which every `target.*` rule then read. A target
+    /// probed every 10s therefore supplied samples for an issue about a
+    /// target probed every 5 minutes: it confirmed findings and ran down
+    /// recovery holds against a cached result nobody had re-measured.
+    pub targets: std::collections::BTreeMap<String, std::time::Instant>,
 }
 
 /// Something done to an issue from outside the detection loop: a user action,
@@ -348,9 +368,15 @@ impl Engine {
         if !fresh(times.path, 120) {
             observed.paths.clear();
         }
-        if !fresh(times.targets, TARGET_STALE_SECS) {
-            observed.targets.clear();
-        }
+        // Per target, not in bulk: one target going stale says nothing about
+        // the others, and the newest completion standing in for all of them
+        // is what let a fast target keep a slow one's result looking live.
+        observed.targets.retain(|t| {
+            fresh(
+                times.targets.get(&t.name).copied(),
+                t.stale_after_secs.unwrap_or(TARGET_STALE_SECS),
+            )
+        });
         if !fresh(times.ipv6, 120) {
             observed.active.ipv6 = None;
         }
@@ -399,7 +425,10 @@ impl Engine {
             {
                 Some((times.interface, 15))
             } else if row.rule.starts_with("target.") {
-                Some((times.targets, TARGET_STALE_SECS))
+                // Coverage is per rule, not per target, so the rule counts as
+                // sampled while any target is still fresh; the freshest is
+                // the one that decides.
+                Some((times.targets.values().copied().max(), TARGET_STALE_SECS))
             } else {
                 None
             };
@@ -474,7 +503,9 @@ impl Engine {
         now: DateTime<Local>,
     ) -> Option<DateTime<Local>> {
         let need = self.settings.thresholds.consecutive_n.max(1);
-        let sample = times.and_then(|t| sample_time(d.rule, t)).flatten();
+        let sample = times
+            .and_then(|t| sample_time(d.rule, &d.subject, t))
+            .flatten();
         let entry = self.pending.entry(d.key()).or_insert(Pending {
             samples: 0,
             last: None,
@@ -651,7 +682,7 @@ impl Engine {
 
             let mut live_held = None;
             if let Some(times) = times {
-                if let Some(sample) = sample_time(&issue.rule, times) {
+                if let Some(sample) = sample_time(&issue.rule, &issue.subject, times) {
                     let Some(sample) = sample else {
                         self.verifying_since.remove(&issue.id);
                         self.verification_samples.remove(&issue.id);
@@ -923,7 +954,12 @@ impl Engine {
                             && (r.outcome == super::next_test::Outcome::Positive) == expect.positive
                     })
             });
-            let outcome = if !issue.state.is_open() {
+            // Only an auto-close is measured: netwatch watched the verify
+            // condition hold. A hand-resolved issue closed because someone
+            // said so, which is not evidence that the step worked.
+            let outcome = if matches!(issue.state, IssueState::Resolved { .. }) {
+                Some(VerifyOutcome::ClosedByOperator)
+            } else if !issue.state.is_open() {
                 Some(if still_supported {
                     VerifyOutcome::Partial
                 } else {
@@ -1690,6 +1726,10 @@ mod tests {
         let b = base();
         let target = |refused: bool| TargetObs {
             baseline_key: None,
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
             name: "api".into(),
             host: "127.0.0.1".into(),
             port: 8443,
@@ -1712,6 +1752,7 @@ mod tests {
             tls_stage: None,
             http_stage: None,
             status: None,
+            stale_after_secs: None,
             context: TargetContext::default(),
         };
         let obs = |refused| Observations {
@@ -1721,7 +1762,12 @@ mod tests {
         let start = std::time::Instant::now();
         let mut times = ObservationTimes::default();
         let mut tick = |e: &mut Engine, refused: bool, probe: u64, secs: u64| {
-            times.targets = Some(start + std::time::Duration::from_secs(probe * 60));
+            times.targets = [(
+                "api".to_string(),
+                start + std::time::Duration::from_secs(probe * 60),
+            )]
+            .into_iter()
+            .collect();
             e.observe_live_at(
                 &obs(refused),
                 &b,
@@ -1768,6 +1814,59 @@ mod tests {
             matches!(issue.state, IssueState::AutoClosed { .. }),
             "{:?}",
             issue.state
+        );
+    }
+
+    #[test]
+    fn closing_an_issue_by_hand_is_not_a_measured_recovery() {
+        // Pressing resolve after carrying out a step used to record
+        // `Recovered` against that step, crediting an action with a repair
+        // nothing measured. Only an auto-close follows an observed hold.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+
+        assert!(e.mark_step_done(&id, 0));
+        clock.advance_secs(5);
+        assert!(e.resolve(&id));
+
+        // The rule stops firing afterwards, so nothing reopens it. The engine
+        // still never watched a verify window: a human ended this, not a
+        // measurement.
+        clock.advance_secs(120);
+        e.observe(&obs(1.3), &b);
+
+        let issue = e.get(&id).unwrap();
+        assert!(matches!(issue.state, IssueState::Resolved { .. }));
+        let v = issue.verification.as_ref().expect("a step was carried out");
+        assert_eq!(
+            v.outcome,
+            Some(super::super::issue::VerifyOutcome::ClosedByOperator),
+            "a hand-closed issue cannot report a measured recovery"
+        );
+    }
+
+    #[test]
+    fn an_auto_close_after_a_step_still_reports_a_measured_recovery() {
+        // The counterpart: the engine watched p50 hold under 5ms for the
+        // rule's window, so the step keeps its credit.
+        let (mut e, clock) = engine_at("2026-09-03 06:48:10");
+        let b = base();
+        e.observe(&obs(40.0), &b);
+        let id = e.primary()[0].id.clone();
+        assert!(e.mark_step_done(&id, 0));
+
+        for _ in 0..61 {
+            clock.advance_secs(1);
+            e.observe(&obs(1.3), &b);
+        }
+
+        let issue = e.get(&id).unwrap();
+        assert!(matches!(issue.state, IssueState::AutoClosed { .. }));
+        assert_eq!(
+            issue.verification.as_ref().unwrap().outcome,
+            Some(super::super::issue::VerifyOutcome::Recovered)
         );
     }
 
@@ -1837,7 +1936,7 @@ mod tests {
             addr: Some("192.168.8.1".into()),
             rtt_ms: None,
             loss_pct: 100.0,
-            arp_ok: true,
+            arp_ok: Some(true),
             icmp_ok: false,
             internet_reachable: Some(false),
         });
@@ -1965,6 +2064,128 @@ mod tests {
     }
 
     #[test]
+    fn one_targets_probes_cannot_confirm_or_recover_another_targets_issue() {
+        // Every `target.*` rule used to read one shared "newest completion"
+        // across all targets. A target on a 10s interval therefore supplied
+        // samples for an issue about a target on a 5-minute one: it confirmed
+        // the finding, and then ran down its recovery hold, against a cached
+        // result nobody had re-measured.
+        use crate::diagnose::targets::{Stage, StageError, TargetContext, TargetObs};
+        let (mut e, _clock) = hysteresis_engine_at("2026-09-15 10:00:00");
+        let b = base();
+        let target = |name: &str, refused: bool| TargetObs {
+            baseline_key: None,
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
+            stale_after_secs: Some(600),
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            port: 8443,
+            tls: false,
+            http: false,
+            expect_status: None,
+            probed_at: String::new(),
+            resolve: Stage {
+                ms: Some(0.0),
+                error: None,
+            },
+            addresses: vec!["127.0.0.1".into()],
+            lookups: vec![],
+            connect: Some(Stage {
+                ms: Some(1.0),
+                error: refused.then_some(StageError::Refused),
+            }),
+            connect_v4: None,
+            connect_v6: None,
+            tls_stage: None,
+            http_stage: None,
+            status: None,
+            context: TargetContext::default(),
+        };
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        // "slow" is refused throughout and probed once; "fast" is healthy and
+        // probed every 10 seconds.
+        let tick = |e: &mut Engine, slow_probe: u64, fast_probe: u64, secs: u64| {
+            let times = ObservationTimes {
+                targets: [
+                    ("slow".to_string(), at(slow_probe)),
+                    ("fast".to_string(), at(fast_probe)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            e.observe_live_at(
+                &Observations {
+                    targets: vec![target("slow", true), target("fast", false)],
+                    ..Default::default()
+                },
+                &b,
+                &times,
+                at(secs),
+            );
+        };
+
+        // Three probes of "fast" while "slow" has published once: not enough
+        // to confirm an issue about "slow".
+        tick(&mut e, 0, 0, 0);
+        tick(&mut e, 0, 10, 10);
+        tick(&mut e, 0, 20, 20);
+        assert_eq!(
+            e.open_count(),
+            0,
+            "another target's probes cannot confirm this one"
+        );
+
+        // "slow" publishes twice more and the issue opens on its own samples.
+        tick(&mut e, 60, 60, 60);
+        tick(&mut e, 120, 120, 120);
+        assert_eq!(e.open_count(), 1);
+        let id = e.primary()[0].id.clone();
+        assert_eq!(e.get(&id).unwrap().subject.label(), "slow");
+
+        // "slow" now looks healthy, but only "fast" keeps probing. The
+        // recovery hold must not run down on another target's cadence.
+        let healthy_tick = |e: &mut Engine, slow_probe: u64, fast_probe: u64, secs: u64| {
+            let times = ObservationTimes {
+                targets: [
+                    ("slow".to_string(), at(slow_probe)),
+                    ("fast".to_string(), at(fast_probe)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            };
+            e.observe_live_at(
+                &Observations {
+                    targets: vec![target("slow", false), target("fast", false)],
+                    ..Default::default()
+                },
+                &b,
+                &times,
+                at(secs),
+            );
+        };
+        healthy_tick(&mut e, 180, 180, 180);
+        for secs in [240, 300, 360, 420, 480] {
+            healthy_tick(&mut e, 180, secs, secs);
+        }
+        assert!(
+            e.get(&id).unwrap().state.is_open(),
+            "only one probe of this target has shown recovery, whatever the other target did"
+        );
+
+        // Its own probes then hold the condition and it closes.
+        for secs in [540, 600, 660, 720] {
+            healthy_tick(&mut e, secs, secs, secs);
+        }
+        assert!(!e.get(&id).unwrap().state.is_open());
+    }
+
+    #[test]
     fn cached_probe_does_not_complete_verification_without_a_new_result() {
         let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
         let base = base();
@@ -2003,7 +2224,7 @@ mod tests {
                 rtt_ms: None,
                 loss_pct: 100.0,
                 internet_reachable: None,
-                arp_ok: false,
+                arp_ok: Some(false),
                 icmp_ok: false,
             }),
             ..Default::default()
@@ -2178,7 +2399,7 @@ mod tests {
                     addr: Some(gw.into()),
                     rtt_ms: Some(rtt),
                     loss_pct: 0.0,
-                    arp_ok: true,
+                    arp_ok: Some(true),
                     icmp_ok: true,
                     internet_reachable: Some(true),
                 }),

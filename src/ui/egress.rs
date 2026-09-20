@@ -18,6 +18,7 @@ use ratatui::{
     prelude::*,
     widgets::{Cell, Paragraph, Row, Table},
 };
+use std::time::SystemTime;
 
 const SPARK: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Rows of chrome above the table body: tab bar (3) + table border + header.
@@ -92,11 +93,48 @@ fn verdict_rank(v: &Verdict) -> u8 {
     }
 }
 
+/// When this netwatch run began, on the wall clock profiles are stamped with.
+///
+/// Profiles persist, so "seen since we started" is what separates the traffic
+/// this session is watching from the baseline it inherited. A duration rather
+/// than a stored timestamp, because the session's own start is already
+/// recorded as an `Instant`.
+fn session_start(app: &App) -> SystemTime {
+    SystemTime::now()
+        .checked_sub(app.session_started_at.elapsed())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Whether a profile has been seen since this run started.
+fn seen_this_session(profile: &EgressProfile, since: SystemTime) -> bool {
+    profile.last_seen >= since
+}
+
+/// Profiles held back because nothing has been heard from them this session.
+pub fn hidden_history_count(app: &App) -> usize {
+    if app.ui.egress_show_history {
+        return 0;
+    }
+    let since = session_start(app);
+    app.egress_profiler
+        .profiles_ref()
+        .iter()
+        .filter(|p| !seen_this_session(p, since))
+        .count()
+}
+
 /// Flatten the profiles into the visible row list, honouring filter,
 /// collapse state and sort. Public so the mouse handler maps clicks against
 /// exactly the rows the renderer drew.
 pub fn visible_rows(app: &App) -> Vec<EgressRow<'_>> {
     let profiles = app.egress_profiler.profiles_ref();
+    // History is kept — drift is measured against it — but it is not what
+    // this page opens on. `H` brings it back.
+    let since = session_start(app);
+    let profiles: Vec<&EgressProfile> = profiles
+        .into_iter()
+        .filter(|p| app.ui.egress_show_history || seen_this_session(p, since))
+        .collect();
     let needle = app
         .ui
         .egress_filter_active
@@ -282,6 +320,35 @@ fn dwell(count: u64) -> String {
         s => format!("{:.1}d", s as f64 / 86_400.0),
     }
 }
+
+/// How long since a process last sent anything, and whether that is recent
+/// enough to call it live.
+///
+/// Profiles are a learned baseline and persist across restarts, so the tab
+/// lists every program that has ever been seen. Without this the row for
+/// something that ran once last week looked exactly like the row for the
+/// browser sending right now — same name, same destinations, same totals,
+/// and an empty Active column on both.
+fn last_seen_age(profile: &EgressProfile, now: SystemTime) -> (String, bool) {
+    let Ok(age) = now.duration_since(profile.last_seen) else {
+        // Clock went backwards; "now" is the honest answer, not a negative age.
+        return ("now".into(), true);
+    };
+    let secs = age.as_secs();
+    let live = secs <= LIVE_WITHIN_SECS;
+    let label = match secs {
+        s if s < 10 => "now".to_string(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    };
+    (label, live)
+}
+
+/// Seen inside this window counts as live: two probe cycles plus slack, so a
+/// process between bursts does not flicker between live and stale.
+const LIVE_WITHIN_SECS: u64 = 120;
 
 /// Compact byte formatting with a GB step — egress totals reach it.
 fn human_bytes(b: u64) -> String {
@@ -524,6 +591,15 @@ fn summary_line(app: &App, rows: &[EgressRow<'_>]) -> Line<'static> {
             Style::default().fg(t.text_muted),
         ),
     ];
+    // Say what is not on screen. A filtered list that does not admit it is
+    // filtered is how someone concludes a program never phoned home.
+    let hidden = hidden_history_count(app);
+    if hidden > 0 {
+        spans.push(Span::styled(
+            format!(" · {hidden} from earlier sessions hidden"),
+            Style::default().fg(t.text_muted),
+        ));
+    }
     if out > 0 {
         spans.push(Span::styled(
             format!(" · {} out", human_bytes(out)),
@@ -627,13 +703,20 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
             } => {
                 let chevron = if *collapsed { "▶" } else { "▼" };
                 let (vcol, vtext) = verdict_style(t, worst, true);
+                let (age, live) = last_seen_age(profile, SystemTime::now());
+                // A process nobody has heard from is still worth listing —
+                // its baseline is what drift is measured against — but it is
+                // not what someone scanning this page is looking for.
+                let name_style = Style::default()
+                    .fg(if live { t.brand } else { t.text_muted })
+                    .bg(bg)
+                    .add_modifier(if live {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
                 Row::new(vec![
-                    Cell::from(format!("{chevron} {}", profile.process)).style(
-                        Style::default()
-                            .fg(t.brand)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Cell::from(format!("{chevron} {}", profile.process)).style(name_style),
                     Cell::from(format!(
                         "{dests} dest{}",
                         if *dests == 1 { "" } else { "s" }
@@ -643,7 +726,11 @@ fn render_tree(f: &mut Frame, app: &App, area: Rect) {
                     Cell::from(vol(*bytes_in)).style(Style::default().fg(t.rx_rate).bg(bg)),
                     Cell::from(spark(activity, spark_w))
                         .style(Style::default().fg(t.text_secondary).bg(bg)),
-                    Cell::from("").style(Style::default().bg(bg)),
+                    Cell::from(age).style(
+                        Style::default()
+                            .fg(if live { t.status_good } else { t.text_muted })
+                            .bg(bg),
+                    ),
                     Cell::from(vtext).style(Style::default().fg(vcol).bg(bg)),
                 ])
             }
@@ -965,6 +1052,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         },
     ));
     nav.extend(hint("d", "detail"));
+    nav.extend(hint(
+        "H",
+        if app.ui.egress_show_history {
+            "hide history"
+        } else {
+            "show history"
+        },
+    ));
     // Teach the two glyphs that aren't self-evident, rather than restating
     // that the linter never blocks — that belongs in the docs, not on every
     // frame.
@@ -1005,8 +1100,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{tally, EgressRow, Tally};
-    use crate::collectors::egress::{EgressDest, Verdict};
+    use super::{last_seen_age, seen_this_session, tally, EgressRow, Tally, LIVE_WITHIN_SECS};
+    use crate::collectors::egress::{EgressDest, EgressProfile, Verdict};
     use std::collections::VecDeque;
     use std::time::SystemTime;
 
@@ -1024,6 +1119,80 @@ mod tests {
             bytes_in: 0,
             activity: VecDeque::new(),
         }
+    }
+
+    fn profile_last_seen(secs_ago: u64) -> EgressProfile {
+        EgressProfile {
+            process: "curl".into(),
+            dests: Default::default(),
+            last_seen: SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 - secs_ago),
+        }
+    }
+
+    #[test]
+    fn history_is_hidden_until_it_is_asked_for() {
+        // A profile last seen before this run started is baseline, not
+        // traffic, and the page opens on traffic.
+        let since = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let this_session = EgressProfile {
+            process: "firefox".into(),
+            dests: Default::default(),
+            last_seen: since + std::time::Duration::from_secs(5),
+        };
+        let earlier = EgressProfile {
+            process: "curl".into(),
+            dests: Default::default(),
+            last_seen: since - std::time::Duration::from_secs(86_400),
+        };
+        assert!(seen_this_session(&this_session, since));
+        assert!(!seen_this_session(&earlier, since));
+        // A profile stamped exactly at the boundary belongs to this session:
+        // the first observation of a run lands on it.
+        let boundary = EgressProfile {
+            process: "ssh".into(),
+            dests: Default::default(),
+            last_seen: since,
+        };
+        assert!(seen_this_session(&boundary, since));
+    }
+
+    #[test]
+    fn a_process_row_says_when_it_was_last_heard_from() {
+        // Profiles persist across restarts, so this page lists every program
+        // ever seen. Something that ran once last week used to render exactly
+        // like the browser sending right now.
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        assert_eq!(
+            last_seen_age(&profile_last_seen(0), now),
+            ("now".into(), true)
+        );
+        assert_eq!(
+            last_seen_age(&profile_last_seen(30), now),
+            ("30s".into(), true)
+        );
+        assert_eq!(
+            last_seen_age(&profile_last_seen(LIVE_WITHIN_SECS), now),
+            ("2m".into(), true),
+            "a process between bursts is still live"
+        );
+        let (label, live) = last_seen_age(&profile_last_seen(3600), now);
+        assert_eq!(label, "1h");
+        assert!(!live, "an hour of silence is not live");
+        let (label, live) = last_seen_age(&profile_last_seen(86_400 * 3), now);
+        assert_eq!(label, "3d");
+        assert!(!live);
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_does_not_report_a_negative_age() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let future = EgressProfile {
+            process: "curl".into(),
+            dests: Default::default(),
+            last_seen: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        };
+        assert_eq!(last_seen_age(&future, now), ("now".into(), true));
     }
 
     /// A drift row must be counted by the summary.

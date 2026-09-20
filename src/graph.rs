@@ -258,6 +258,34 @@ pub fn area_graph_with(
 /// those to [`render_with_max`] under the braille style right-aligns them into
 /// a plot with room for twice as many, leaving the left half of the strip
 /// blank. Here each bucket fills its own column in both styles.
+/// One row of bottom-anchored eighths, for a sparkline that lives inside a
+/// line of text rather than its own plot area.
+///
+/// The Diagnose detail is a `Vec<Line>`: it has no plot rectangle to hand a
+/// renderer, and giving it one would mean splitting the pane and laying the
+/// two halves out separately. A row of glyphs slots into the text it explains
+/// and keeps the pane a single flow.
+///
+/// Values at or below zero draw the floor glyph rather than a blank, so a
+/// quiet series reads as measured-and-quiet, not as missing data.
+pub fn bar_row(data: &[u64], width: usize, max: u64) -> Vec<char> {
+    const GLYPHS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if width == 0 || data.is_empty() {
+        return vec![];
+    }
+    let start = data.len().saturating_sub(width);
+    data[start..]
+        .iter()
+        .map(|&v| {
+            if max == 0 {
+                return GLYPHS[0];
+            }
+            let scaled = (v.min(max) as u128 * (GLYPHS.len() as u128 - 1) / max as u128) as usize;
+            GLYPHS[scaled]
+        })
+        .collect()
+}
+
 pub fn render_bucketed_with_max(
     f: &mut Frame,
     area: Rect,
@@ -609,6 +637,30 @@ pub fn render_mirrored_with_max(
     tx_color: Color,
     opts: GraphOpts,
 ) -> u16 {
+    render_mirrored_scaled(buf, plot, rx, tx, max, max, style, rx_color, tx_color, opts)
+}
+
+/// The same mirror, with a separate maximum for each half.
+///
+/// Sharing one maximum is what makes rx and tx comparable, and that is the
+/// default. But a 16 MB/s download beside a 61 KB/s upload puts the whole tx
+/// half below one row: half the panel renders empty, and the reader cannot
+/// tell "almost nothing" from "nothing at all". The caller decides when the
+/// ratio has passed that point, and labels the axis with both numbers so the
+/// halves are not silently read against each other.
+#[allow(clippy::too_many_arguments)]
+pub fn render_mirrored_scaled(
+    buf: &mut Buffer,
+    plot: Rect,
+    rx: &[u64],
+    tx: &[u64],
+    rx_max: u64,
+    tx_max: u64,
+    style: GraphStyle,
+    rx_color: Color,
+    tx_color: Color,
+    opts: GraphOpts,
+) -> u16 {
     if plot.width == 0 || plot.height == 0 {
         return 0;
     }
@@ -624,7 +676,7 @@ pub fn render_mirrored_with_max(
             ..plot
         },
         rx,
-        max,
+        rx_max,
         style,
         rx_color,
         opts,
@@ -638,7 +690,7 @@ pub fn render_mirrored_with_max(
             ..plot
         },
         tx,
-        max,
+        tx_max,
         style,
         tx_color,
         // The zero line the rx half draws is this half's floor too.

@@ -41,6 +41,28 @@ pub struct Rule {
     /// and they share a subject scope. Explicit — never inferred.
     pub suppresses: &'static [RuleId],
     pub status: RuleStatus,
+    /// What must be measured before this rule may fire. Empty means the rule
+    /// has not been through a contract review yet, which the generated
+    /// coverage document states rather than hides.
+    pub evidence: &'static [&'static str],
+    /// Healthy situations that produce the same symptom, and which the rule's
+    /// checks have to tell apart.
+    pub lookalikes: &'static [&'static str],
+    /// What counts as recovery, in words.
+    pub recovery: &'static str,
+    /// Where the rule can run at all, and what it cannot see.
+    pub platforms: &'static str,
+}
+
+impl Rule {
+    /// Whether this rule has been through the contract review: evidence,
+    /// lookalikes, recovery and platform limits all stated.
+    pub fn contracted(&self) -> bool {
+        !self.evidence.is_empty()
+            && !self.lookalikes.is_empty()
+            && !self.recovery.is_empty()
+            && !self.platforms.is_empty()
+    }
 }
 
 /// Built-in ruleset v1.
@@ -54,6 +76,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "resolver p50 > 3σ above baseline for 3 samples, or pipeline dns stage > 20ms",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "dns.failing",
@@ -63,6 +89,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "servfail/timeout rate > 5%, or the pipeline dns stage fails",
         suppresses: &["dns.slow_resolver", "target.resolve_failed"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "dns.truncation_retry",
@@ -72,6 +102,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "more than 10% of probe replies carry the TC bit",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "dns.hijack_suspect",
@@ -81,6 +115,16 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a private address for a public name, or disagreement with a validating reference on most cycles",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[
+            "the same name asked of the configured resolver and of a reference resolver",
+            "whether the answer is private, and whether the reference validated it",
+        ],
+        lookalikes: &[
+            "split-horizon dns on a corporate network, which is by design",
+            "a cdn answering differently by geography",
+        ],
+        recovery: "the two resolvers agree again, or the private answer stops",
+        platforms: "anywhere a reference resolver is reachable; blocked outbound dns leaves it unmeasured",
     },
     // ------------------------------------------------------- gateway / link
     Rule {
@@ -105,6 +149,16 @@ pub const CATALOGUE: &[Rule] = &[
             "target.slow_stage",
         ],
         status: RuleStatus::Active,
+        evidence: &[
+            "arp or icmp probe to the default gateway, with its result",
+            "an internet probe beyond the gateway, to tell a quiet router from a broken one",
+        ],
+        lookalikes: &[
+            "a router that does not answer icmp but forwards normally",
+            "an unprivileged run that cannot send icmp at all",
+        ],
+        recovery: "the gateway answers again, or something beyond it does",
+        platforms: "linux and macos; no arp probe exists yet, so arp is reported as unmeasured",
     },
     Rule {
         id: "link.down",
@@ -114,6 +168,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "interface carrier lost",
         suppresses: &["gateway.unreachable"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "gateway.rtt_spike",
@@ -123,6 +181,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "gateway rtt > 3σ above baseline for 3 samples",
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "iface.errors",
@@ -132,6 +194,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "rx/tx error, drop, overrun or fifo counters increment",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "iface.saturated",
@@ -141,6 +207,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "throughput above 90% of link rate for 30s",
         suppresses: &["tcp.bufferbloat_local", "path.rtt_spike"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "wifi.weak_signal",
@@ -150,6 +220,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "signal at or below −70 dBm, or more than 20% of frames retried over a minute",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     // --------------------------------------------------------------- path
     Rule {
@@ -163,6 +237,10 @@ pub const CATALOGUE: &[Rule] = &[
         // makes the pair readable: "the path changed, and it cost you 40ms".
         suppresses: &["path.rtt_spike"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "path.high_loss",
@@ -172,6 +250,16 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a hop loses packets and the loss propagates to later hops",
         suppresses: &["tcp.retrans_burst"],
         status: RuleStatus::Active,
+        evidence: &[
+            "per-hop loss from a trace, with silent hops distinguished from lossy ones",
+            "whether the destination itself answered the trace",
+        ],
+        lookalikes: &[
+            "a hop rate-limiting its own icmp while forwarding traffic normally",
+            "a firewalled tail that answers nothing, so propagation cannot be seen",
+        ],
+        recovery: "a later trace to the same target shows no hop losing packets",
+        platforms: "native trace on linux ipv4; elsewhere a traceroute subprocess, which cannot always tell whether the destination replied",
     },
     Rule {
         id: "path.rtt_spike",
@@ -181,6 +269,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "end-to-end rtt > 3σ above baseline",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     // ---------------------------------------------------------- tcp/sockets
     Rule {
@@ -191,6 +283,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "rtt under load exceeds idle rtt by more than 100ms",
         suppresses: &["tcp.bufferbloat_remote", "path.rtt_spike"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "tcp.bufferbloat_remote",
@@ -200,6 +296,16 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "one socket's rtt rises with its own tx while the link-level test passes",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[
+            "socket rtt and tx rate from the kernel, held for the verdict window",
+            "an idle-versus-loaded rtt comparison on our own uplink, to place the queue",
+        ],
+        lookalikes: &[
+            "a stable distant peer, whose rtt is distance rather than queueing",
+            "our own uplink bloating, which is the local rule, not this one",
+        ],
+        recovery: "socket rtt returns to its baseline while the socket is still sending",
+        platforms: "linux and macos; without the loaded-rtt test the finding names an unlocalised queue",
     },
     Rule {
         id: "tcp.retrans_burst",
@@ -209,6 +315,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "retrans/min more than 3σ above the socket's baseline",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "tcp.zero_window",
@@ -218,6 +328,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "rwnd is zero, or cwnd greatly exceeds rwnd",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "tcp.connect_failures",
@@ -227,6 +341,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "more than 5 failed active or passive TCP handshakes per minute in this namespace",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "tcp.timewait_exhaustion",
@@ -236,6 +354,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "distinct TIME_WAIT local ports exceed 60% of the ephemeral range for one address; not exhaustion proof",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     // ------------------------------------------------- mtu / nat / v6 / cap
     Rule {
@@ -246,6 +368,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "small DF probes work, large probes time out, and reducing TCP MSS restores a transfer to the same endpoint",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "nat.symmetric",
@@ -255,6 +381,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "two stun servers see different public ports from one socket",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "ipv6.broken",
@@ -264,6 +394,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a v6 default route exists but v6 probes fail while v4 works",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "captive.portal",
@@ -274,6 +408,10 @@ pub const CATALOGUE: &[Rule] = &[
         // Selected-endpoint HTTP evidence cannot establish global causality.
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     // ------------------------------------------------------------- targets
     Rule {
@@ -289,6 +427,16 @@ pub const CATALOGUE: &[Rule] = &[
             "target.slow_stage",
         ],
         status: RuleStatus::Active,
+        evidence: &[
+            "a lookup for the configured target, with the resolver that answered",
+            "the outcome per resolver: answered, nxdomain, servfail or no reply",
+        ],
+        lookalikes: &[
+            "a name that genuinely does not exist",
+            "split-horizon dns where the name only resolves on another link",
+        ],
+        recovery: "the same target resolves again on its own probe",
+        platforms: "all platforms; resolver identity comes from systemd-resolved where available",
     },
     Rule {
         id: "target.connect_failed",
@@ -298,6 +446,15 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target's first address fails to connect for 3 probes",
         suppresses: &["target.tls_failed", "target.http_error", "target.slow_stage"],
         status: RuleStatus::Active,
+        evidence: &[
+            "a connect attempt per address and family, with the error each returned",
+        ],
+        lookalikes: &[
+            "a service that is down, which is not a network fault",
+            "one address family broken while the other works",
+        ],
+        recovery: "the same target connects again on its own probe",
+        platforms: "all platforms",
     },
     Rule {
         id: "target.tls_failed",
@@ -307,6 +464,15 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target's TLS handshake fails for 3 probes",
         suppresses: &["target.http_error", "target.slow_stage"],
         status: RuleStatus::Active,
+        evidence: &[
+            "the tls handshake result on the connection that succeeded, with the certificate error",
+        ],
+        lookalikes: &[
+            "an enterprise ca that netwatch does not trust",
+            "a clock skew that makes a valid certificate look expired",
+        ],
+        recovery: "the handshake completes again on the same target",
+        platforms: "all platforms; system trust stores are read where available",
     },
     Rule {
         id: "target.http_error",
@@ -316,6 +482,15 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a configured target answers 5xx, or not the expected status, for 3 probes",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[
+            "the response status on the configured target, against the expected status",
+        ],
+        lookalikes: &[
+            "an authentication or redirect response that is expected for this endpoint",
+            "a proxy answering instead of the service",
+        ],
+        recovery: "the target returns its expected status again",
+        platforms: "all platforms",
     },
     Rule {
         id: "target.slow_stage",
@@ -325,6 +500,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a target's dns, connect, tls or first-byte time > 3σ above its baseline for 3 probes",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     // -------------------------------------------------------------- egress
     Rule {
@@ -335,6 +514,10 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "a destination outside the learned egress baseline (only with alert = \"all\")",
         suppresses: &[],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
     Rule {
         id: "egress.policy_violation",
@@ -344,8 +527,93 @@ pub const CATALOGUE: &[Rule] = &[
         trigger: "an observed destination is blocked by the loaded policy, or with alert = \"all\" falls outside it (warning only)",
         suppresses: &["egress.drift"],
         status: RuleStatus::Active,
+        evidence: &[],
+        lookalikes: &[],
+        recovery: "",
+        platforms: "",
     },
 ];
+
+/// The catalogue rendered as `docs/diagnostic-coverage.md`.
+///
+/// Generated rather than written by hand: the committed copy claimed 25 rules
+/// when there were 30, omitted every `target.*` entry, and marked five active
+/// rules as unintegrated. A test asserts the file matches this output, so the
+/// document cannot drift from the catalogue again.
+pub fn coverage_markdown() -> String {
+    let total = CATALOGUE.len();
+    let active = CATALOGUE.iter().filter(|r| r.status.is_active()).count();
+    let contracted: Vec<&Rule> = CATALOGUE.iter().filter(|r| r.contracted()).collect();
+    let mut m = String::new();
+    m.push_str("# Diagnose rule coverage\n\n");
+    m.push_str(
+        "Generated from `rules::CATALOGUE` by `netwatch diagnose coverage --doc`. \
+Do not edit by hand: `rules.rs` holds the source of truth, and a test fails when this \
+file and the catalogue disagree.\n\n",
+    );
+    m.push_str(&format!(
+        "The catalogue contains **{total} rules**, of which **{active}** are active. \
+**{}** have been through a contract review: evidence, lookalikes, recovery and platform \
+limits all stated. The rest are listed as not yet contracted, which is a statement about \
+this document, not about whether the detector runs.\n\n",
+        contracted.len()
+    ));
+    m.push_str(
+        "Runtime availability is a separate question, answered per host by \
+`netwatch diagnose coverage`: a rule with a detector may still have no inputs on the \
+machine in front of you. An empty issue list says \"no findings\", never \"this host is \
+healthy\".\n\n",
+    );
+
+    m.push_str("## Contracted rules\n\n");
+    for rule in &contracted {
+        m.push_str(&format!("### `{}`\n\n", rule.id));
+        m.push_str(&format!(
+            "{} · severity {:?}\n\n",
+            rule.title, rule.severity
+        ));
+        m.push_str(&format!("**Fires when:** {}\n\n", rule.trigger));
+        m.push_str("**Evidence required:**\n\n");
+        for e in rule.evidence {
+            m.push_str(&format!("- {e}\n"));
+        }
+        m.push_str("\n**Healthy lookalikes:**\n\n");
+        for l in rule.lookalikes {
+            m.push_str(&format!("- {l}\n"));
+        }
+        m.push_str(&format!("\n**Recovery:** {}\n\n", rule.recovery));
+        m.push_str(&format!("**Platforms:** {}\n\n", rule.platforms));
+        if !rule.suppresses.is_empty() {
+            m.push_str(&format!(
+                "**Suppresses:** {}\n\n",
+                rule.suppresses
+                    .iter()
+                    .map(|r| format!("`{r}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    m.push_str("## Not yet contracted\n\n");
+    m.push_str(
+        "These rules have detectors and can open issues. What they have not had is a \
+written statement of the evidence they need and the healthy situations they must not \
+mistake for a fault.\n\n",
+    );
+    m.push_str("| Rule | Category | Fires when | Status |\n|---|---|---|---|\n");
+    for rule in CATALOGUE.iter().filter(|r| !r.contracted()) {
+        let status = match rule.status {
+            RuleStatus::Active => "active".to_string(),
+            RuleStatus::Planned(missing) => format!("planned — {missing}"),
+        };
+        m.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            rule.id, rule.category, rule.trigger, status
+        ));
+    }
+    m
+}
 
 pub fn lookup(id: &str) -> Option<&'static Rule> {
     CATALOGUE.iter().find(|r| r.id == id)
@@ -368,18 +636,38 @@ pub fn catalogue_label() -> String {
     }
 }
 
-/// Whether two subjects are close enough for suppression to apply. A gateway
-/// failure suppresses DNS on the same host; it does not suppress a finding
-/// about an unrelated interface.
-fn scopes_overlap(root: &Subject, child: &Subject) -> bool {
-    match (root, child) {
-        // Host-wide roots (gateway, link) cover everything on the host.
+/// Whether a root finding can explain a child one.
+///
+/// Subject alone is too coarse: `gateway.unreachable` is filed against the
+/// host and used to cover every target on the machine, including targets
+/// reached over a tunnel that never touches that gateway. Where the two
+/// findings record which interface or resolver they actually went through,
+/// a demonstrated difference breaks the edge.
+fn depends_on(root: &Issue, child: &Issue) -> bool {
+    // Measured on different interfaces: neither explains the other, whatever
+    // their subjects say.
+    if let (Some(a), Some(b)) = (&root.scope.via_iface, &child.scope.via_iface) {
+        if a != b {
+            return false;
+        }
+    }
+    match (&root.subject, &child.subject) {
         (Subject::Host, _) => true,
         (Subject::Iface { name }, Subject::Iface { name: other }) => name == other,
-        // A link/gateway problem on an interface covers what runs over it.
-        (Subject::Iface { .. }, _) => true,
-        // A failing system resolver covers every name a target looks up.
-        (Subject::Resolver { .. }, Subject::Target { .. }) => true,
+        // A link or gateway problem on an interface covers what runs over it —
+        // unless the child recorded a different interface, handled above.
+        (Subject::Iface { name }, _) => child
+            .scope
+            .via_iface
+            .as_ref()
+            .is_none_or(|used| used == name),
+        // A failing resolver covers the names looked up through it. A target
+        // that resolved through a different resolver is not its consequence.
+        (Subject::Resolver { addr }, Subject::Target { .. }) => child
+            .scope
+            .via_resolver
+            .as_ref()
+            .is_none_or(|used| used == addr),
         (a, b) => a == b,
     }
 }
@@ -416,7 +704,7 @@ pub fn apply_suppression(issues: &mut [Issue]) {
             if !rule.suppresses.contains(&child.rule.as_str()) {
                 continue;
             }
-            if !scopes_overlap(&root.subject, &child.subject) {
+            if !depends_on(root, child) {
                 continue;
             }
             // Most severe root wins, so a link failure beats a gateway failure.
@@ -540,6 +828,114 @@ mod tests {
             tests: vec![],
             verification: None,
         }
+    }
+
+    #[test]
+    fn the_committed_coverage_document_matches_the_catalogue() {
+        // The hand-written version claimed 25 rules when there were 30, left
+        // out every `target.*` entry, and described five active rules as
+        // unintegrated. Generating it is what stops that happening again.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/diagnostic-coverage.md");
+        let committed = std::fs::read_to_string(path).expect("coverage doc is committed");
+        assert_eq!(
+            committed,
+            coverage_markdown(),
+            "run: cargo run -- diagnose coverage --doc"
+        );
+    }
+
+    #[test]
+    fn a_contracted_rule_states_all_four_parts() {
+        for rule in CATALOGUE.iter().filter(|r| r.contracted()) {
+            assert!(!rule.evidence.is_empty(), "{}", rule.id);
+            assert!(!rule.lookalikes.is_empty(), "{}", rule.id);
+            assert!(!rule.recovery.is_empty(), "{}", rule.id);
+            assert!(!rule.platforms.is_empty(), "{}", rule.id);
+        }
+        // Tier one: the rules implicated by the review's findings. The
+        // release gate is these eight; the remaining rules follow.
+        for id in [
+            "gateway.unreachable",
+            "dns.hijack_suspect",
+            "path.high_loss",
+            "tcp.bufferbloat_remote",
+            "target.resolve_failed",
+            "target.connect_failed",
+            "target.tls_failed",
+            "target.http_error",
+        ] {
+            assert!(
+                lookup(id).expect("rule exists").contracted(),
+                "{id} is tier one and must carry a contract"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gateway_failure_does_not_hide_a_target_reached_over_a_tunnel() {
+        // `gateway.unreachable` is filed against the host and suppresses
+        // every target rule. Subject overlap alone therefore demoted a
+        // target reached over wg0 — which never touches that gateway — to a
+        // consequence of it, hiding a second, unrelated fault.
+        let mut gateway = issue("1", "gateway.unreachable", Subject::Host);
+        gateway.scope.via_iface = Some("eth0".into());
+
+        let mut tunnelled = issue(
+            "2",
+            "target.connect_failed",
+            Subject::Target {
+                name: "corp-api".into(),
+            },
+        );
+        tunnelled.scope.via_iface = Some("wg0".into());
+
+        let mut same_link = issue(
+            "3",
+            "target.connect_failed",
+            Subject::Target {
+                name: "public-api".into(),
+            },
+        );
+        same_link.scope.via_iface = Some("eth0".into());
+
+        let mut issues = vec![gateway, tunnelled, same_link];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by, None, "different interface");
+        assert_eq!(issues[2].suppressed_by.as_deref(), Some("1"));
+        assert_eq!(issues[0].consequences, vec!["3".to_string()]);
+    }
+
+    #[test]
+    fn a_failing_resolver_only_explains_targets_that_used_it() {
+        let resolver = issue(
+            "1",
+            "dns.failing",
+            Subject::Resolver {
+                addr: "192.168.8.1".into(),
+            },
+        );
+        let mut through_it = issue(
+            "2",
+            "target.resolve_failed",
+            Subject::Target { name: "api".into() },
+        );
+        through_it.scope.via_resolver = Some("192.168.8.1".into());
+        let mut elsewhere = issue(
+            "3",
+            "target.resolve_failed",
+            Subject::Target {
+                name: "corp".into(),
+            },
+        );
+        elsewhere.scope.via_resolver = Some("10.0.0.53".into());
+
+        let mut issues = vec![resolver, through_it, elsewhere];
+        apply_suppression(&mut issues);
+        assert_eq!(issues[1].suppressed_by.as_deref(), Some("1"));
+        assert_eq!(
+            issues[2].suppressed_by, None,
+            "this target resolved through a different resolver"
+        );
     }
 
     #[test]

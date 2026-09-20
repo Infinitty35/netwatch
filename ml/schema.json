@@ -324,7 +324,7 @@
     },
     {
       "group": "check",
-      "name": "check.dns.hijack_suspect.split_horizon.public_name_public_answer"
+      "name": "check.dns.hijack_suspect.split_horizon.private_answer_for_a_public_name"
     },
     {
       "group": "check",
@@ -384,7 +384,23 @@
     },
     {
       "group": "check",
+      "name": "check.path.high_loss.hop_dropping.destination_answered_the_trace"
+    },
+    {
+      "group": "check",
       "name": "check.path.high_loss.icmp_rate_limit.later_hops_are_clean"
+    },
+    {
+      "group": "check",
+      "name": "check.path.high_loss.icmp_rate_limit.destination_answered_the_trace"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_remote.unlocalised_queueing.link_level_bufferbloat_test_passed"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.bufferbloat_remote.unlocalised_queueing.rtt_tracks_this_socket_s_own_tx"
     },
     {
       "group": "check",
@@ -1291,7 +1307,7 @@
       "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "a1b52763644bd9fa",
+  "hash": "a3141086556720b1",
   "meta_columns": [
     "episode",
     "source",

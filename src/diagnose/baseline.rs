@@ -71,6 +71,15 @@ pub struct NetworkFingerprint {
     pub resolvers: Vec<String>,
     /// Local network in CIDR-ish form, e.g. "192.168.8.0/24".
     pub subnet: Option<String>,
+    /// VPN or tunnel interfaces that were up, sorted. Bringing a tunnel up
+    /// changes which routes and resolvers apply, so a baseline learned
+    /// without it describes a different network — and an issue opened before
+    /// it cannot be verified after it.
+    ///
+    /// Absent in baselines written before this field existed, which keeps
+    /// their keys stable for hosts that have never had a tunnel up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vpn: Vec<String>,
 }
 
 impl NetworkFingerprint {
@@ -87,13 +96,22 @@ impl NetworkFingerprint {
             gateway,
             resolvers,
             subnet,
+            vpn: vec![],
         }
+    }
+
+    /// Record the tunnels that were up when this network was seen.
+    pub fn with_vpn(mut self, mut vpn: Vec<String>) -> Self {
+        vpn.sort();
+        vpn.dedup();
+        self.vpn = vpn;
+        self
     }
 
     /// Stable key for the on-disk map. Human-readable on purpose: someone
     /// opening `baselines.json` should be able to tell which network is which.
     pub fn key(&self) -> String {
-        format!(
+        let base = format!(
             "{}|{}|{}|{}",
             self.iface,
             self.gateway.as_deref().unwrap_or("-"),
@@ -103,15 +121,26 @@ impl NetworkFingerprint {
                 self.resolvers.join(",")
             },
             self.subnet.as_deref().unwrap_or("-")
-        )
+        );
+        // Appended only when a tunnel is up, so keys already on disk for
+        // ordinary networks keep matching and their baselines survive.
+        if self.vpn.is_empty() {
+            base
+        } else {
+            format!("{base}|vpn:{}", self.vpn.join(","))
+        }
     }
 
     /// Short label for the UI, e.g. `eth0 via 192.168.8.1`.
     pub fn label(&self) -> String {
-        match &self.gateway {
+        let mut s = match &self.gateway {
             Some(gw) => format!("{} via {}", self.iface, gw),
             None => self.iface.clone(),
+        };
+        if !self.vpn.is_empty() {
+            s.push_str(&format!(" + {}", self.vpn.join(", ")));
         }
+        s
     }
 }
 
@@ -646,6 +675,34 @@ mod tests {
             i += 1;
         }
         t
+    }
+
+    #[test]
+    fn a_tunnel_coming_up_is_a_different_network() {
+        // Routes and resolvers change when a tunnel comes up, so a baseline
+        // learned without it describes somewhere else.
+        let plain = NetworkFingerprint::new(
+            "eth0",
+            Some("192.168.8.1".into()),
+            vec!["192.168.8.1".into()],
+            Some("192.168.8.0/24".into()),
+        );
+        let tunnelled = plain.clone().with_vpn(vec!["wg0".into()]);
+        assert_ne!(plain.key(), tunnelled.key());
+        assert!(tunnelled.label().contains("wg0"));
+
+        // Keys for networks with no tunnel keep their old spelling, so
+        // baselines already on disk still match.
+        assert_eq!(plain.key(), "eth0|192.168.8.1|192.168.8.1|192.168.8.0/24");
+
+        // Tunnel order cannot change identity.
+        assert_eq!(
+            plain
+                .clone()
+                .with_vpn(vec!["wg0".into(), "tun0".into()])
+                .key(),
+            plain.with_vpn(vec!["tun0".into(), "wg0".into()]).key()
+        );
     }
 
     #[test]

@@ -30,9 +30,10 @@ kernel accepted a program or that every flow was attributed.
 
 ## Diagnose and remediation
 
-The [25-rule matrix](diagnostic-coverage.md) identifies 18 implemented detectors
-and seven rules awaiting Diagnose integration. An implemented rule can still be
-learning, unmeasured or stale. Local bufferbloat lacks a live loaded/idle test;
+The [rule coverage document](diagnostic-coverage.md), generated from the
+catalogue, lists 30 active rules, eight of which carry a reviewed contract
+stating their evidence, lookalikes, recovery and platform limits. An active
+rule can still be learning, unmeasured or stale on a given host. Local bufferbloat lacks a live loaded/idle test;
 interface saturation lacks link capacity in the live adapter. Empty findings do
 not establish host health. Baseline readiness is sample-based, not a guaranteed
 30-minute elapsed window.

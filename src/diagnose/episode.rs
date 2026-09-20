@@ -107,8 +107,14 @@ pub struct ProbeAges {
     pub dns: Option<f64>,
     pub internet: Option<f64>,
     pub nat: Option<f64>,
+    /// Newest target completion, kept for recordings written before probe
+    /// ages were split per target. Replay reads `target_ages` instead: one
+    /// age shared by every target is what let a fast target verify a slow
+    /// one, and it cannot be attributed back to a name after the fact.
     #[serde(default)]
     pub targets: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub target_ages: std::collections::BTreeMap<String, f64>,
     pub gateway_target: Option<String>,
     pub dns_target: Option<String>,
 }
@@ -130,7 +136,22 @@ impl ProbeAges {
             dns: age(times.health.dns),
             internet: age(times.health.internet),
             nat: age(times.health.nat),
-            targets: age(times.targets),
+            targets: times
+                .targets
+                .values()
+                .copied()
+                .max()
+                .map(|at| now.saturating_duration_since(at).as_secs_f64()),
+            target_ages: times
+                .targets
+                .iter()
+                .map(|(name, at)| {
+                    (
+                        name.clone(),
+                        now.saturating_duration_since(*at).as_secs_f64(),
+                    )
+                })
+                .collect(),
             gateway_target: times.health.gateway_target.clone(),
             dns_target: times.health.dns_target.clone(),
         }
@@ -160,7 +181,15 @@ impl ProbeAges {
             interface: at(self.interface),
             sockets: at(self.sockets),
             path: at(self.path),
-            targets: at(self.targets),
+            // A recording from before per-target ages has only the newest
+            // completion, which cannot be attributed to a target; it decodes
+            // as no per-target sampling rather than as evidence for whichever
+            // target is on screen.
+            targets: self
+                .target_ages
+                .iter()
+                .filter_map(|(name, age)| Some((name.clone(), at(Some(*age))?)))
+                .collect(),
             ..Default::default()
         };
         times.health.gateway = at(self.gateway);
@@ -903,7 +932,7 @@ pub struct Divergence {
     pub replayed: Vec<OpenIssue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IssueSpan {
     pub key: String,
     pub opened: String,
@@ -1057,11 +1086,77 @@ fn sorted(open: &[OpenIssue]) -> Vec<OpenIssue> {
 
 // ------------------------------------------------------------------ cli
 
+/// The decisions a pinned episode must keep producing: which issues opened,
+/// when, and what each one was blamed on.
+///
+/// This is what the corpus compares, rather than the whole engine state: an
+/// issue opening a frame later, or landing on a different cause, is a change
+/// worth reviewing, while a reworded detail string is not.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalDecisions {
+    pub episode: String,
+    pub frames: usize,
+    pub issues: Vec<IssueSpan>,
+}
+
+impl CanonicalDecisions {
+    pub fn of(episode: &Episode) -> (Self, ReplayReport) {
+        let report = replay(episode);
+        (
+            Self {
+                episode: episode.id.clone(),
+                frames: report.frames,
+                issues: report.issues.clone(),
+            },
+            report,
+        )
+    }
+}
+
+/// Write the pinned corpus: the deterministic fixture episode and the
+/// decisions it must keep producing.
+pub fn write_corpus(dir: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let mut written = vec![];
+    let episode = super::fixture::episode();
+    let (decisions, report) = CanonicalDecisions::of(&episode);
+    anyhow::ensure!(
+        report.matches(),
+        "the fixture episode does not replay to its own recording; \
+         fix that before pinning it"
+    );
+    // Gzipped, like a real recording: the scenario is 440 frames and 2MB of
+    // pretty JSON, which is not something to put in a diff.
+    let ep_path = dir.join(format!("{}.json.gz", episode.id));
+    {
+        let file = std::fs::File::create(&ep_path)?;
+        let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::best());
+        serde_json::to_writer(&mut gz, &episode)?;
+        gz.finish()?.flush()?;
+    }
+    written.push(ep_path);
+    let dec_path = dir.join(format!("{}.decisions.json", episode.id));
+    std::fs::write(&dec_path, serde_json::to_string_pretty(&decisions)?)?;
+    written.push(dec_path);
+    Ok(written)
+}
+
 /// `netwatch diagnose episodes [DIR]` and
 /// `netwatch diagnose replay [--json] <FILE|DIR>...`.
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("coverage") => super::coverage::command(&args[1..]),
+        Some("run") => super::run::command(&args[1..]),
+        Some("corpus") => {
+            let dir = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("tests/diagnose/corpus"));
+            for path in write_corpus(&dir)? {
+                println!("wrote {}", path.display());
+            }
+            Ok(())
+        }
         Some("episodes") => {
             let dir = match args.get(1) {
                 Some(d) => PathBuf::from(d),
@@ -1245,7 +1340,7 @@ mod tests {
                     addr: Some(GW.into()),
                     rtt_ms: Some(rtt),
                     loss_pct: 0.0,
-                    arp_ok: true,
+                    arp_ok: Some(true),
                     icmp_ok: true,
                     internet_reachable: Some(true),
                 }),
@@ -1329,6 +1424,40 @@ mod tests {
         assert_eq!(
             reasons,
             vec![SnapshotReason::Opened, SnapshotReason::Closed]
+        );
+    }
+
+    #[test]
+    fn the_pinned_corpus_replays_to_its_recorded_decisions() {
+        // Until now the replay tests recorded in memory and replayed the
+        // result against itself, which cannot catch a change that alters both
+        // sides. This pins a committed episode and the decisions it must keep
+        // producing: which issues open, when, and what each is blamed on.
+        //
+        // A semantic fix that changes them is expected to change this file,
+        // reviewed in the same diff. Regenerate with:
+        //   cargo run -- diagnose corpus
+        let dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/diagnose/corpus"
+        ));
+        let episode = load(&dir.join("fixture-scenario.json.gz")).expect("corpus episode");
+        let pinned: CanonicalDecisions = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("fixture-scenario.decisions.json"))
+                .expect("corpus decisions"),
+        )
+        .expect("decisions parse");
+
+        let (decisions, report) = CanonicalDecisions::of(&episode);
+        assert!(
+            report.matches(),
+            "replay diverged from the recording: {:?}",
+            report.divergences.first()
+        );
+        assert_eq!(
+            decisions, pinned,
+            "the engine now reaches different decisions on the pinned episode; \
+             if that is intended, regenerate the corpus and review the diff"
         );
     }
 

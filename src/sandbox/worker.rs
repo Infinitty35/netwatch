@@ -147,6 +147,28 @@ pub fn begin(name: &str) {
         );
     }
 }
+/// Record a component that exists but is only partly confined, with the
+/// reason.
+///
+/// Distinct from [`fail`]: the component is running and useful, and the note
+/// is what stops its protection being overstated. Strict mode treats it as a
+/// failure, because a partial guarantee is not the one strict promises.
+pub fn note(name: &str, detail: impl Into<String>) {
+    if let Some(p) = POLICY.get() {
+        let mut components = p.components.lock().unwrap();
+        let detail = detail.into();
+        let strict = matches!(p.mode, Mode::Strict);
+        components.insert(
+            name.into(),
+            Component {
+                ready: !strict,
+                report: None,
+                error: Some(detail),
+            },
+        );
+    }
+}
+
 pub fn fail(name: &str, error: impl Into<String>) {
     if let Some(p) = POLICY.get() {
         p.components.lock().unwrap().insert(
@@ -161,10 +183,20 @@ pub fn fail(name: &str, error: impl Into<String>) {
 }
 /// Enforce on the actual worker. Strict failures return false before processing.
 pub fn enter(name: &str) -> bool {
+    enter_retaining(name, super::Retain::Nothing)
+}
+
+/// Enter while keeping the capabilities `retain` names.
+///
+/// The eBPF worker is the only caller: it needs CAP_BPF and CAP_PERFMON for
+/// the load that entry would otherwise have taken from it. It drops them with
+/// [`drop_load_caps`] before reading anything, so the window is the load
+/// itself and the report names it.
+pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
     let Some(p) = POLICY.get() else {
         return true;
     };
-    let report = super::apply(p.mode, &p.paths);
+    let report = super::apply_retaining(p.mode, &p.paths, retain);
     #[cfg(test)]
     let report = {
         let mut report = report;
@@ -205,12 +237,37 @@ pub fn snapshot() -> BTreeMap<String, Component> {
         .unwrap_or_default()
 }
 /// Start with a bounded entry handshake. A timed-out worker is never released.
+/// Drop the capabilities [`enter_retaining`] kept, on the calling thread.
+///
+/// Records the outcome against `name`, because a worker that kept CAP_BPF and
+/// then failed to drop it is a different state from one that never held it,
+/// and the sandbox report should not flatten the two.
+pub fn drop_load_caps(name: &str) {
+    #[cfg(target_os = "linux")]
+    if POLICY.get().is_some() {
+        if let Err(error) = super::linux::drop_bpf_caps() {
+            fail(name, format!("load capabilities not dropped: {error}"));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = name;
+}
+
 pub fn spawn(name: &'static str, run: impl FnOnce() + Send + 'static) -> WorkerHandle {
+    spawn_retaining(name, super::Retain::Nothing, run)
+}
+
+/// [`spawn`], entering with `retain` held.
+pub fn spawn_retaining(
+    name: &'static str,
+    retain: super::Retain,
+    run: impl FnOnce() + Send + 'static,
+) -> WorkerHandle {
     begin(name);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::spawn(move || {
-        let allowed = enter(name);
+        let allowed = enter_retaining(name, retain);
         let _ = ready_tx.send(allowed);
         if allowed && release_rx.recv().unwrap_or(false) && !stopping() {
             run();

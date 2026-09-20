@@ -1643,13 +1643,26 @@ fn saturation(now_bps: f64, link_bps: Option<u64>, observed_peak: Option<u64>) -
     )
 }
 
-/// Link speed in bits, for the saturation label: `1 Gb`, `100 Mb`.
+/// Link speed in bits, for the saturation label: `1 Gb`, `100 Mb`, `480 Kb`.
+///
+/// Every ceiling below a megabit used to divide to zero, so a quiet link with
+/// no OS-reported speed — Wi-Fi, usually — labelled its meter "12% of 0 Mb".
+/// A percentage of nothing is not a reading, and the number it was a
+/// percentage of was real.
 fn short_bits(bps: u64) -> String {
-    if bps >= 1_000_000_000 {
-        format!("{} Gb", bps / 1_000_000_000)
-    } else {
-        format!("{} Mb", bps / 1_000_000)
+    for (scale, unit) in [(1_000_000_000, "Gb"), (1_000_000, "Mb"), (1_000, "Kb")] {
+        if bps >= scale {
+            let value = bps as f64 / scale as f64;
+            // One decimal only where it carries information: "1.5 Mb" is
+            // worth the character, "304.0 Mb" is not.
+            return if value >= 10.0 || (value - value.round()).abs() < 0.05 {
+                format!("{value:.0} {unit}")
+            } else {
+                format!("{value:.1} {unit}")
+            };
+        }
     }
+    format!("{bps} b")
 }
 
 // ── box 3: health ───────────────────────────────────────────────────────────
@@ -3174,6 +3187,33 @@ mod tests {
         let (f, label) = saturation(12_500_000.0, Some(1_000_000_000), Some(50_000_000));
         assert!((f - 0.1).abs() < 0.001, "got {f}");
         assert_eq!(label, "10% of 1 Gb link");
+    }
+
+    #[test]
+    fn a_ceiling_under_a_megabit_is_not_rendered_as_zero() {
+        // What a quiet Wi-Fi link showed: no OS link speed, a small measured
+        // peak, and a label reading "12% of 0 Mb". The ceiling was 480 Kb.
+        let (_, label) = saturation(60_000.0, None, Some(60_000));
+        assert!(label.contains("480 Kb"), "got {label}");
+        assert!(!label.contains("0 Mb"), "got {label}");
+
+        assert_eq!(short_bits(8_000), "8 Kb");
+        assert_eq!(short_bits(1_500_000), "1.5 Mb");
+        assert_eq!(short_bits(304_000_000), "304 Mb");
+        assert_eq!(short_bits(1_000_000_000), "1 Gb");
+        assert_eq!(short_bits(2_500_000_000), "2.5 Gb");
+        assert_eq!(short_bits(999), "999 b");
+    }
+
+    /// No ceiling this function can be handed may label itself as zero of
+    /// anything: the meter's denominator is the one number on the row that
+    /// has to be true.
+    #[test]
+    fn no_ceiling_renders_as_a_zero_denominator() {
+        for bps in [1u64, 999, 1_000, 60_000, 999_999, 1_000_000, 8_000_000_000] {
+            let label = short_bits(bps);
+            assert!(!label.starts_with("0 "), "{bps} bits rendered as {label}");
+        }
     }
 
     #[test]

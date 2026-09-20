@@ -245,6 +245,10 @@ pub fn solarized() -> Theme {
     // Solarized Dark palette
     let base03 = Color::Rgb(0, 43, 54);
     let base01 = Color::Rgb(88, 110, 117);
+    // base01 is Solarized's "optional emphasised content" shade against a
+    // *light* background; on base03 it is 2.8:1, so muted text uses a tone
+    // between base01 and base0 (4.6:1 on base03).
+    let muted_readable = Color::Rgb(0x7d, 0x92, 0x96);
     let _base00 = Color::Rgb(101, 123, 131);
     let base0 = Color::Rgb(131, 148, 150);
     let base1 = Color::Rgb(147, 161, 161);
@@ -266,7 +270,7 @@ pub fn solarized() -> Theme {
         separator: base01,
         text_primary: base0,
         text_secondary: base1,
-        text_muted: base01,
+        text_muted: muted_readable,
         text_inverse: base03,
         status_good: green,
         status_warn: yellow,
@@ -285,6 +289,10 @@ pub fn dracula() -> Theme {
     let bg = Color::Rgb(40, 42, 54);
     let fg = Color::Rgb(248, 248, 242);
     let comment = Color::Rgb(98, 114, 164);
+    // Dracula's comment colour is 3.0:1 on its own background — fine for a
+    // comment in an editor, not for the labels and units this theme puts it
+    // on. Lightened to 4.5:1 while staying recognisably Dracula.
+    let comment_readable = Color::Rgb(0x8b, 0x98, 0xbd);
     let cyan = Color::Rgb(139, 233, 253);
     let green = Color::Rgb(80, 250, 123);
     let orange = Color::Rgb(255, 184, 108);
@@ -302,7 +310,7 @@ pub fn dracula() -> Theme {
         separator: comment,
         text_primary: fg,
         text_secondary: Color::Rgb(200, 200, 210),
-        text_muted: comment,
+        text_muted: comment_readable,
         text_inverse: bg,
         status_good: green,
         status_warn: yellow,
@@ -340,7 +348,12 @@ pub fn nord() -> Theme {
         separator: Color::Rgb(67, 76, 94),
         text_primary: snow0,
         text_secondary: snow1,
-        text_muted: Color::Rgb(76, 86, 106),
+        // Nord's own nord3 (#4C566A) is a *background* shade: as text it is
+        // 1.7:1 on Nord's polar night and 2.3:1 on a darker terminal, which
+        // is below the threshold for any text at any size. Muted text here
+        // sits between nord3 and nord4 instead — 4.9:1 on Nord's own
+        // background, 6.7:1 on a darker one.
+        text_muted: Color::Rgb(0x98, 0xa3, 0xb8),
         text_inverse: polar0,
         status_good: aurora_green,
         status_warn: aurora_yellow,
@@ -366,13 +379,16 @@ pub fn sky() -> Theme {
     // defaults; bright variants for legibility against the deep-blue bg).
     let white = Color::Rgb(0xCB, 0xCC, 0xCD);
     let bright_white = Color::Rgb(0xFF, 0xFF, 0xFF);
-    let bright_red = Color::Rgb(0xFC, 0x39, 0x1F);
+    // Saturated red on this deep blue is 2.0:1 — the severity word, which is
+    // the one thing on screen that must never be missed, was the least
+    // legible text in the theme. Lightened to 3.9:1, still unmistakably red.
+    let bright_red = Color::Rgb(0xFF, 0xA9, 0x9C);
     let bright_green = Color::Rgb(0x31, 0xE7, 0x22);
     let bright_yellow = Color::Rgb(0xEA, 0xEC, 0x23);
     let bright_cyan = Color::Rgb(0x14, 0xF0, 0xF0);
     // bright_black on the deep-blue bg fails WCAG AA; lighter neutral
     // keeps borders, separators, and muted text legible.
-    let muted_readable = Color::Rgb(0xB5, 0xB6, 0xB7);
+    let muted_readable = Color::Rgb(0xD2, 0xD3, 0xD4);
 
     Theme {
         name: "sky",
@@ -444,6 +460,85 @@ pub fn paper() -> Theme {
         selection_bg: Color::Rgb(220, 230, 240),
         highlight_bg: Color::Rgb(200, 215, 230),
         bg: Color::Rgb(0xF5, 0xF5, 0xF2),
+    }
+}
+
+#[cfg(test)]
+mod contrast {
+    use super::*;
+
+    /// WCAG relative luminance.
+    fn luminance(c: Color) -> Option<f64> {
+        let Color::Rgb(r, g, b) = c else { return None };
+        let f = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        Some(0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b))
+    }
+
+    fn ratio(fg: Color, bg: Color) -> Option<f64> {
+        let (a, b) = (luminance(fg)?, luminance(bg)?);
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        Some((hi + 0.05) / (lo + 0.05))
+    }
+
+    /// Reference dark terminal background.
+    ///
+    /// Themes that do not paint their own background inherit the terminal's,
+    /// which netwatch cannot know. This is the darkest common case, and a
+    /// tone that reads on it reads on the lighter ones too.
+    const DARK_REFERENCE: Color = Color::Rgb(0x1a, 0x1b, 0x26);
+
+    #[test]
+    fn muted_text_stays_readable_on_a_dark_background() {
+        // Several palettes' "comment" or "polar night" shades are background
+        // tones in their own documentation: Nord's nord3 renders at 1.7:1 on
+        // Nord's own background. netwatch puts units, baselines and key hints
+        // in this slot, so it has to be text, not chrome.
+        for theme in THEME_NAMES.iter().map(|n| by_name(n)) {
+            let bg = match theme.bg {
+                Color::Rgb(..) => theme.bg,
+                _ => DARK_REFERENCE,
+            };
+            // Paper is a light theme; its own background is the reference.
+            let bg = if theme.name == "paper" { theme.bg } else { bg };
+            let Some(r) = ratio(theme.text_muted, bg) else {
+                continue; // ANSI slots resolve through the terminal's palette
+            };
+            assert!(
+                r >= 4.5,
+                "{}: muted text is {r:.2}:1, below the 4.5:1 needed for body text",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn severity_colours_stay_distinguishable_on_a_dark_background() {
+        // Severity words are bold and short, so 3:1 is the bar they have to
+        // clear rather than 4.5:1.
+        for theme in THEME_NAMES.iter().map(|n| by_name(n)) {
+            if theme.name == "paper" {
+                continue;
+            }
+            let bg = match theme.bg {
+                Color::Rgb(..) => theme.bg,
+                _ => DARK_REFERENCE,
+            };
+            for (role, c) in [
+                ("status_error", theme.status_error),
+                ("status_warn", theme.status_warn),
+                ("status_good", theme.status_good),
+            ] {
+                let Some(r) = ratio(c, bg) else { continue };
+                assert!(r >= 3.0, "{}: {role} is {r:.2}:1, below 3:1", theme.name);
+            }
+        }
     }
 }
 

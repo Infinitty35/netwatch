@@ -45,10 +45,34 @@ const CAPS_TO_DROP_DEFAULT: &[Capability] = &[
 /// there.
 const CAPS_TO_DROP_STRICT: &[Capability] = &[Capability::CAP_NET_RAW];
 
-pub fn apply(mode: Mode, paths: &SandboxPaths, report: &mut Report) {
+/// What loading and attaching a BPF program needs. CAP_SYS_ADMIN is the
+/// pre-5.8 fallback and is listed for the same kernels the drop list names.
+const CAPS_FOR_BPF_LOAD: &[Capability] = &[
+    Capability::CAP_BPF,
+    Capability::CAP_PERFMON,
+    Capability::CAP_SYS_ADMIN,
+];
+
+/// Drop the load capabilities on the calling thread.
+///
+/// Called by the eBPF worker once its programs are attached, so the thread
+/// that goes on to read kernel events holds nothing it no longer needs.
+pub fn drop_bpf_caps() -> Result<(), String> {
+    for cap in CAPS_FOR_BPF_LOAD {
+        for set in [CapSet::Effective, CapSet::Inheritable, CapSet::Permitted] {
+            caps::drop(None, set, *cap).map_err(|e| format!("{} {set:?}: {e}", cap_name(*cap)))?;
+            if caps::has_cap(None, set, *cap).unwrap_or(true) {
+                return Err(format!("{} still present in {set:?}", cap_name(*cap)));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn apply(mode: Mode, paths: &SandboxPaths, retain: super::Retain, report: &mut Report) {
     report.mode.effective = Some(mode.label());
 
-    drop_caps(mode, report);
+    drop_caps(mode, retain, report);
     match caps::read(None, CapSet::Effective) {
         Ok(caps) => {
             report.platform.caps_retained = caps.iter().map(|c| format!("{c:?}")).collect();
@@ -86,13 +110,23 @@ pub fn apply(mode: Mode, paths: &SandboxPaths, report: &mut Report) {
     }
 }
 
-fn drop_caps(mode: Mode, report: &mut Report) {
+fn drop_caps(mode: Mode, retain: super::Retain, report: &mut Report) {
     let extra: &[Capability] = if matches!(mode, Mode::Strict) {
         CAPS_TO_DROP_STRICT
     } else {
         &[]
     };
     for cap in CAPS_TO_DROP_DEFAULT.iter().chain(extra.iter()) {
+        // Held deliberately and briefly — see `Retain`. The worker drops
+        // them itself once the load is done, and the report says which
+        // worker held what until it did.
+        if matches!(retain, super::Retain::BpfLoad) && CAPS_FOR_BPF_LOAD.contains(cap) {
+            report
+                .platform
+                .caps_retained_for_load
+                .push(cap_name(*cap).to_string());
+            continue;
+        }
         // Try to drop from every set we have access to. `caps::drop`
         // returns Ok(()) even if the cap wasn't present, so the no-cap
         // (unprivileged) path is silently fine.
@@ -360,6 +394,48 @@ fn enforce(ruleset: landlock::RulesetCreated, report: &mut Report) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bpf_load_capabilities_are_the_ones_entry_drops() {
+        // If the drop list and the load list ever diverge, the eBPF worker
+        // either enters without a capability it needs or keeps one nothing
+        // asked it to keep. Both are quiet failures, so they are asserted.
+        for cap in CAPS_FOR_BPF_LOAD {
+            assert!(
+                CAPS_TO_DROP_DEFAULT.contains(cap),
+                "{cap:?} is held for the load but entry never drops it"
+            );
+        }
+        assert!(
+            !CAPS_FOR_BPF_LOAD.contains(&Capability::CAP_NET_RAW),
+            "capture's capability is not the loader's to keep"
+        );
+    }
+
+    #[test]
+    fn only_the_load_policy_keeps_capabilities_back() {
+        let mut report = Report::default();
+        drop_caps(Mode::BestEffort, super::super::Retain::Nothing, &mut report);
+        assert!(
+            report.platform.caps_retained_for_load.is_empty(),
+            "an ordinary worker keeps nothing back: {:?}",
+            report.platform.caps_retained_for_load
+        );
+
+        let mut report = Report::default();
+        drop_caps(Mode::BestEffort, super::super::Retain::BpfLoad, &mut report);
+        // Reported whether or not the process had them: the field says what
+        // the policy held back, not what the thread happened to own.
+        assert_eq!(
+            report.platform.caps_retained_for_load.len(),
+            CAPS_FOR_BPF_LOAD.len()
+        );
+        assert!(report
+            .platform
+            .caps_retained_for_load
+            .iter()
+            .any(|c| c.contains("BPF")));
+    }
 
     #[test]
     fn collect_read_only_includes_proc_and_etc() {

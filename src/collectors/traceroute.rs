@@ -23,6 +23,14 @@ pub struct TracerouteResult {
     pub target: String,
     pub status: TracerouteStatus,
     pub hops: Vec<TracerouteHop>,
+    /// Whether the destination itself answered — a port-unreachable from the
+    /// target on the native path, or a final hop matching the target address
+    /// on the subprocess path. `None` when the trace cannot tell, which is the
+    /// usual case for a firewalled tail.
+    ///
+    /// Diagnose needs this to decide whether silence after a lossy hop means
+    /// "the loss propagates" or "we simply cannot see past it".
+    pub reached: Option<bool>,
 }
 
 pub struct TracerouteRunner {
@@ -47,6 +55,7 @@ impl TracerouteRunner {
         Self {
             cancel: Mutex::new(Default::default()),
             result: Arc::new(Mutex::new(TracerouteResult {
+                reached: None,
                 completed: None,
                 completed_at: String::new(),
                 target: String::new(),
@@ -80,8 +89,9 @@ impl TracerouteRunner {
                 return;
             }
             match outcome {
-                Ok(hops) => {
+                Ok((hops, reached)) => {
                     r.hops = hops;
+                    r.reached = reached;
                     r.status = TracerouteStatus::Done;
                     r.completed = Some(std::time::Instant::now());
                     r.completed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -100,13 +110,16 @@ impl TracerouteRunner {
         r.status = TracerouteStatus::Idle;
         r.completed = None;
         r.hops.clear();
+        r.reached = None;
     }
 }
+
+type Trace = (Vec<TracerouteHop>, Option<bool>);
 
 fn run_traceroute(
     target: &str,
     cancel: &crate::diagnose::probe_io::Cancel,
-) -> Result<Vec<TracerouteHop>, String> {
+) -> Result<Trace, String> {
     // Prefer native UDP+TTL traceroute on Linux — works under the
     // sandbox because Landlock sets NO_NEW_PRIVS, which makes the
     // kernel ignore the setcap on /usr/bin/traceroute. The native
@@ -118,8 +131,8 @@ fn run_traceroute(
     // so the subprocess path is preserved there (and macOS has no
     // sandbox today, so the setcap issue doesn't bite).
     #[cfg(target_os = "linux")]
-    if let Some(hops) = run_traceroute_native(target, cancel) {
-        return Ok(hops);
+    if let Some(trace) = run_traceroute_native(target, cancel) {
+        return Ok(trace);
     }
 
     if cancel.cancelled() {
@@ -132,7 +145,7 @@ fn run_traceroute(
 fn run_traceroute_native(
     target: &str,
     cancel: &crate::diagnose::probe_io::Cancel,
-) -> Option<Vec<TracerouteHop>> {
+) -> Option<Trace> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::sys::socket::{
         recvmsg, sendto, setsockopt, socket,
@@ -280,7 +293,10 @@ fn run_traceroute_native(
         }
     }
 
-    Some(hops)
+    // The native path knows this for certain: a port-unreachable can only have
+    // come from the destination. Without one we ran out of hops instead, which
+    // is not the same as the destination being down.
+    Some((hops, Some(target_reached)))
 }
 
 /// Subprocess fallback for Windows and for IPv6 targets (the native
@@ -291,7 +307,7 @@ fn run_traceroute_native(
 fn run_traceroute_subprocess(
     target: &str,
     cancel: &crate::diagnose::probe_io::Cancel,
-) -> Result<Vec<TracerouteHop>, String> {
+) -> Result<Trace, String> {
     #[cfg(target_os = "windows")]
     let (binary, args) = ("tracert", vec!["-d", "-w", "1000", "-h", "30", target]);
     #[cfg(not(target_os = "windows"))]
@@ -309,7 +325,27 @@ fn run_traceroute_subprocess(
     if !ok {
         return Err(text.trim().to_string());
     }
-    Ok(parse_traceroute_output(&text))
+    let hops = parse_traceroute_output(&text);
+    let reached = destination_answered(target, &hops);
+    Ok((hops, reached))
+}
+
+/// Did the destination itself answer the subprocess trace?
+///
+/// `traceroute -n` prints the target's own address as the last hop when it
+/// replies. Anything else — a silent tail, a different final address, a target
+/// we cannot parse as an address — is unknown rather than a "no": the
+/// destination may simply be filtering the probes traceroute uses.
+fn destination_answered(target: &str, hops: &[TracerouteHop]) -> Option<bool> {
+    let target_ip: std::net::IpAddr = target.parse().ok()?;
+    let last = hops.last()?;
+    let ip = last.ip.as_deref()?;
+    let ip: std::net::IpAddr = ip.parse().ok()?;
+    if ip.to_canonical() == target_ip.to_canonical() {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Format a `Command::output()` failure with an install hint when the

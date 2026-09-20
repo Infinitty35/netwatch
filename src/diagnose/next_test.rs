@@ -238,7 +238,16 @@ pub fn latest_runs<'a>(issue: &'a Issue, now: &str) -> Vec<&'a TestRun> {
             (Some(now), Some(at)) => (now - at).num_seconds() <= VALID_SECS,
             _ => true,
         };
-        if fresh && run.outcome != Outcome::Inconclusive {
+        if !fresh {
+            continue;
+        }
+        // An inconclusive re-run retracts the earlier answer instead of being
+        // ignored. Skipping it left the superseded result ranking causes and
+        // stopped the test being offered again, so a test that stopped
+        // working kept voting on its own last good day.
+        if run.outcome == Outcome::Inconclusive {
+            latest.remove(run.test.as_str());
+        } else {
             latest.insert(run.test.as_str(), run);
         }
     }
@@ -1146,6 +1155,59 @@ mod tests {
         let before = n(&i);
         apply(&mut i, "2026-09-15 10:00:12");
         assert_eq!(n(&i), before);
+    }
+
+    #[test]
+    fn an_inconclusive_rerun_retracts_the_earlier_answer() {
+        // A test that stopped working used to keep voting with its last good
+        // result: the inconclusive run was skipped rather than retracting the
+        // answer, so the superseded verdict went on ranking causes and the
+        // test was never offered again.
+        let mut i = slow_resolver();
+        let run = |at: &str, outcome: Outcome| TestRun {
+            test: "dns.alt_resolver".into(),
+            at: at.into(),
+            outcome,
+            detail: String::new(),
+            measurements: BTreeMap::new(),
+            after_action: false,
+        };
+        i.tests.push(run("2026-09-15 10:00:00", Outcome::Positive));
+        apply(&mut i, "2026-09-15 10:00:05");
+        let scored = |i: &Issue| {
+            i.causes
+                .iter()
+                .find(|c| c.id == "upstream_slow")
+                .unwrap()
+                .score()
+        };
+        assert_eq!(scored(&i), Some(1.0), "the positive run supports the cause");
+
+        i.tests
+            .push(run("2026-09-15 10:01:00", Outcome::Inconclusive));
+        assert!(
+            latest_runs(&i, "2026-09-15 10:01:05").is_empty(),
+            "an inconclusive rerun leaves no valid answer behind"
+        );
+
+        // Causes are rebuilt from the detectors each tick, so re-apply on a
+        // fresh copy the way the engine does.
+        let mut fresh = slow_resolver();
+        fresh.tests = i.tests.clone();
+        apply(&mut fresh, "2026-09-15 10:01:05");
+        assert_eq!(
+            scored(&fresh),
+            None,
+            "a retracted answer cannot keep ranking the cause"
+        );
+        assert_eq!(
+            suggest(&fresh, Capability::None, "2026-09-15 10:01:05")
+                .unwrap()
+                .test
+                .id,
+            "dns.alt_resolver",
+            "and the test is offered again"
+        );
     }
 
     #[test]

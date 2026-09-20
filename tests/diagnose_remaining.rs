@@ -161,6 +161,11 @@ fn changed_target_configuration_cannot_verify_an_old_endpoint() {
         error: Some(StageError::Refused),
     };
     let target = TargetObs {
+        stale_after_secs: None,
+        attempts: vec![],
+        effective_endpoint: None,
+        sni: None,
+        http_authority: None,
         baseline_key: Some("target-config:old".into()),
         name: "api".into(),
         host: "127.0.0.1".into(),

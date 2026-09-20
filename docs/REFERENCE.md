@@ -637,7 +637,7 @@ See [INSIGHTS.md](INSIGHTS.md) for setup, data disclosure and troubleshooting.
 
 The intervals below assume the default one-second tick. Platform support is not
 feature parity; see the [capability matrix](CAPABILITIES.md), including Windows,
-and the [Diagnose input matrix](diagnostic-coverage.md).
+and the [Diagnose rule coverage](diagnostic-coverage.md).
 
 | Collector | Interval | macOS | Linux |
 |-----------|:--------:|-------|-------|

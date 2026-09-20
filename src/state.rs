@@ -166,6 +166,13 @@ pub struct AppUiState {
     pub egress_collapsed: crate::ui::tree::FoldState,
     /// Column the Egress tree is ordered by.
     pub egress_sort: EgressSort,
+    /// Show processes last seen before this session started.
+    ///
+    /// Egress profiles are a persisted baseline, so the tab would otherwise
+    /// open on every program ever observed on this machine — most of them
+    /// months old and none of them what someone opening the tab is looking
+    /// for. History is a keypress away, not the default.
+    pub egress_show_history: bool,
     /// Whether the destination detail pane is open (`d`).
     pub egress_detail: bool,
     /// Which connection groups are folded. Keyed by group value (process
@@ -270,6 +277,7 @@ impl AppUiState {
             egress_filter_active: None,
             egress_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             egress_sort: EgressSort::default(),
+            egress_show_history: false,
             egress_detail: false,
             connection_collapsed: crate::ui::tree::FoldState::new(cfg.groups_start_collapsed),
             // Folded by default whatever the preference says: the panel is

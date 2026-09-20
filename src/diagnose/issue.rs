@@ -302,6 +302,19 @@ impl CheckResult {
         self
     }
 
+    /// Whether this check is the one that tells the cause apart from its
+    /// lookalikes, rather than a symptom several causes share.
+    ///
+    /// Weight carries that meaning already: a detector gives a check extra
+    /// weight precisely when it discriminates — the loaded/idle comparison
+    /// that places a queue, the corroborating internet probe behind a
+    /// gateway verdict, whether the destination answered a trace. Deriving it
+    /// from weight keeps one source of truth instead of a second flag that
+    /// can disagree with the first.
+    pub fn is_discriminating(&self) -> bool {
+        self.weight >= DISCRIMINATING_WEIGHT
+    }
+
     pub fn glyph(&self) -> &'static str {
         match self.passed {
             Some(true) => "✓",
@@ -310,6 +323,10 @@ impl CheckResult {
         }
     }
 }
+
+/// The weight at which a check counts as the cause's discriminator rather
+/// than a shared symptom. Detectors already use 2.0 and 3.0 for exactly that.
+pub const DISCRIMINATING_WEIGHT: f64 = 2.0;
 
 /// How well a cause's checks held up. Deliberately four buckets and not a
 /// percentage: the underlying number is a weighted check-pass fraction, not a
@@ -397,14 +414,55 @@ impl Cause {
         }
     }
 
+    /// A discriminating check that could not be run. The cause may still be
+    /// the right answer; what is missing is the measurement that would tell
+    /// it apart from its lookalikes.
+    pub fn missing_discriminator(&self) -> Option<&CheckResult> {
+        self.checks
+            .iter()
+            .find(|c| c.passed.is_none() && c.is_discriminating())
+    }
+
+    /// What makes this cause's support sufficient: the discriminating checks
+    /// that actually passed. Empty when nothing discriminating ran, which is
+    /// why such a cause cannot be Strong.
+    pub fn sufficient_evidence(&self) -> Vec<&str> {
+        self.checks
+            .iter()
+            .filter(|c| c.passed == Some(true) && c.is_discriminating())
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+
     pub fn confidence(&self) -> Confidence {
-        match self.score() {
-            None => Confidence::Untested,
-            Some(s) if s >= 0.85 => Confidence::Strong,
-            Some(s) if s >= 0.6 => Confidence::Likely,
-            Some(s) if s >= 0.3 => Confidence::Possible,
-            Some(_) => Confidence::Weak,
+        let Some(s) = self.score() else {
+            return Confidence::Untested;
+        };
+        let level = if s >= 0.85 {
+            Confidence::Strong
+        } else if s >= 0.6 {
+            Confidence::Likely
+        } else if s >= 0.3 {
+            Confidence::Possible
+        } else {
+            Confidence::Weak
+        };
+        // A pass fraction says how the runnable checks went; it says nothing
+        // about the check that did not run. One shared symptom passing while
+        // the discriminator is skipped scored 1.0 and printed "strong",
+        // which is the claim this cap exists to prevent.
+        //
+        // Strong therefore needs one of two things: every check ran, so
+        // nothing is outstanding, or a discriminating check passed and can be
+        // named as the reason. Either way the claim can say what supports it.
+        let complete = self.checks.iter().all(|c| c.passed.is_some());
+        if level == Confidence::Strong
+            && (self.missing_discriminator().is_some()
+                || (!complete && self.sufficient_evidence().is_empty()))
+        {
+            return Confidence::Likely;
         }
+        level
     }
 
     /// `"3 of 4 checks"` — the honest denominator, excluding skipped checks.
@@ -688,6 +746,24 @@ pub struct Scope {
     pub processes: Vec<String>,
     pub destinations: u32,
     pub flows: u32,
+    /// The interface this finding's traffic actually used, when it is known.
+    ///
+    /// Suppression reads it: a link or gateway failure on eth0 explains
+    /// nothing about a target reached over wg0, and demoting that target to a
+    /// consequence hides a second, unrelated fault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_iface: Option<String>,
+    /// The resolver this finding's lookups actually used, when it is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_resolver: Option<String>,
+    /// Whether process attribution was attempted for this finding.
+    ///
+    /// An empty `processes` means two different things: a host-wide fault
+    /// that really does affect everything, or an attribution that failed. It
+    /// used to render as "all processes" either way, which turns a missing
+    /// measurement into a claim about the whole machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub processes_measured: bool,
     /// Free-text qualifier, e.g. "not affecting established flows".
     pub note: Option<String>,
 }
@@ -697,7 +773,11 @@ impl Scope {
     pub fn label(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.processes.is_empty() {
-            parts.push("all processes".to_string());
+            parts.push(if self.processes_measured {
+                "process not identified".to_string()
+            } else {
+                "all processes".to_string()
+            });
         } else if self.processes.len() <= 3 {
             parts.push(self.processes.join(", "));
         } else {
@@ -775,6 +855,9 @@ pub enum VerifyOutcome {
     NotRecovered,
     /// It was already recovering before the step; the step gets no credit.
     RecoveredBeforeAction,
+    /// An operator closed the issue by hand. Nothing was measured, so this is
+    /// not evidence that the step worked — or that the fault is gone.
+    ClosedByOperator,
 }
 
 impl VerifyOutcome {
@@ -784,6 +867,7 @@ impl VerifyOutcome {
             VerifyOutcome::Partial => "partly recovered",
             VerifyOutcome::NotRecovered => "not recovered",
             VerifyOutcome::RecoveredBeforeAction => "was already recovering",
+            VerifyOutcome::ClosedByOperator => "closed by hand, not measured",
         }
     }
 }
@@ -817,11 +901,16 @@ impl Issue {
 
     /// Sort causes best-first. Untestable causes sink below tested ones so a
     /// cause nothing could rule out never outranks one with passing checks.
+    /// Order causes by how well the evidence supports them: confidence
+    /// first, so a cause whose discriminator never ran cannot outrank one
+    /// that was actually measured, then the pass fraction within a level.
     pub fn rank_causes(&mut self) {
         self.causes.sort_by(|a, b| {
             let sa = a.score().unwrap_or(-1.0);
             let sb = b.score().unwrap_or(-1.0);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            b.confidence()
+                .cmp(&a.confidence())
+                .then(sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal))
         });
     }
 
@@ -929,7 +1018,11 @@ mod tests {
     }
 
     #[test]
-    fn skipped_checks_do_not_count_against_a_cause() {
+    fn a_skipped_shared_symptom_does_not_count_against_a_cause() {
+        // Skipping a check that several causes share is not evidence against
+        // this one, so the pass fraction still reads 1.0 — but with a check
+        // outstanding and nothing discriminating to point at, the cause is
+        // not strong either.
         let all_pass = Cause::new(
             "all_pass",
             "c",
@@ -940,8 +1033,113 @@ mod tests {
             ],
         );
         assert_eq!(all_pass.score(), Some(1.0));
-        assert_eq!(all_pass.confidence(), Confidence::Strong);
+        assert_eq!(all_pass.confidence(), Confidence::Likely);
         assert_eq!(all_pass.checks_label(), "2 of 2 checks (1 not run)");
+        assert_eq!(all_pass.sufficient_evidence(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_missing_discriminator_keeps_a_cause_short_of_strong() {
+        // The defect this cap exists for: one shared symptom passes, the
+        // check that would separate this cause from its lookalikes never
+        // ran, and the ratio alone called that strong.
+        let c = Cause::new(
+            "receiver_queueing",
+            "c",
+            vec![
+                CheckResult::pass("symptom", "symptom", ""),
+                CheckResult::skipped("discriminator", "discriminator", "no test has run")
+                    .weighted(2.0),
+            ],
+        );
+        assert_eq!(c.score(), Some(1.0), "a skipped check is not a failure");
+        assert_eq!(c.confidence(), Confidence::Likely);
+        assert_eq!(
+            c.missing_discriminator().map(|k| k.id.as_str()),
+            Some("discriminator")
+        );
+        assert!(c.sufficient_evidence().is_empty());
+
+        // Run it, and the cause can be strong on evidence that names itself.
+        let measured = Cause::new(
+            "receiver_queueing",
+            "c",
+            vec![
+                CheckResult::pass("symptom", "symptom", ""),
+                CheckResult::pass("discriminator", "discriminator", "").weighted(2.0),
+            ],
+        );
+        assert_eq!(measured.confidence(), Confidence::Strong);
+        assert_eq!(measured.sufficient_evidence(), vec!["discriminator"]);
+    }
+
+    #[test]
+    fn strong_needs_either_a_complete_set_of_checks_or_a_named_discriminator() {
+        // Everything ran and passed: nothing is outstanding to qualify it.
+        let complete = Cause::new(
+            "c",
+            "c",
+            vec![
+                CheckResult::pass("a", "a", ""),
+                CheckResult::pass("b", "b", ""),
+            ],
+        );
+        assert_eq!(complete.confidence(), Confidence::Strong);
+
+        // A symptom passed, an ordinary check did not, and nothing
+        // discriminating spoke for the cause: not strong.
+        let partial = Cause::new(
+            "c",
+            "c",
+            vec![
+                CheckResult::pass("a", "a", ""),
+                CheckResult::skipped("b", "b", "no data"),
+            ],
+        );
+        assert_eq!(partial.confidence(), Confidence::Likely);
+        assert!(partial.sufficient_evidence().is_empty());
+    }
+
+    #[test]
+    fn a_measured_cause_outranks_one_whose_discriminator_never_ran() {
+        let mut issue = test_issue();
+        issue.causes = vec![
+            Cause::new(
+                "unmeasured",
+                "unmeasured",
+                vec![
+                    CheckResult::pass("symptom", "symptom", ""),
+                    CheckResult::skipped("d", "d", "").weighted(2.0),
+                ],
+            ),
+            Cause::new(
+                "measured",
+                "measured",
+                vec![
+                    CheckResult::pass("symptom", "symptom", ""),
+                    CheckResult::pass("d", "d", "").weighted(2.0),
+                ],
+            ),
+        ];
+        issue.rank_causes();
+        assert_eq!(issue.causes[0].id, "measured");
+    }
+
+    #[test]
+    fn a_failed_attribution_does_not_read_as_every_process() {
+        let host_wide = Scope::default();
+        assert!(host_wide.label().contains("all processes"));
+
+        let attempted = Scope {
+            processes_measured: true,
+            ..Default::default()
+        };
+        assert!(
+            attempted.label().contains("process not identified"),
+            "{}",
+            attempted.label()
+        );
+        assert!(!attempted.label().contains("all processes"));
     }
 
     #[test]

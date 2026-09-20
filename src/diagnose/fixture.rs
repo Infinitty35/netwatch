@@ -128,7 +128,7 @@ fn healthy_gateway() -> GatewayObs {
         addr: Some(GATEWAY.into()),
         rtt_ms: Some(0.9),
         loss_pct: 0.0,
-        arp_ok: true,
+        arp_ok: Some(true),
         icmp_ok: true,
         internet_reachable: Some(true),
     }
@@ -213,6 +213,7 @@ pub fn observations_with(secs_from_start: u64, resolver_fixed: bool) -> Observat
             (false, false) => healthy_dns(),
         }),
         paths: vec![PathObs {
+            destination_reached: Some(true),
             target: "1.1.1.1".into(),
             hops: if path_changed {
                 path_after()
@@ -317,6 +318,54 @@ pub fn report() -> Report {
             "timeline.json".into(),
         ],
     }
+}
+
+/// A deterministic recorded episode of the scenario above.
+///
+/// The corpus DG08 pins replays this: same frames, same decisions, every
+/// time. Its id is fixed rather than a fresh uuid, so two runs produce
+/// byte-identical files and a diff means a decision changed.
+pub fn episode() -> crate::diagnose::episode::Episode {
+    use crate::diagnose::engine::{Clock, Engine, FixedClock, ObservationTimes};
+    use crate::diagnose::episode;
+    let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:44:00"));
+    let mut engine = Engine::new(Box::new(clock.clone()));
+    let mut base = baselines();
+    let mut rec = episode::Recorder::new(episode::EnvProfile::detect("root", 1000), 1.789e9);
+    rec.schedule_quiet_sample(f64::MAX);
+    let start = std::time::Instant::now() + std::time::Duration::from_secs(86_400);
+    for t in 0..=SCENARIO_SECS {
+        let mut obs = observations_at(t);
+        for s in &mut obs.sockets {
+            s.process = Some("firefox".into());
+        }
+        let now = start + std::time::Duration::from_secs(t);
+        let times = ObservationTimes {
+            interface: Some(now),
+            sockets: Some(now),
+            path: Some(now),
+            ..Default::default()
+        };
+        engine.observe_live_at(&obs, &base, &times, now);
+        let _ = rec.record(episode::Tick {
+            at: 1.789e9 + t as f64,
+            ts: crate::diagnose::engine::format_ts(clock.now()),
+            now,
+            obs: &obs,
+            times: &times,
+            readings: &[],
+            engine: &engine,
+            baselines: &base,
+            events: vec![],
+        });
+        base.set_gate_sigma(engine.settings().thresholds.sigma_k);
+        clock.advance_secs(1);
+    }
+    let mut ep = rec
+        .flush(&engine, &crate::diagnose::engine::format_ts(clock.now()))
+        .expect("the scenario opens issues, so an episode exists");
+    ep.id = "fixture-scenario".into();
+    ep
 }
 
 #[cfg(test)]

@@ -177,12 +177,23 @@ impl LiveSampler {
             .find(|i| i.name == app.capture_interface)
             .and_then(|i| i.ipv4.clone())
             .map(|ip| subnet_of(&ip));
+        // Tunnels that are up are part of this network's identity: they
+        // change the route and the resolver a target reaches, so a baseline
+        // or a pending verification from before they came up describes
+        // something else.
+        let vpn: Vec<String> = app
+            .interface_info
+            .iter()
+            .filter(|i| i.is_up && super::targets::is_vpn_iface(&i.name))
+            .map(|i| i.name.clone())
+            .collect();
         NetworkFingerprint::new(
             app.capture_interface.clone(),
             cfg.gateway.clone(),
             cfg.dns_servers.clone(),
             subnet,
         )
+        .with_vpn(vpn)
     }
 
     /// This tick's raw readings as `(subject, metric, value)`, ready to feed
@@ -234,11 +245,16 @@ impl LiveSampler {
     }
 
     fn targets(&mut self, app: &App) -> Vec<super::targets::TargetObs> {
-        let (fresh, newest) = app
+        let (fresh, _) = app
             .diagnose
             .target_prober
             .fresh(&app.user_config.diagnose_targets);
-        self.completed.targets = newest;
+        // Each target carries its own completion time: an issue about one
+        // target may only be confirmed or verified by that target's probes.
+        self.completed.targets = fresh
+            .iter()
+            .map(|(at, obs)| (obs.name.clone(), *at))
+            .collect();
         fresh.into_iter().map(|(_, obs)| obs).collect()
     }
 
@@ -473,6 +489,7 @@ impl LiveSampler {
             hops,
             previous,
             traced_at: result.completed_at.clone(),
+            destination_reached: result.reached,
         };
         self.path_samples
             .insert(result.target.clone(), (completed, path.clone()));
@@ -571,10 +588,11 @@ fn gateway(app: &App) -> Option<GatewayObs> {
         rtt_ms: health.gateway_rtt_ms,
         loss_pct: health.gateway_loss_pct,
         internet_reachable,
-        // No ARP probe yet. Reporting `true` would let the "wrong vlan" cause
-        // be ruled out on no evidence, so it mirrors the ICMP result and the
-        // cause analysis leans on the checks that did run.
-        arp_ok: icmp_ok,
+        // No ARP probe yet, so this stays unknown. Mirroring the ICMP result
+        // here made the checks assert "no arp reply from the gateway" about a
+        // probe that was never sent — and an unprivileged run, which cannot
+        // send ICMP at all, produced that line every time.
+        arp_ok: None,
         icmp_ok,
     })
 }

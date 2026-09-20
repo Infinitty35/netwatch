@@ -152,7 +152,7 @@ fn build(input: &Input<'_>) -> Builder {
     let gw = obs.gateway.as_ref();
     b.put("gateway.rtt_ms", gw.and_then(|g| g.rtt_ms));
     b.put("gateway.loss_pct", gw.map(|g| g.loss_pct));
-    b.flag("gateway.arp_ok", gw.map(|g| g.arp_ok));
+    b.flag("gateway.arp_ok", gw.and_then(|g| g.arp_ok));
     b.flag("gateway.icmp_ok", gw.map(|g| g.icmp_ok));
     b.flag(
         "gateway.internet_reachable",

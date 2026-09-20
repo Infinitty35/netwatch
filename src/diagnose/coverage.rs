@@ -276,6 +276,17 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            // Regenerate the committed catalogue document. No host is probed:
+            // this describes the ruleset, not what this machine can see.
+            "--doc" => {
+                let path = args
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "docs/diagnostic-coverage.md".to_string());
+                std::fs::write(&path, super::rules::coverage_markdown())?;
+                println!("wrote {path}");
+                return Ok(());
+            }
             "--json" => json = true,
             "--test" => {
                 test = Some(
@@ -385,7 +396,7 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         "completeness": "bounded snapshot; missing results may still be in flight",
         "source_age_seconds": { "ipv6": age(times.ipv6), "portal": age(times.portal), "pmtu": age(times.pmtu), "kernel": age(times.kernel), "interface": age(times.interface), "sockets": age(times.sockets),
             "dns": age(times.health.dns), "gateway": age(times.health.gateway), "nat": age(times.health.nat),
-            "path": age(times.path), "targets": age(times.targets), "egress": age(times.egress) },
+            "path": age(times.path), "targets": age(times.targets.values().copied().max()), "egress": age(times.egress) },
         "active_experiments": app.diagnose.active_prober.snapshot().0,
         "experiment_progress": app.diagnose.active_prober.snapshot().2,
         "configured_targets": app.user_config.diagnose_targets.len(),

@@ -104,6 +104,11 @@ pub struct PlatformReport {
     pub caps_dropped: Vec<String>,
     /// Effective capabilities still held after verified drop attempts.
     pub caps_retained: Vec<String>,
+    /// Capabilities entry deliberately left in place for a load that needs
+    /// them, which the worker then drops itself. Reported separately from
+    /// `caps_retained` so "still held because the policy kept it" cannot be
+    /// read as "the drop failed".
+    pub caps_retained_for_load: Vec<String>,
     /// macOS: whether `sandbox_init_with_parameters` returned 0.
     pub macos_seatbelt: bool,
     /// Windows: whether the restricted-token + job-object pair applied.
@@ -152,6 +157,25 @@ impl Report {
 /// Returns the Report unconditionally. In `Mode::Strict`, callers should
 /// check `report.mode.warnings` and abort if non-empty.
 pub fn apply(mode: Mode, paths: &SandboxPaths) -> Report {
+    apply_retaining(mode, paths, Retain::Nothing)
+}
+
+/// Capabilities a worker keeps through entry.
+///
+/// Loading a BPF program needs CAP_BPF and CAP_PERFMON, and entry drops
+/// both — so the eBPF worker would confine itself out of the one syscall it
+/// exists to make. It enters with the filesystem policy applied and those two
+/// capabilities held, loads, and drops them itself before reading a single
+/// event. Nothing else uses this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retain {
+    Nothing,
+    /// CAP_BPF, CAP_PERFMON and the pre-5.8 CAP_SYS_ADMIN fallback.
+    BpfLoad,
+}
+
+/// [`apply`], keeping the capabilities `retain` names.
+pub fn apply_retaining(mode: Mode, paths: &SandboxPaths, retain: Retain) -> Report {
     let mut report = Report::default();
 
     if matches!(mode, Mode::Disabled) {
@@ -161,8 +185,11 @@ pub fn apply(mode: Mode, paths: &SandboxPaths) -> Report {
 
     #[cfg(target_os = "linux")]
     {
-        linux::apply(mode, paths, &mut report);
+        linux::apply(mode, paths, retain, &mut report);
     }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = retain;
 
     #[cfg(not(target_os = "linux"))]
     {

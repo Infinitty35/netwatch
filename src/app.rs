@@ -845,15 +845,11 @@ impl App {
                 .attach_pktap(Arc::clone(&handle.attributor));
             self.pktap_handle = Some(handle);
         }
+        // The tracker enters the sandbox itself, loads with the capabilities
+        // the load needs, and drops them before reading an event — so this no
+        // longer refuses whenever the sandbox is on. See `ConnTracker::start`.
         #[cfg(feature = "ebpf")]
-        match if matches!(
-            crate::sandbox::worker::mode(),
-            crate::sandbox::Mode::Disabled
-        ) {
-            crate::ebpf::conn_tracker::ConnTracker::start().map_err(|e| e.to_string())
-        } else {
-            Err("eBPF disabled: SDK reader has no pre-processing confinement hook; using socket polling".into())
-        } {
+        match crate::ebpf::conn_tracker::ConnTracker::start().map_err(|e| e.to_string()) {
             Ok(tracker) => {
                 self.connection_collector
                     .attach_ebpf(Arc::clone(&tracker.attributor));
@@ -4101,6 +4097,10 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
                 }
             }
             app.ui.export_status_tick = 0;
+        }
+        KeyCode::Char('H') if app.ui.current_tab == Tab::Egress => {
+            app.ui.egress_show_history = !app.ui.egress_show_history;
+            app.ui.scroll.egress_scroll = 0;
         }
         KeyCode::Char('d') if app.ui.current_tab == Tab::Egress => {
             app.ui.egress_detail = !app.ui.egress_detail;

@@ -91,3 +91,35 @@ jobs:
 
       - name: cargo check armv5te
         run: cargo check --target armv5te-unknown-linux-gnueabi
+
+  # The Diagnose fault lab builds a two-namespace veth network and asserts the
+  # probe's verdicts against faults it creates on purpose: IPv6 blackholes, a
+  # captive portal, a PMTU hole, a seccomp-denied socket, TIME_WAIT pressure.
+  # It existed in the repo for weeks with nothing running it, which makes it a
+  # test that cannot fail. Privileges: a user namespace mapped to root, so
+  # nothing outside the job's own namespace is touched.
+  diagnose-fault-lab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 ethtool iputils-ping util-linux
+
+      - name: Build the probe example
+        run: cargo build --example diagnose_probe
+
+      - name: Run the fault lab
+        run: unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py | tee fault-lab.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-fault-lab
+          path: fault-lab.json
+          if-no-files-found: warn

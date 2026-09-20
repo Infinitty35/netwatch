@@ -237,6 +237,13 @@ pub struct TargetContext {
     pub clock_offset_secs: Option<f64>,
 }
 
+/// One address tried during a probe, and what it returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectAttempt {
+    pub address: String,
+    pub stage: Stage,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TargetObs {
     #[serde(default)]
@@ -259,6 +266,26 @@ pub struct TargetObs {
     /// Time to the first byte of the response.
     pub http_stage: Option<Stage>,
     pub status: Option<u16>,
+    /// Every address this probe tried, in order, with what each returned.
+    /// The probe used to try only the first address: one dead address in a
+    /// DNS answer made a working service look down.
+    #[serde(default)]
+    pub attempts: Vec<ConnectAttempt>,
+    /// The address the later stages actually ran on.
+    #[serde(default)]
+    pub effective_endpoint: Option<String>,
+    /// The name sent as SNI, when TLS was used.
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// The authority sent in the HTTP `Host` header, including the port when
+    /// it is not the scheme's default and brackets around an IPv6 literal.
+    #[serde(default)]
+    pub http_authority: Option<String>,
+    /// How long results for this target stay usable, from its configured
+    /// probe interval. `None` in recordings made before the engine scoped
+    /// staleness per target; those fall back to the global default.
+    #[serde(default)]
+    pub stale_after_secs: Option<u64>,
     pub context: TargetContext,
 }
 
@@ -307,6 +334,13 @@ pub fn is_vpn_iface(name: &str) -> bool {
 // ------------------------------------------------------------------ probe
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Addresses tried before giving up, so a long DNS answer cannot turn one
+/// target into a minute of probing.
+const MAX_ADDRESS_ATTEMPTS: usize = 4;
+/// Total wall clock one target may spend connecting, across every address and
+/// the extra per-family attempt. One unreachable target must not starve the
+/// targets queued behind it.
+const TARGET_BUDGET: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn probe(cfg: &TargetConfig, env: &ProbeEnv, now: impl Fn() -> String) -> TargetObs {
@@ -322,6 +356,7 @@ fn probe_cancel(
     let link_domains = link_domains();
     let mut obs = TargetObs {
         baseline_key: Some(cfg.baseline_key()),
+        stale_after_secs: Some(cfg.stale_after_secs()),
         name: cfg.name.clone(),
         host: cfg.host.clone(),
         port: cfg.port,
@@ -338,6 +373,10 @@ fn probe_cancel(
         tls_stage: None,
         http_stage: None,
         status: None,
+        attempts: vec![],
+        effective_endpoint: None,
+        sni: None,
+        http_authority: None,
         context: TargetContext {
             system_proxy_mode: system_proxy_mode(),
             container_bridges: container_bridges(),
@@ -390,66 +429,138 @@ fn probe_cancel(
     };
     obs.addresses = addrs.iter().map(|a| a.ip().to_string()).collect();
 
+    connect_stages(cfg, &addrs, cancel, &mut obs);
+    obs.probed_at = now();
+    obs
+}
+
+fn connect_stages(
+    cfg: &TargetConfig,
+    addrs: &[SocketAddr],
+    cancel: &super::probe_io::Cancel,
+    obs: &mut TargetObs,
+) {
     // ── connect ──
+    //
+    // Every address in turn, not just the first: a DNS answer that leads with
+    // a dead address used to make a working service look down, because the
+    // first failure ended the probe and TLS and HTTP never ran. Attempts are
+    // bounded and share one budget, so a target with a long address list
+    // cannot hold up the targets queued behind it.
     let Some(first) = addrs.first().copied() else {
-        obs.probed_at = now();
-        return obs;
+        return;
     };
-    if cancel.cancelled() {
-        obs.connect = Some(Stage::failed(
+    let deadline = Instant::now() + TARGET_BUDGET;
+    let cancelled_stage = || {
+        Stage::failed(
             None,
             StageError::Other {
                 message: "probe cancelled".into(),
             },
-        ));
-        obs.probed_at = now();
-        return obs;
+        )
+    };
+    let budget_stage = || {
+        Stage::failed(
+            None,
+            StageError::Other {
+                message: "probe budget spent before this address was tried".into(),
+            },
+        )
+    };
+    let mut selected: Option<(SocketAddr, TcpStream, Stage)> = None;
+    for addr in addrs.iter().copied().take(MAX_ADDRESS_ATTEMPTS) {
+        if cancel.cancelled() {
+            obs.attempts.push(ConnectAttempt {
+                address: addr.to_string(),
+                stage: cancelled_stage(),
+            });
+            break;
+        }
+        if Instant::now() >= deadline {
+            obs.attempts.push(ConnectAttempt {
+                address: addr.to_string(),
+                stage: budget_stage(),
+            });
+            break;
+        }
+        let (stage, stream) = connect(addr);
+        obs.attempts.push(ConnectAttempt {
+            address: addr.to_string(),
+            stage: stage.clone(),
+        });
+        if let Some(stream) = stream {
+            selected = Some((addr, stream, stage));
+            break;
+        }
     }
-    let (first_stage, stream) = connect(first);
-    let v4 = addrs.iter().find(|a| a.is_ipv4()).copied();
-    let v6 = addrs.iter().find(|a| a.is_ipv6()).copied();
-    let family = |addr: Option<SocketAddr>| {
-        addr.map(|a| {
-            if a == first {
-                first_stage.clone()
-            } else if cancel.cancelled() {
-                Stage::failed(
-                    None,
-                    StageError::Other {
-                        message: "probe cancelled".into(),
-                    },
-                )
-            } else {
-                connect(a).0
-            }
-        })
+
+    // Per-family results, from the attempts already made. A family nothing
+    // tried is probed once more if the budget allows, because "v6 fails while
+    // v4 works" is evidence a cause depends on.
+    let attempted = |want_v6: bool| -> Option<Stage> {
+        obs.attempts
+            .iter()
+            .find(|a| {
+                a.address
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|s| s.is_ipv6() == want_v6)
+            })
+            .map(|a| a.stage.clone())
     };
-    obs.connect_v4 = family(v4);
-    obs.connect_v6 = family(v6);
-    obs.connect = Some(first_stage);
-    let Some(stream) = stream else {
-        obs.probed_at = now();
-        return obs;
+    let family = |want_v6: bool, obs_attempts: &[ConnectAttempt]| -> Option<Stage> {
+        let addr = addrs.iter().find(|a| a.is_ipv6() == want_v6).copied()?;
+        if let Some(stage) = obs_attempts
+            .iter()
+            .find(|a| a.address == addr.to_string())
+            .map(|a| a.stage.clone())
+        {
+            return Some(stage);
+        }
+        if cancel.cancelled() {
+            return Some(cancelled_stage());
+        }
+        if Instant::now() >= deadline {
+            return Some(budget_stage());
+        }
+        Some(connect(addr).0)
     };
+    obs.connect_v4 = attempted(false).or_else(|| family(false, &obs.attempts));
+    obs.connect_v6 = attempted(true).or_else(|| family(true, &obs.attempts));
+
+    let Some((addr, stream, stage)) = selected else {
+        // Nothing connected. The headline stage is the first address's
+        // result, which is what the rules read, and `attempts` holds the rest.
+        obs.connect = Some(
+            obs.attempts
+                .first()
+                .map(|a| a.stage.clone())
+                .unwrap_or_else(cancelled_stage),
+        );
+        let _ = first;
+        return;
+    };
+    obs.connect = Some(stage);
+    obs.effective_endpoint = Some(addr.to_string());
+
     let mut stream =
         match super::probe_io::Stream::new(stream, Instant::now() + IO_TIMEOUT, cancel.clone()) {
             Ok(s) => s,
             Err(e) => {
                 obs.connect = Some(Stage::failed(None, connect_error(&e)));
-                obs.probed_at = now();
-                return obs;
+                return;
             }
         };
 
     // ── tls + http ──
     if obs.tls {
+        obs.sni = Some(cfg.host.clone());
         let started = Instant::now();
         match tls_handshake(&cfg.host, &mut stream) {
             Ok(mut conn) => {
                 obs.tls_stage = Some(Stage::ok(started.elapsed().as_secs_f64() * 1000.0));
                 if cfg.http {
                     let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-                    http_exchange(cfg, &mut tls, &mut obs);
+                    http_exchange(cfg, &mut tls, obs);
                 }
             }
             Err(error) => {
@@ -460,10 +571,54 @@ fn probe_cancel(
             }
         }
     } else if cfg.http {
-        http_exchange(cfg, &mut stream, &mut obs);
+        http_exchange(cfg, &mut stream, obs);
     }
-    obs.probed_at = now();
+}
+
+/// Probe stages against a fixed address list, with no DNS of its own.
+///
+/// The seam the address-fallback tests use: resolution is the one part of a
+/// probe that cannot be made deterministic in a unit test.
+#[cfg(test)]
+fn probe_addresses(
+    cfg: &TargetConfig,
+    env: &ProbeEnv,
+    addrs: &[SocketAddr],
+    cancel: &super::probe_io::Cancel,
+) -> TargetObs {
+    let mut obs = probe(cfg, env, String::new);
+    obs.attempts.clear();
+    obs.connect = None;
+    obs.connect_v4 = None;
+    obs.connect_v6 = None;
+    obs.tls_stage = None;
+    obs.http_stage = None;
+    obs.status = None;
+    obs.effective_endpoint = None;
+    obs.resolve = Stage::ok(0.0);
+    obs.addresses = addrs.iter().map(|a| a.ip().to_string()).collect();
+    connect_stages(cfg, addrs, cancel, &mut obs);
     obs
+}
+
+/// The `Host` header for a target: the port when it is not the scheme's
+/// default, and brackets around an IPv6 literal.
+///
+/// Sending a bare `host` reached the wrong virtual host on any non-default
+/// port, and an unbracketed IPv6 literal is not a valid authority at all, so
+/// the server's reply described something other than the configured target.
+pub fn http_authority(host: &str, port: u16, tls: bool) -> String {
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default = if tls { 443 } else { 80 };
+    if port == default {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn connect(addr: SocketAddr) -> (Stage, Option<TcpStream>) {
@@ -597,9 +752,11 @@ pub fn tls_error(e: &rustls::Error) -> StageError {
 }
 
 fn http_exchange(cfg: &TargetConfig, stream: &mut impl ReadWrite, obs: &mut TargetObs) {
+    let authority = http_authority(&cfg.host, cfg.port, cfg.uses_tls());
+    obs.http_authority = Some(authority.clone());
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: netwatch-diagnose\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        cfg.path, cfg.host
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: netwatch-diagnose\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        cfg.path
     );
     let started = Instant::now();
     if let Err(e) = stream.write_all(request.as_bytes()) {
@@ -1057,6 +1214,59 @@ mod tests {
     }
 
     #[test]
+    fn the_host_header_carries_the_port_and_brackets_a_v6_literal() {
+        // A bare host on a non-default port reaches whatever virtual host the
+        // server defaults to, and an unbracketed v6 literal is not a valid
+        // authority at all — either way the reply describes something other
+        // than the configured target.
+        assert_eq!(http_authority("example.com", 443, true), "example.com");
+        assert_eq!(http_authority("example.com", 80, false), "example.com");
+        assert_eq!(
+            http_authority("example.com", 8443, true),
+            "example.com:8443"
+        );
+        assert_eq!(
+            http_authority("example.com", 8080, false),
+            "example.com:8080"
+        );
+        assert_eq!(http_authority("::1", 443, true), "[::1]");
+        assert_eq!(http_authority("::1", 8443, true), "[::1]:8443");
+        assert_eq!(http_authority("127.0.0.1", 8080, false), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn a_dead_first_address_does_not_hide_a_working_service() {
+        // The probe used to try `addrs.first()` only. One stale AAAA or a
+        // dead round-robin member therefore reported the whole service down,
+        // with TLS and HTTP never attempted.
+        let port = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead); // nothing is listening on this port now
+
+        let cfg = TargetConfig {
+            http: true,
+            ..cfg("127.0.0.1", port)
+        };
+        let cancel = super::super::probe_io::Cancel::default();
+        let addrs = vec![
+            SocketAddr::from(([127, 0, 0, 1], dead_port)),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ];
+        let obs = probe_addresses(&cfg, &ProbeEnv::default(), &addrs, &cancel);
+
+        assert_eq!(obs.attempts.len(), 2, "both addresses were tried in order");
+        assert!(!obs.attempts[0].stage.is_ok());
+        assert!(obs.attempts[1].stage.is_ok());
+        assert_eq!(
+            obs.effective_endpoint.as_deref(),
+            Some(addrs[1].to_string().as_str())
+        );
+        assert_eq!(obs.status, Some(200), "http ran on the address that worked");
+        assert!(obs.connect.as_ref().is_some_and(|s| s.is_ok()));
+    }
+
+    #[test]
     fn disabled_targets_do_not_start_workers() {
         let mut target = cfg("127.0.0.1", 80);
         target.enabled = false;
@@ -1097,6 +1307,11 @@ mod tests {
         let original = cfg("localhost", 443);
         let prober = TargetProber::default();
         let obs = TargetObs {
+            stale_after_secs: None,
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
             baseline_key: None,
             name: original.name.clone(),
             host: original.host.clone(),

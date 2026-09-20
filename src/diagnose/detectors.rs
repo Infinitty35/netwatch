@@ -202,6 +202,15 @@ pub struct PathObs {
     /// The previous trace to the same target, for diffing.
     pub previous: Option<Vec<HopObs>>,
     pub traced_at: String,
+    /// Whether the destination itself answered this trace. `None` when the
+    /// trace cannot tell, which is the usual case for a firewalled tail and
+    /// the default for recordings made before this field existed.
+    ///
+    /// Without it, "every hop after the lossy one is silent" cannot be told
+    /// apart from "the loss reaches the destination", and blaming a hop on
+    /// that basis names a router for its own ICMP policy.
+    #[serde(default)]
+    pub destination_reached: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -291,7 +300,12 @@ pub struct GatewayObs {
     pub addr: Option<String>,
     pub rtt_ms: Option<f64>,
     pub loss_pct: f64,
-    pub arp_ok: bool,
+    /// Whether the gateway answered ARP. `None` when no ARP probe has run,
+    /// which is currently always: netwatch sends no ARP of its own. An
+    /// unmeasured probe must not be rendered as a failed one, so the checks
+    /// below report it as unknown rather than asserting either way.
+    #[serde(default)]
+    pub arp_ok: Option<bool>,
     pub icmp_ok: bool,
     /// Whether a host beyond the gateway answered. This is the corroborating
     /// check that makes "gateway unreachable" safe to say.
@@ -402,6 +416,19 @@ fn detect_targets(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
         .filter_map(|target| {
             target_detection(target, obs, base, t).map(|mut d| {
                 d.scope.configuration = target.baseline_key.clone();
+                // Which resolver answered for this target, and the link that
+                // resolver belongs to. Suppression uses both: a resolver
+                // failure elsewhere, or a link failure on another interface,
+                // does not explain this finding.
+                if let Some(answered) = target
+                    .lookups
+                    .iter()
+                    .find(|l| l.outcome == super::targets::LookupOutcome::Answered)
+                    .or_else(|| target.lookups.first())
+                {
+                    d.scope.via_resolver = Some(answered.resolver.clone());
+                    d.scope.via_iface = answered.link.clone();
+                }
                 d
             })
         })
@@ -1304,7 +1331,7 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
     let Some(gw) = &obs.gateway else {
         return vec![];
     };
-    if gw.arp_ok && gw.icmp_ok {
+    if gw.arp_ok != Some(false) && gw.icmp_ok {
         return detect_gateway_rtt(gw, base, t);
     }
     // The probe failed, but the internet answered — so the gateway is
@@ -1341,14 +1368,20 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
             "icmp_filtered",
             "gateway is up but not answering icmp",
             vec![
-                if gw.arp_ok {
-                    CheckResult::pass("arp_resolves", "arp resolves", "the gateway answered arp")
-                } else {
-                    CheckResult::fail(
+                match gw.arp_ok {
+                    Some(true) => CheckResult::pass(
+                        "arp_resolves",
+                        "arp resolves",
+                        "the gateway answered arp",
+                    ),
+                    Some(false) => CheckResult::fail(
                         "arp_resolves",
                         "arp resolves",
                         "no arp reply from the gateway",
-                    )
+                    ),
+                    None => {
+                        CheckResult::skipped("arp_resolves", "arp resolves", "no arp probe has run")
+                    }
                 },
                 CheckResult::fail(
                     "icmp_reaches_the_gateway",
@@ -1362,15 +1395,18 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
             "wrong_vlan_or_address_conflict",
             "wrong vlan or an address conflict",
             vec![
-                if !gw.arp_ok {
-                    CheckResult::pass(
+                match gw.arp_ok {
+                    Some(false) => CheckResult::pass(
                         "arp_fails",
                         "arp fails",
                         "no arp reply — we may not be on its segment",
-                    )
-                } else {
-                    CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
-                },
+                    ),
+                    Some(true) => {
+                        CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
+                    }
+                    None => CheckResult::skipped("arp_fails", "arp fails", "no arp probe has run"),
+                }
+                .weighted(2.0),
                 corroboration,
             ],
         ),
@@ -1380,6 +1416,9 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
         Step::instruct("confirm the default route", "ip route show default"),
     ];
     d.scope.note = Some("everything downstream is affected".into());
+    // The gateway is reached over the primary interface; naming it lets
+    // suppression leave alone whatever runs over a different one.
+    d.scope.via_iface = obs.iface.as_ref().map(|i| i.name.clone());
     vec![d]
 }
 
@@ -1638,21 +1677,32 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         },
                     ],
                 ),
+                // A private answer for a public name is the signature of an
+                // internal zone as much as of an interceptor, so it supports
+                // this cause on the same evidence and at the same weight as
+                // `interceptor` above. Nothing netwatch measures separates a
+                // deliberate override from a hostile one; ranking them equally
+                // is the honest outcome until a discriminating check exists.
                 Cause::new(
                     "split_horizon",
                     "split-horizon dns on this network, by design",
                     vec![if cross.private_answer {
-                        CheckResult::fail(
-                            "public_name_public_answer",
-                            "public name, public answer",
-                            "a private answer for a public name is not split horizon",
+                        CheckResult::pass(
+                            "private_answer_for_a_public_name",
+                            "private answer for a public name",
+                            format!(
+                                "{} → {local}, which an internal zone also explains",
+                                cross.name
+                            ),
                         )
+                        .weighted(2.0)
                     } else {
                         CheckResult::skipped(
-                            "public_name_public_answer",
-                            "public name, public answer",
-                            "cannot tell an interceptor from an intentional override",
+                            "private_answer_for_a_public_name",
+                            "private answer for a public name",
+                            "the answer is public, so an internal zone does not explain it",
                         )
+                        .weighted(2.0)
                     }],
                 ),
             ];
@@ -1864,6 +1914,9 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         processes: vec![],
         destinations: 0,
         flows: 0,
+        via_iface: None,
+        processes_measured: false,
+        via_resolver: Some(dns.resolver.clone()),
         note: Some("every new connection pays this before it can start".into()),
     };
     out.push(d);
@@ -2138,22 +2191,32 @@ fn detect_path_change(path: &PathObs) -> Option<Detection> {
 fn detect_path_loss(path: &PathObs) -> Option<Detection> {
     // Loss only counts when it propagates. A hop that drops probes while
     // later hops are clean is rate-limiting ICMP, not losing traffic.
-    let mut culprit: Option<&HopObs> = None;
+    //
+    // A silent tail is a third case, and the one that produced false blame:
+    // nothing after the lossy hop answered, so propagation was never observed
+    // either way. That is reported as unattributed loss, because the
+    // alternative — naming the last hop that happened to answer — accuses a
+    // router of dropping traffic on the strength of its own ICMP policy.
+    let mut attributed: Option<&HopObs> = None;
+    let mut blind: Option<&HopObs> = None;
     for (i, hop) in path.hops.iter().enumerate() {
         if hop.silent || hop.loss_pct < 5.0 {
             continue;
         }
-        let later_also_lossy = path.hops[i + 1..]
-            .iter()
-            .filter(|h| !h.silent)
-            .any(|h| h.loss_pct >= 5.0);
-        let is_last = path.hops[i + 1..].iter().all(|h| h.silent);
-        if later_also_lossy || is_last {
-            culprit = Some(hop);
+        let later: Vec<&HopObs> = path.hops[i + 1..].iter().filter(|h| !h.silent).collect();
+        if later.iter().any(|h| h.loss_pct >= 5.0) {
+            attributed = Some(hop);
             break;
         }
+        if later.is_empty() {
+            blind.get_or_insert(hop);
+        }
+        // Otherwise later hops answered and are clean: ICMP rate limiting,
+        // not a finding. Keep scanning for a hop whose loss does propagate.
     }
-    let hop = culprit?;
+
+    let hop = attributed.or(blind)?;
+    let propagates = attributed.is_some();
 
     let mut d = Detection::new(
         "path.high_loss",
@@ -2163,30 +2226,80 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
     );
     d.evidence
         .push(Evidence::new("path.hop_loss", hop.loss_pct, "%").with_window(60, 1));
+
+    // Each check states what this trace showed. The strings used to be fixed,
+    // so "loss propagates to later hops" and "later hops lose packets too"
+    // were printed in the branch where nothing after the hop answered.
+    let propagation = if propagates {
+        CheckResult::pass(
+            "loss_propagates_to_later_hops",
+            "loss propagates to later hops",
+            format!("{:.0}% at hop {} and beyond", hop.loss_pct, hop.number),
+        )
+    } else {
+        CheckResult::skipped(
+            "loss_propagates_to_later_hops",
+            "loss propagates to later hops",
+            "every hop after this one is silent, so propagation was not observed",
+        )
+    };
+    let later_clean = if propagates {
+        CheckResult::fail(
+            "later_hops_are_clean",
+            "later hops are clean",
+            "later hops lose packets too, so this is real loss",
+        )
+    } else {
+        CheckResult::skipped(
+            "later_hops_are_clean",
+            "later hops are clean",
+            "no hop after this one answered, so there is nothing to compare",
+        )
+    };
+    let destination = match path.destination_reached {
+        Some(true) => CheckResult::pass(
+            "destination_answered_the_trace",
+            "destination answered the trace",
+            format!("{} replied, so the path completes", path.target),
+        )
+        .weighted(2.0),
+        Some(false) => CheckResult::fail(
+            "destination_answered_the_trace",
+            "destination answered the trace",
+            format!("{} never replied to the trace", path.target),
+        )
+        .weighted(2.0),
+        None => CheckResult::skipped(
+            "destination_answered_the_trace",
+            "destination answered the trace",
+            "this trace cannot tell whether the destination answered",
+        )
+        .weighted(2.0),
+    };
+
+    let hop_label = format!(
+        "hop {} ({})",
+        hop.number,
+        hop.ip.as_deref().unwrap_or("unknown")
+    );
     d.causes = vec![
         Cause::new(
             "hop_dropping",
-            format!(
-                "hop {} ({}) is dropping traffic",
-                hop.number,
-                hop.ip.as_deref().unwrap_or("unknown")
-            ),
-            vec![CheckResult::pass(
-                "loss_propagates_to_later_hops",
-                "loss propagates to later hops",
-                format!("{:.0}% at hop {} and beyond", hop.loss_pct, hop.number),
-            )],
+            format!("{hop_label} is dropping traffic"),
+            vec![propagation, destination.clone()],
         ),
         Cause::new(
             "icmp_rate_limit",
             "the hop is rate-limiting icmp rather than losing traffic",
-            vec![CheckResult::fail(
-                "later_hops_are_clean",
-                "later hops are clean",
-                "later hops lose packets too, so this is real loss",
-            )],
+            vec![later_clean, destination],
         ),
     ];
+    if !propagates {
+        d.scope.note = Some(format!(
+            "every hop after {hop_label} is silent — the trace lost packets, \
+             but no hop can be blamed for it"
+        ));
+    }
     d.remediation = vec![
         Step::instruct(
             "try a different path",
@@ -2247,46 +2360,63 @@ fn socket_detection(
                 d.evidence
                     .push(Evidence::new("tcp.retrans", retrans as f64, "").with_window(60, 60));
             }
-            d.causes = vec![
+            // Localisation needs the loaded/idle comparison. Without it the
+            // only measurement in hand is "rtt is high while this socket
+            // sends", which a queue at either end explains equally well — and
+            // an intercontinental peer explains without any queue at all. The
+            // cause named below changes with the evidence, so the finding
+            // never claims a side it has not measured.
+            let localised = link_test_passed.is_some();
+            let queue_checks = vec![
+                match link_test_passed {
+                    Some(true) => CheckResult::pass(
+                        "link_level_bufferbloat_test_passed",
+                        "link-level bufferbloat test passed",
+                        "our uplink stays responsive under load",
+                    )
+                    .weighted(2.0),
+                    Some(false) => CheckResult::fail(
+                        "link_level_bufferbloat_test_passed",
+                        "link-level bufferbloat test passed",
+                        "our own uplink bloats under load too",
+                    )
+                    .weighted(2.0),
+                    None => CheckResult::skipped(
+                        "link_level_bufferbloat_test_passed",
+                        "link-level bufferbloat test passed",
+                        "no loaded-rtt test has run, so the queue cannot be placed",
+                    )
+                    .weighted(2.0),
+                },
+                if s.tx_bps > 0.0 {
+                    CheckResult::pass(
+                        "rtt_tracks_this_socket_s_own_tx",
+                        "rtt tracks this socket's own tx",
+                        format!("{} in flight while rtt is {rtt:.0}ms", rate(s.tx_bps)),
+                    )
+                } else {
+                    CheckResult::fail(
+                        "rtt_tracks_this_socket_s_own_tx",
+                        "rtt tracks this socket's own tx",
+                        "socket is idle",
+                    )
+                },
+            ];
+            let queue = if localised {
                 Cause::new(
                     "receiver_queueing",
                     "the receiver is queueing — its buffer, not ours",
-                    vec![
-                        match link_test_passed {
-                            Some(true) => CheckResult::pass(
-                                "link_level_bufferbloat_test_passed",
-                                "link-level bufferbloat test passed",
-                                "our uplink stays responsive under load",
-                            )
-                            .weighted(2.0),
-                            Some(false) => CheckResult::fail(
-                                "link_level_bufferbloat_test_passed",
-                                "link-level bufferbloat test passed",
-                                "our own uplink bloats under load too",
-                            )
-                            .weighted(2.0),
-                            None => CheckResult::skipped(
-                                "link_level_bufferbloat_test_passed",
-                                "link-level bufferbloat test passed",
-                                "no loaded-rtt test has run",
-                            )
-                            .weighted(2.0),
-                        },
-                        if s.tx_bps > 0.0 {
-                            CheckResult::pass(
-                                "rtt_tracks_this_socket_s_own_tx",
-                                "rtt tracks this socket's own tx",
-                                format!("{} in flight while rtt is {rtt:.0}ms", rate(s.tx_bps)),
-                            )
-                        } else {
-                            CheckResult::fail(
-                                "rtt_tracks_this_socket_s_own_tx",
-                                "rtt tracks this socket's own tx",
-                                "socket is idle",
-                            )
-                        },
-                    ],
-                ),
+                    queue_checks,
+                )
+            } else {
+                Cause::new(
+                    "unlocalised_queueing",
+                    "something is queueing; which end is unmeasured",
+                    queue_checks,
+                )
+            };
+            d.causes = vec![
+                queue,
                 Cause::new(
                     "path_loss",
                     "loss on the path",
@@ -2300,16 +2430,37 @@ fn socket_detection(
                     vec![path_loss_check(&s.remote, obs)],
                 ),
             ];
-            d.remediation = vec![
-                Step::instruct(
-                    "nothing to fix locally",
-                    "the queue is on the receiver; the report names the peer",
-                ),
-                Step::escalate(
-                    "tell whoever runs the peer",
-                    "ask for fq_codel or cake on its egress",
-                ),
-            ];
+            d.remediation = if localised {
+                vec![
+                    Step::instruct(
+                        "nothing to fix locally",
+                        "the queue is on the receiver; the report names the peer",
+                    ),
+                    Step::escalate(
+                        "tell whoever runs the peer",
+                        "ask for fq_codel or cake on its egress",
+                    ),
+                ]
+            } else {
+                vec![Step::instruct(
+                    "run the loaded-rtt test to place the queue",
+                    "it compares idle and loaded rtt on your own uplink; until it \
+                     runs, neither end can be blamed",
+                )]
+            };
+            if !localised {
+                // The rule's catalogue title says "receiver-side
+                // bufferbloat". Leaving it on a finding that could not place
+                // the queue puts the claim back in the headline, which is the
+                // line most people read and the only one a copied summary
+                // carries.
+                d.title = "socket queueing, side unmeasured".into();
+                d.scope.note = Some(
+                    "rtt is high while this socket sends, but no loaded-rtt test has \
+                     run — a distant peer looks the same as a queue"
+                        .into(),
+                );
+            }
             d
         }
         SocketVerdict::RetransBurst => {
@@ -2391,6 +2542,11 @@ fn socket_detection(
         processes: s.process.iter().cloned().collect(),
         destinations: 1,
         flows: 1,
+        via_iface: None,
+        via_resolver: None,
+        // A socket finding is about one flow, so attribution was attempted.
+        // Whether it produced a name is what the label now distinguishes.
+        processes_measured: true,
         note: None,
     };
     Some(d)
@@ -2917,6 +3073,7 @@ mod tests {
         let obs = Observations {
             sockets: vec![bloated_socket()],
             paths: vec![PathObs {
+                destination_reached: Some(true),
                 target: "10.88.0.3".into(),
                 hops,
                 previous: None,
@@ -2960,6 +3117,46 @@ mod tests {
     }
 
     #[test]
+    fn without_a_loaded_rtt_test_the_queue_is_not_placed_on_the_receiver() {
+        // A stable distant peer looks exactly like this: high rtt while the
+        // socket sends. Calling it receiver-side bufferbloat, and telling the
+        // operator to go and ask the peer's owner for fq_codel, needs the
+        // loaded/idle comparison that has not run here.
+        let obs = Observations {
+            sockets: vec![bloated_socket()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "tcp.bufferbloat_remote")
+            .expect("the socket is still worth surfacing");
+        assert!(
+            d.causes.iter().all(|c| c.id != "receiver_queueing"),
+            "no measurement placed the queue at the receiver"
+        );
+        let queue = d
+            .causes
+            .iter()
+            .find(|c| c.id == "unlocalised_queueing")
+            .expect("the unlocalised cause takes its place");
+        assert_ne!(queue.confidence(), super::super::issue::Confidence::Strong);
+        assert!(queue.sufficient_evidence().is_empty());
+        assert!(
+            d.remediation
+                .iter()
+                .any(|s| s.text.contains("loaded-rtt test")),
+            "the useful next move is the test that would localise it"
+        );
+        assert!(d.remediation.iter().all(|s| !s.text.contains("peer")));
+        assert_eq!(
+            d.title, "socket queueing, side unmeasured",
+            "the headline is the line a copied summary carries, so it cannot \
+             name a side either"
+        );
+    }
+
+    #[test]
     fn a_bloated_uplink_opens_the_local_issue_too() {
         let obs = Observations {
             sockets: vec![bloated_socket()],
@@ -2987,7 +3184,7 @@ mod tests {
             addr: Some("192.168.8.1".into()),
             rtt_ms: None,
             loss_pct: 100.0,
-            arp_ok: false,
+            arp_ok: Some(false),
             icmp_ok: false,
             internet_reachable: Some(false),
         }
@@ -3008,6 +3205,93 @@ mod tests {
         assert!(
             detect(&obs, &store(), &Thresholds::default()).is_empty(),
             "the internet answered through this gateway — it is plainly up"
+        );
+    }
+
+    #[test]
+    fn an_unprobed_arp_is_never_rendered_as_a_failed_arp() {
+        // netwatch sends no ARP of its own, so `arp_ok` is `None` on every
+        // live host. It used to mirror the ICMP result, which made both
+        // checks assert a probe that never ran — worst on an unprivileged
+        // run, where ICMP cannot be sent either.
+        let obs = Observations {
+            gateway: Some(GatewayObs {
+                arp_ok: None,
+                ..dead_gateway()
+            }),
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "gateway.unreachable")
+            .expect("nothing answers anywhere — still a real outage");
+        for cause in &d.causes {
+            for check in &cause.checks {
+                if check.id == "arp_resolves" || check.id == "arp_fails" {
+                    assert!(
+                        check.passed.is_none(),
+                        "{} claimed {:?} about an arp probe that never ran",
+                        check.id,
+                        check.passed
+                    );
+                }
+            }
+        }
+        // And an unmeasured probe cannot carry the cause it would have
+        // discriminated: its corroborating check is skipped, so the cause
+        // stays short of strong.
+        let vlan = d
+            .causes
+            .iter()
+            .find(|c| c.id == "wrong_vlan_or_address_conflict")
+            .expect("cause present");
+        assert!(vlan.checks.iter().any(|k| k.passed.is_none()));
+        assert_ne!(vlan.confidence(), super::super::issue::Confidence::Strong);
+    }
+
+    #[test]
+    fn a_private_answer_keeps_split_horizon_on_the_table() {
+        // A private answer for a public name is the signature of an internal
+        // zone as much as of an interceptor. The check used to be inverted,
+        // so the benign explanation scored 0.0 in exactly the case where it
+        // applies.
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.cross = Some(DnsCross {
+            name: "dns.google".into(),
+            local: vec!["10.0.0.1".into()],
+            reference_resolver: "1.1.1.1".into(),
+            reference: vec!["8.8.8.8".into()],
+            validated: true,
+            private_answer: true,
+            mismatch_pct: 100.0,
+            cycles: 1,
+        });
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.hijack_suspect")
+            .expect("private answer fires the rule");
+        let split = d
+            .causes
+            .iter()
+            .find(|c| c.id == "split_horizon")
+            .expect("cause present");
+        assert_eq!(
+            split.score(),
+            Some(1.0),
+            "the private answer supports an intentional internal zone too"
+        );
+        let interceptor = d
+            .causes
+            .iter()
+            .find(|c| c.id == "interceptor")
+            .expect("cause present");
+        assert_eq!(
+            split.score(),
+            interceptor.score(),
+            "nothing measured separates the two, so neither may outrank the other"
         );
     }
 
@@ -3087,6 +3371,7 @@ mod tests {
             hops: current,
             previous: Some(previous),
             traced_at: "2026-09-03 06:44:02".into(),
+            destination_reached: Some(true),
         };
         let d = detect_path_change(&path).unwrap();
         assert_eq!(
@@ -3130,11 +3415,96 @@ mod tests {
             hops,
             previous: None,
             traced_at: "now".into(),
+            destination_reached: Some(true),
         };
         assert!(
             detect_path_loss(&path).is_none(),
             "a silent middle hop with clean hops after it is icmp rate-limiting"
         );
+    }
+
+    #[test]
+    fn a_silent_tail_after_a_lossy_hop_blames_nobody() {
+        // The hop that answers last used to be named the culprit whenever
+        // every hop behind it was silent — the normal shape of a firewalled
+        // tail. Rate-limiting its own ICMP became "hop 2 is dropping
+        // traffic", with evidence text asserting a propagation nobody saw.
+        let mut hops = vec![
+            hop(1, "192.168.8.1", "-", 1.0),
+            hop(2, "100.64.0.1", "as7545", 8.0),
+            hop(3, "203.0.113.9", "as7545", 12.0),
+        ];
+        hops[1].loss_pct = 30.0;
+        hops[2].silent = true;
+        hops[2].loss_pct = 100.0;
+        hops[2].ip = None;
+        let path = PathObs {
+            target: "1.1.1.1".into(),
+            hops,
+            previous: None,
+            traced_at: "now".into(),
+            destination_reached: None,
+        };
+        let d = detect_path_loss(&path).expect("the trace did lose packets");
+        let propagation = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "loss_propagates_to_later_hops")
+            .unwrap();
+        assert!(
+            propagation.passed.is_none(),
+            "propagation was never observed, so it cannot be claimed either way"
+        );
+        for check in d.causes.iter().flat_map(|c| &c.checks) {
+            assert!(
+                !check.detail.contains("and beyond"),
+                "{}: {} — asserts a propagation this branch did not see",
+                check.id,
+                check.detail
+            );
+        }
+        assert!(d
+            .scope
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no hop can be blamed"));
+        for cause in &d.causes {
+            assert_ne!(
+                cause.confidence(),
+                super::super::issue::Confidence::Strong,
+                "{} outran the evidence",
+                cause.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_reached_destination_is_recorded_on_both_causes() {
+        let mut hops = vec![
+            hop(1, "192.168.8.1", "-", 1.0),
+            hop(2, "100.64.0.1", "as7545", 8.0),
+            hop(3, "203.0.113.9", "as7545", 12.0),
+        ];
+        hops[1].loss_pct = 22.0;
+        hops[2].loss_pct = 24.0;
+        let path = PathObs {
+            target: "1.1.1.1".into(),
+            hops,
+            previous: None,
+            traced_at: "now".into(),
+            destination_reached: Some(true),
+        };
+        let d = detect_path_loss(&path).unwrap();
+        for cause in &d.causes {
+            let dest = cause
+                .checks
+                .iter()
+                .find(|k| k.id == "destination_answered_the_trace")
+                .expect("both causes carry the destination check");
+            assert_eq!(dest.passed, Some(true));
+        }
     }
 
     #[test]
@@ -3151,6 +3521,7 @@ mod tests {
             hops,
             previous: None,
             traced_at: "now".into(),
+            destination_reached: Some(true),
         };
         let d = detect_path_loss(&path).unwrap();
         assert_eq!(d.rule, "path.high_loss");
@@ -3310,11 +3681,12 @@ mod tests {
                 addr: Some("192.168.8.1".into()),
                 rtt_ms: Some(1.4),
                 loss_pct: 0.0,
-                arp_ok: true,
+                arp_ok: Some(true),
                 icmp_ok: true,
                 internet_reachable: Some(true),
             }),
             paths: vec![PathObs {
+                destination_reached: Some(true),
                 target: "1.1.1.1".into(),
                 hops: vec![HopObs {
                     number: 1,
@@ -3361,6 +3733,11 @@ mod target_tests {
 
     fn healthy() -> TargetObs {
         TargetObs {
+            stale_after_secs: None,
+            attempts: vec![],
+            effective_endpoint: None,
+            sni: None,
+            http_authority: None,
             baseline_key: None,
             name: "api".into(),
             host: "api.corp.internal".into(),

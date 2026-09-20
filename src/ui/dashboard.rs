@@ -21,6 +21,10 @@ const KPI_ROWS: u16 = 5;
 const MID_ROWS: u16 = 14;
 /// The incident timeline, when the screen is tall enough to earn it.
 const TIMELINE_ROWS: u16 = 6;
+
+/// Rows the interfaces panel needs to show its border, header and one
+/// interface. Below this it has nothing to say that its title does not.
+const IFACE_MIN_ROWS: u16 = 4;
 /// How far back the KPI tiles' sparklines look.
 ///
 /// Fixed, and the same for every tile, because the five sit in one row and are
@@ -30,6 +34,12 @@ const TIMELINE_ROWS: u16 = 6;
 /// throughput tile showing one, at identical width. Same column, different
 /// moment, no way to tell.
 const KPI_WINDOW_SECS: u64 = 300;
+
+/// How far apart rx and tx peaks have to be before the throughput mirror
+/// gives each half its own scale. At 20× the quieter direction is under one
+/// row of a ten-row half, which renders as an empty panel rather than a small
+/// one.
+const SPLIT_SCALE_RATIO: u64 = 20;
 /// Below this the timeline is dropped rather than squeezing the connections
 /// list, which is the panel a reader is actually working in.
 const TIMELINE_MIN_HEIGHT: u16 = 38;
@@ -46,13 +56,21 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     // interfaces falls back to sharing the throughput row, which is a graph
     // and shrinks without losing meaning.
     let iface_beside_conns = area.width >= IFACE_BESIDE_CONNS_MIN_W;
+    // Where the timeline goes. Stacked under interfaces it shares the column
+    // that already holds the other per-interface context, and the connections
+    // table keeps the full height of the row instead of giving six of its
+    // rows to a strip that spans the screen. A narrow layout has no such
+    // column — interfaces is up in the throughput row — so it keeps the
+    // full-width strip.
+    let timeline_under_interfaces = show_timeline && iface_beside_conns;
+    let timeline_full_width = show_timeline && !iface_beside_conns;
     let mut constraints = vec![
         Constraint::Length(3),        // header
         Constraint::Length(KPI_ROWS), // hero row
         Constraint::Length(MID_ROWS), // throughput, and interfaces when narrow
-        Constraint::Min(6),           // connections, and interfaces when wide
+        Constraint::Min(6),           // connections, interfaces and timeline
     ];
-    if show_timeline {
+    if timeline_full_width {
         constraints.push(Constraint::Length(TIMELINE_ROWS));
     }
     constraints.push(Constraint::Length(3)); // footer
@@ -65,8 +83,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     widgets::render_header(f, app, chunks[0]);
     render_kpi_strip(f, app, chunks[1]);
     render_mid_section(f, app, chunks[2], iface_beside_conns);
-    render_bottom_section(f, app, chunks[3], iface_beside_conns);
-    if show_timeline {
+    render_bottom_section(
+        f,
+        app,
+        chunks[3],
+        iface_beside_conns,
+        timeline_under_interfaces,
+    );
+    if timeline_full_width {
         render_timeline(f, app, chunks[4]);
     }
     render_footer(f, app, chunks[chunks.len() - 1]);
@@ -227,6 +251,7 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
         Reading::baselined(app, &gw_subject, "gateway.rtt", hs.gateway_rtt_ms),
         &gw_history,
         probe_secs,
+        &["gateway."],
     );
 
     render_kpi_tile(
@@ -239,6 +264,7 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
         Reading::baselined(app, &dns_subject, "dns.rtt_p50", hs.dns_rtt_ms),
         &dns_history,
         probe_secs,
+        &["dns."],
     );
 
     render_kpi_tile(
@@ -251,6 +277,7 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
         Reading::baselined(app, "internet", "path.rtt", hs.internet_rtt_ms),
         &net_history,
         probe_secs,
+        &["path."],
     );
 
     // Loss has no learned distribution: the only healthy value is zero, so
@@ -285,6 +312,7 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
         ),
         &loss_history,
         probe_secs,
+        &["path.high_loss", "gateway.unreachable"],
     );
 
     // Retransmits per minute across every socket with tcp_info, and where they
@@ -313,6 +341,7 @@ fn render_kpi_strip(f: &mut Frame, app: &App, area: Rect) {
         Reading::plain(retrans_detail, retrans_color),
         &[],
         probe_secs,
+        &["tcp.retrans_burst"],
     );
 }
 
@@ -357,6 +386,21 @@ fn session_retrans(app: &App) -> (f64, Option<(String, f64)>) {
 /// dot in front of the number: a coloured bullet is a fifth thing on the row
 /// competing with four that carry meaning, and the spec reserves status colour
 /// for the value's relationship to its threshold.
+/// Whether Diagnose has an open finding behind a tile's alarm colour.
+///
+/// A tile alarms on a threshold; Diagnose opens an issue only once a
+/// condition has been confirmed across samples and its rule has the evidence
+/// it needs. The two disagreeing is normal and often correct — but a red
+/// border beside a status line reading "no issues" is a contradiction on
+/// screen, so the tile says which of the two it is.
+fn issue_behind(app: &App, rules: &[&str]) -> bool {
+    app.diagnose
+        .engine
+        .primary()
+        .iter()
+        .any(|i| rules.iter().any(|r| i.rule.starts_with(r)))
+}
+
 fn render_kpi_tile(
     f: &mut Frame,
     app: &App,
@@ -367,6 +411,8 @@ fn render_kpi_tile(
     reading: Reading,
     history: &[u64],
     secs_per_sample: u64,
+    // Diagnose rules that would explain this tile's alarm, if one fired.
+    rules: &[&str],
 ) {
     let t = &app.theme;
     // A tile only takes a coloured border when it is actually saying
@@ -439,9 +485,13 @@ fn render_kpi_tile(
 
     // Row 1 — the baseline. Row 2 — when it started, if it has.
     if inner.height >= 2 {
+        let mut detail = reading.detail.clone();
+        if alarmed && !issue_behind(app, rules) {
+            detail.push_str(" · no issue raised");
+        }
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                widgets::ellipsise(&reading.detail, inner.width.saturating_sub(2) as usize),
+                widgets::ellipsise(&detail, inner.width.saturating_sub(2) as usize),
                 Style::default().fg(t.text_muted),
             ))),
             row(1),
@@ -506,7 +556,13 @@ fn render_mid_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conns: 
     render_interfaces(f, app, cols[1]);
 }
 
-fn render_bottom_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conns: bool) {
+fn render_bottom_section(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    iface_beside_conns: bool,
+    timeline_under_interfaces: bool,
+) {
     if !iface_beside_conns {
         render_connections(f, app, area);
         return;
@@ -520,7 +576,50 @@ fn render_bottom_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conn
         .split(area);
 
     render_connections(f, app, cols[0]);
-    render_interfaces(f, app, cols[1]);
+    // The stacked pair needs a panel's worth of rows each. Below that the
+    // timeline's own guard would blank its contents and leave an empty
+    // bordered box under interfaces, which is worse than no timeline.
+    if !timeline_under_interfaces || cols[1].height < IFACE_MIN_ROWS + TIMELINE_ROWS {
+        render_interfaces(f, app, cols[1]);
+        return;
+    }
+
+    // Interfaces takes what its rows need; the timeline takes the rest. Sized
+    // the other way round, a host with one interface left a panel of empty
+    // bordered space above a timeline squeezed into its minimum.
+    let iface_rows = interfaces_height(app, cols[1].height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(iface_rows),
+            Constraint::Min(TIMELINE_ROWS),
+        ])
+        .split(cols[1]);
+    render_interfaces(f, app, rows[0]);
+    render_timeline(f, app, rows[1]);
+}
+
+/// Rows the interfaces panel needs: a border pair, the header, one row per
+/// interface that is up, and the idle summary line.
+///
+/// Capped so that the timeline below it always gets its minimum, and floored
+/// at a panel that can still show its header — below that the panel's own
+/// guard blanks it.
+fn interfaces_height(app: &App, available: u16) -> u16 {
+    let interfaces = app.traffic.interfaces();
+    let up = active_ifaces(&interfaces, &app.interface_info).len() as u16;
+    interfaces_height_for(up, available)
+}
+
+/// Split out from [`interfaces_height`] so the arithmetic is testable without
+/// an `App`.
+fn interfaces_height_for(up: u16, available: u16) -> u16 {
+    // Border pair, header, one row per interface that is up, idle summary.
+    let wanted = 2 + 1 + up + 1;
+    wanted.clamp(
+        IFACE_MIN_ROWS,
+        available.saturating_sub(TIMELINE_ROWS).max(IFACE_MIN_ROWS),
+    )
 }
 
 /// Throughput, mirrored around a shared zero line.
@@ -533,6 +632,24 @@ fn render_bottom_section(f: &mut Frame, app: &App, area: Rect, iface_beside_conn
 ///
 /// Now both series share one maximum, rx grows up from the middle and tx grows
 /// down, and the axis is labelled at the top, the zero line and the bottom.
+///
+/// The one exception is a very lopsided link. At 16 MB/s down and 61 KB/s up
+/// the entire tx half falls below a single row, so half the panel renders
+/// empty and "almost idle" cannot be told from "nothing at all". Past
+/// [`SPLIT_SCALE_RATIO`] the halves take their own maxima, and the axis
+/// labels — which then differ — are what says so.
+/// Whether the two halves of the throughput mirror need their own scales.
+///
+/// Both directions have to be carrying something: one idle direction renders
+/// as an empty half either way, and splitting there would magnify noise into
+/// a full-height bar.
+fn split_scale(rx_peak: u64, tx_peak: u64) -> bool {
+    if rx_peak == 0 || tx_peak == 0 {
+        return false;
+    }
+    rx_peak / tx_peak >= SPLIT_SCALE_RATIO || tx_peak / rx_peak >= SPLIT_SCALE_RATIO
+}
+
 fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let interfaces = app.traffic.interfaces();
@@ -553,6 +670,12 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
         .copied()
         .max()
         .unwrap_or(0);
+    let rx_peak = agg_rx.iter().copied().max().unwrap_or(0);
+    let tx_peak = agg_tx.iter().copied().max().unwrap_or(0);
+    // Split only when the quieter direction would otherwise be invisible, and
+    // only when it has something to show: two empty halves are still better
+    // read against one scale.
+    let split = split_scale(rx_peak, tx_peak);
     let mean = {
         let n = agg_rx.len() + agg_tx.len();
         if n == 0 {
@@ -620,15 +743,27 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
     // Both halves share one maximum — that is the point of the mirror — and
     // one zero line, which the graph module owns so the two halves cannot
     // each draw their own.
-    let scale = if log { log_scale(peak) } else { peak.max(1) };
+    let axis_scale = |v: u64| {
+        if log {
+            log_scale(v)
+        } else {
+            v.max(1)
+        }
+    };
+    let (rx_scale, tx_scale) = if split {
+        (axis_scale(rx_peak), axis_scale(tx_peak))
+    } else {
+        (axis_scale(peak), axis_scale(peak))
+    };
     let rx_plot = maybe_log(&agg_rx, log);
     let tx_plot = maybe_log(&agg_tx, log);
-    let rx_h = crate::graph::render_mirrored_with_max(
+    let rx_h = crate::graph::render_mirrored_scaled(
         f.buffer_mut(),
         plot,
         &rx_plot,
         &tx_plot,
-        scale,
+        rx_scale,
+        tx_scale,
         app.graph_style,
         t.rx_rate,
         t.tx_rate,
@@ -652,12 +787,24 @@ fn render_throughput_chart(f: &mut Frame, app: &App, area: Rect) {
             },
         );
     };
-    label(inner.y, axis_label.clone());
+    // On a split scale the two labels differ, which is the only signal that
+    // the halves are no longer to the same scale. Keep both.
+    let rx_label = if split {
+        widgets::format_bytes_total(rx_peak.max(1))
+    } else {
+        axis_label.clone()
+    };
+    let tx_label = if split {
+        widgets::format_bytes_total(tx_peak.max(1))
+    } else {
+        axis_label
+    };
+    label(inner.y, rx_label);
     if rx_h > 0 {
         label(inner.y + rx_h - 1, "0".to_string());
     }
     if tx_h > 1 {
-        label(inner.y + rx_h + tx_h - 1, axis_label);
+        label(inner.y + rx_h + tx_h - 1, tx_label);
     }
 
     // x-axis, derived from how many samples the plot is actually showing.
@@ -1976,6 +2123,39 @@ mod tests {
 
     /// Groups are ranked by the same rule as sockets were, so the panel's
     /// promise ("worst first") survives the change of row granularity.
+    #[test]
+    fn interfaces_keeps_the_timeline_its_rows() {
+        // One interface: the panel asks for five rows and gets them.
+        assert_eq!(interfaces_height_for(1, 24), 5);
+        // Eight interfaces still fit: 2 borders, a header, eight rows and the
+        // idle line.
+        assert_eq!(interfaces_height_for(8, 24), 12);
+        // Twenty would take the whole column, so the panel is capped at
+        // whatever leaves the timeline its minimum.
+        assert_eq!(interfaces_height_for(20, 24), 24 - TIMELINE_ROWS);
+        // A column too short for both: interfaces keeps its floor, and the
+        // caller's guard is what stops the timeline being drawn at all.
+        assert_eq!(interfaces_height_for(4, 8), IFACE_MIN_ROWS);
+        assert_eq!(interfaces_height_for(1, 0), IFACE_MIN_ROWS);
+    }
+
+    #[test]
+    fn a_lopsided_link_gets_a_scale_per_direction() {
+        // 16 MB/s down, 61 KB/s up: on one scale the whole tx half is under a
+        // single row, so it renders empty and "almost idle" cannot be told
+        // from "nothing at all".
+        assert!(split_scale(16_000_000, 61_000));
+        assert!(split_scale(61_000, 16_000_000), "either direction");
+        // A comparable pair keeps the shared scale — that comparison is what
+        // the mirror is for.
+        assert!(!split_scale(4_000_000, 1_000_000));
+        assert!(!split_scale(1_000, 999));
+        // An idle direction stays flat rather than having its noise magnified
+        // to full height.
+        assert!(!split_scale(16_000_000, 0));
+        assert!(!split_scale(0, 0));
+    }
+
     #[test]
     fn groups_rank_by_concern_not_throughput() {
         let mut groups = [

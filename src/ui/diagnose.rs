@@ -45,6 +45,24 @@ pub struct View<'a> {
     pub demo_banner: Option<String>,
     /// Tests running against the selected issue.
     pub running_tests: Vec<String>,
+    /// Recent samples of the selected issue's headline metric.
+    ///
+    /// The detail pane used to print the numbers and stop, which left the
+    /// reader to imagine the shape: a spike that has already passed and one
+    /// that is still climbing read identically as "40 ms". The caller owns
+    /// the mapping from metric to series, so this module stays presentation.
+    pub history: Option<MetricHistory>,
+}
+
+/// Recent samples behind an issue's headline metric.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricHistory {
+    pub metric: String,
+    /// Oldest first, in the metric's own unit.
+    pub samples: Vec<f64>,
+    /// The value the rule compares against, when it has one.
+    pub threshold: Option<f64>,
+    pub unit: String,
 }
 
 /// The AI commentary block's state.
@@ -95,6 +113,35 @@ impl<'a> View<'a> {
     }
 }
 
+/// Recent samples behind the selected issue's headline metric.
+///
+/// Only the health probes keep a series netwatch can show: gateway, resolver
+/// and internet RTT. Everything else returns `None` and the pane prints the
+/// numbers alone, which is what it did for every issue until now.
+fn selected_history(app: &crate::app::App) -> Option<MetricHistory> {
+    let issues = app.diagnose.engine.primary();
+    let issue = issues.get(app.diagnose.selected)?;
+    let headline = issue.headline()?;
+    let hs = app.health_prober.status();
+    let samples: Vec<f64> = match headline.metric.as_str() {
+        "gateway.rtt" => hs.gateway_rtt_history.iter().flatten().copied().collect(),
+        "dns.rtt_p50" => hs.dns_rtt_history.iter().flatten().copied().collect(),
+        "path.rtt" => hs.internet_rtt_history.iter().flatten().copied().collect(),
+        _ => return None,
+    };
+    if samples.len() < 4 {
+        return None;
+    }
+    Some(MetricHistory {
+        metric: headline.metric.clone(),
+        // The rule's own verify threshold, which is the line the issue
+        // closes on — not a second number invented for the chart.
+        threshold: (issue.verify.metric == headline.metric).then_some(issue.verify.threshold),
+        unit: headline.unit.clone(),
+        samples,
+    })
+}
+
 pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
     // Present whenever the feature is enabled — a collector that exists but
     // cannot reach a model still has something to tell the user.
@@ -120,6 +167,7 @@ pub fn render(f: &mut Frame, app: &crate::app::App, area: Rect) {
         running_tests: selected_issue(app)
             .map(|id| app.diagnose.tests.running_for(&id))
             .unwrap_or_default(),
+        history: selected_history(app),
     };
     // The header's verdict row is suppressed here: this tab *is* the verdict,
     // and the body renders it in full a line below. Two copies of the same
@@ -183,7 +231,7 @@ fn coverage_details(
         "path" => times.path,
         "nat" => times.health.nat,
         "egress" => times.egress,
-        "target" => times.targets,
+        "target" => times.targets.values().copied().max(),
         "tcp" if row.rule == "tcp.bufferbloat_local" => {
             app.diagnose.sampler.load_test.map(|(at, _, _)| at)
         }
@@ -603,8 +651,12 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
     let verdict = view.engine.verdict(view.baselines);
 
     let coverage = view.engine.coverage();
+    // "rules", not "checks": a check is one line of evidence inside a cause,
+    // and the coverage object counts catalogue rules. Two different numbers
+    // under one word made the generated coverage document read as though it
+    // described something else.
     let watching = format!(
-        "watching {} of {} checks",
+        "watching {} of {} rules",
         coverage
             .rules
             .iter()
@@ -793,8 +845,7 @@ fn render_main(f: &mut Frame, view: &View, area: Rect) {
     if left[1].height >= MIN_CHRONOLOGY_ROWS {
         render_chronology(f, view, left[1]);
     }
-    // Content-sized; the space under it stays empty. The full report is one
-    // key away (`o`), not squeezed in as filler.
+    // The detail takes the column's full height: it is what this tab is for.
     render_detail(f, view, columns[1]);
 }
 
@@ -1113,10 +1164,73 @@ fn render_issue_list(f: &mut Frame, view: &View, issues: &[&Issue], area: Rect) 
 ///
 /// The caller needs the height back: the pane is content-sized, and the space
 /// it does not need goes to the report preview rather than staying blank.
-fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
+/// The sparkline row and its caption.
+///
+/// Scaled to the series' own peak, so the shape is visible whatever the
+/// units; the caption carries the numbers, because a sparkline without one
+/// is a decoration.
+fn history_rows<'a>(
+    h: &MetricHistory,
+    issue: &crate::diagnose::issue::Issue,
+    t: &Theme,
+    width: u16,
+) -> Vec<Line<'a>> {
+    let cells = (width as usize).saturating_sub(4).clamp(8, 120);
+    let scale = 1000.0_f64;
+    let ints: Vec<u64> = h
+        .samples
+        .iter()
+        .map(|v| (v.max(0.0) * scale) as u64)
+        .collect();
+    let peak = ints.iter().copied().max().unwrap_or(0);
+    let glyphs = crate::graph::bar_row(&ints, cells, peak);
+    if glyphs.is_empty() {
+        return vec![];
+    }
+    // Colour per sample rather than per line: the point is which samples
+    // crossed, not that any did.
+    let shown = h.samples.len().saturating_sub(glyphs.len());
+    let severity = severity_color(issue.severity, t);
+    let mut spans = vec![Span::raw("  ")];
+    for (i, g) in glyphs.iter().enumerate() {
+        let above = h
+            .threshold
+            .is_some_and(|limit| h.samples[shown + i] > limit);
+        spans.push(Span::styled(
+            g.to_string(),
+            Style::default().fg(if above { severity } else { t.text_muted }),
+        ));
+    }
+    let mut caption = format!("  {}", h.metric);
+    if let Some(limit) = h.threshold {
+        caption.push_str(&format!(
+            " · threshold {}{}",
+            round_for_caption(limit),
+            h.unit
+        ));
+    }
+    caption.push_str(&format!(" · {} · now", plural(h.samples.len(), "sample")));
+    vec![
+        Line::from(spans),
+        Line::from(Span::styled(caption, Style::default().fg(t.text_muted))),
+    ]
+}
+
+/// Captions carry one decimal at most: the axis is a reminder of scale, not a
+/// reading.
+fn round_for_caption(v: f64) -> String {
+    if v >= 10.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+fn render_detail(f: &mut Frame, view: &View, area: Rect) {
     let t = view.theme;
     let Some(issue) = view.current() else {
-        let height = 4.min(area.height);
+        // The empty state keeps the same frame as a populated one, so the
+        // page does not change shape when the last issue closes.
         let block = widgets::Panel::new("detail").block(t);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1125,9 +1239,9 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
             )))
             .wrap(Wrap { trim: true })
             .block(block),
-            Rect { height, ..area },
+            area,
         );
-        return height;
+        return;
     };
 
     let mut lines: Vec<Line> = Vec::new();
@@ -1191,6 +1305,12 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
             )));
         }
     }
+    // The shape behind the number: one row of the recent samples, coloured
+    // where they sit above the rule's threshold.
+    if let Some(h) = view.history.as_ref().filter(|h| h.samples.len() >= 4) {
+        lines.extend(history_rows(h, issue, t, area.width));
+    }
+
     let scope = issue.scope.label();
     if !scope.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1219,9 +1339,15 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
                 // check-pass fraction, not a calibrated probability.
                 Span::styled(
                     format!(
-                        "  {} · {}",
+                        "  {} · {}{}",
                         cause.confidence().label(),
-                        cause.checks_label()
+                        cause.checks_label(),
+                        match cause.missing_discriminator() {
+                            // Name the measurement that would settle it, so
+                            // "likely" reads as a gap rather than a mood.
+                            Some(k) => format!(" · needs {}", k.name),
+                            None => String::new(),
+                        }
                     ),
                     Style::default().fg(t.text_muted),
                 ),
@@ -1456,31 +1582,17 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) -> u16 {
     .border(sev)
     .fit(area.width)
     .block(t);
-    // Content-sized, like every other panel: a box with fourteen blank rows
-    // under its last sentence reads as a pane that failed to load. Wrapped
-    // lines are counted at the pane's own width so the box does not clip the
-    // text it just measured.
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let rows: usize = lines
-        .iter()
-        .map(|l| {
-            let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-            if inner_w == 0 {
-                1
-            } else {
-                w.div_ceil(inner_w).max(1)
-            }
-        })
-        .sum();
-    let height = (rows as u16 + 2).min(area.height);
-
+    // Full height, unlike the panels beside it. This one is the page: an
+    // incident is what the tab is for, and a box that stops halfway down
+    // leaves the rest of the screen to a background nobody is reading. The
+    // earlier content-sized version was right for a panel among panels and
+    // wrong for the subject of the view.
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(block),
-        Rect { height, ..area },
+        area,
     );
-    height
 }
 
 /// `1 sample` / `2 samples`. English pluralisation, in one place, because
@@ -1609,6 +1721,7 @@ mod tests {
             status: None,
             demo_banner: None,
             running_tests: vec![],
+            history: None,
         };
         mutate(&mut view);
 
@@ -1754,6 +1867,68 @@ mod tests {
     }
 
     #[test]
+    fn the_detail_pane_shows_the_shape_behind_the_headline_number() {
+        // Printing "40 ms" and stopping leaves the reader to imagine the
+        // shape: a spike that has already passed and one still climbing read
+        // identically. The row is only drawn when there are samples to draw.
+        let quiet = draw(120, 40, |_| {});
+        let charted = draw(120, 40, |v| {
+            v.history = Some(MetricHistory {
+                metric: "dns.rtt_p50".into(),
+                samples: vec![1.0, 1.2, 1.1, 40.0, 41.0, 39.0],
+                threshold: Some(5.0),
+                unit: "ms".into(),
+            });
+        });
+        assert!(
+            !quiet.contains("threshold"),
+            "no series, no caption: {quiet}"
+        );
+        assert!(
+            charted.contains("dns.rtt_p50 · threshold 5.0ms · 6 samples · now"),
+            "{charted}"
+        );
+        assert!(
+            charted.chars().any(|c| "▁▂▃▄▅▆▇█".contains(c)),
+            "the row itself is missing: {charted}"
+        );
+    }
+
+    #[test]
+    fn only_the_samples_above_the_threshold_are_coloured() {
+        // The point is which samples crossed, not that any did — so the
+        // colour goes on individual glyphs, not the whole row.
+        let (engine, baselines) = fixture::run();
+        let theme = crate::theme::by_name("nord");
+        let view = View {
+            engine: &engine,
+            baselines: &baselines,
+            theme: &theme,
+            selected: 0,
+            show_report: false,
+            capability: Capability::Root,
+            ai: None,
+            endpoint: "local".to_string(),
+            status: None,
+            demo_banner: None,
+            running_tests: vec![],
+            history: Some(MetricHistory {
+                metric: "dns.rtt_p50".into(),
+                samples: vec![1.0, 1.0, 1.0, 40.0],
+                threshold: Some(5.0),
+                unit: "ms".into(),
+            }),
+        };
+        let issue = view.current().expect("fixture opens issues").clone();
+        let rows = history_rows(view.history.as_ref().unwrap(), &issue, &theme, 60);
+        let spans: Vec<_> = rows[0].spans.iter().skip(1).collect();
+        assert_eq!(spans.len(), 4);
+        let severity = severity_color(issue.severity, &theme);
+        assert_eq!(spans[0].style.fg, Some(theme.text_muted), "below threshold");
+        assert_eq!(spans[3].style.fg, Some(severity), "above threshold");
+    }
+
+    #[test]
     fn a_clear_engine_does_not_claim_health_it_has_not_earned() {
         use crate::diagnose::baseline::NetworkFingerprint;
         use crate::diagnose::engine::{Engine, SystemClock};
@@ -1773,6 +1948,7 @@ mod tests {
             status: None,
             demo_banner: None,
             running_tests: vec![],
+            history: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
@@ -2112,6 +2288,7 @@ mod tests {
                 status: None,
                 demo_banner: None,
                 running_tests: vec![],
+                history: None,
             };
             footer_hints(&v)
         };
@@ -2126,23 +2303,58 @@ mod tests {
     /// to the full column height, leaving fourteen blank rows under its last
     /// sentence — which reads as a pane that failed to load.
     #[test]
-    fn the_detail_pane_ends_where_its_content_ends() {
+    fn the_detail_pane_fills_the_page() {
+        // The incident is the subject of this tab, not a panel among panels:
+        // its frame runs to the bottom of the body rather than stopping at
+        // the last sentence and leaving the rest of the screen empty.
         let s = draw(150, 44, |_| {});
         let lines: Vec<&str> = s.lines().collect();
         let close = lines
             .iter()
             .rposition(|l| l.contains('╯'))
             .expect("a closed panel");
-        // Whatever sits above the closing corner must be content, not a run
-        // of empty rows padding the box out to the bottom of the screen.
-        let blank_tail = lines[..close]
+        let last_drawn = lines
             .iter()
-            .rev()
-            .take_while(|l| l.trim_matches(|c| c == '│' || c == ' ').is_empty())
-            .count();
+            .rposition(|l| !l.trim().is_empty())
+            .expect("something is drawn");
+        assert_eq!(
+            close, last_drawn,
+            "the detail frame should close on the last drawn row:\n{s}"
+        );
+    }
+
+    #[test]
+    fn an_empty_detail_pane_keeps_the_same_frame() {
+        use crate::diagnose::baseline::NetworkFingerprint;
+        use crate::diagnose::engine::{Engine, SystemClock};
+        let engine = Engine::new(Box::new(SystemClock));
+        let baselines = BaselineStore::new(NetworkFingerprint::new("eth0", None, vec![], None));
+        let theme = crate::theme::by_name("default");
+        let view = View {
+            engine: &engine,
+            baselines: &baselines,
+            theme: &theme,
+            selected: 0,
+            show_report: false,
+            capability: Capability::None,
+            ai: None,
+            endpoint: "local".to_string(),
+            status: None,
+            demo_banner: None,
+            running_tests: vec![],
+            history: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|f| render_detail(f, &view, f.size()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let bottom: String = (0..buf.area.width)
+            .map(|x| buf.get(x, buf.area.height - 1).symbol())
+            .collect();
         assert!(
-            blank_tail <= 2,
-            "{blank_tail} blank rows before the corner:\n{s}"
+            bottom.contains('╯'),
+            "the empty state closes at the bottom too: {bottom}"
         );
     }
 

@@ -145,7 +145,7 @@ pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
         rule: "dns.hijack_suspect",
         cause: "split_horizon",
-        checks: &["public_name_public_answer"],
+        checks: &["private_answer_for_a_public_name"],
     },
     CauseSpec {
         rule: "dns.slow_resolver",
@@ -192,12 +192,23 @@ pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
         rule: "path.high_loss",
         cause: "hop_dropping",
-        checks: &["loss_propagates_to_later_hops"],
+        checks: &[
+            "loss_propagates_to_later_hops",
+            "destination_answered_the_trace",
+        ],
     },
     CauseSpec {
         rule: "path.high_loss",
         cause: "icmp_rate_limit",
-        checks: &["later_hops_are_clean"],
+        checks: &["later_hops_are_clean", "destination_answered_the_trace"],
+    },
+    CauseSpec {
+        rule: "tcp.bufferbloat_remote",
+        cause: "unlocalised_queueing",
+        checks: &[
+            "link_level_bufferbloat_test_passed",
+            "rtt_tracks_this_socket_s_own_tx",
+        ],
     },
     CauseSpec {
         rule: "tcp.bufferbloat_remote",

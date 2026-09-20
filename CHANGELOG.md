@@ -2,9 +2,76 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.32.2] - 2026-09-20
 
 ### Added
+- `netwatch diagnose run [--target NAME] [--budget 30s] [--format json]`: one
+  bounded diagnosis with documented exit statuses — 0 no finding, 1 finding,
+  2 incomplete, 3 error. Exit 2 exists so a run that gathered nothing cannot
+  be read as a healthy host.
+- The Diagnose detail pane draws the recent samples behind an issue's headline
+  metric, with the samples above the rule's threshold coloured, so a spike that
+  has passed reads differently from one still climbing.
+- `netwatch diagnose coverage --doc` generates `docs/diagnostic-coverage.md`
+  from the rule catalogue, and `netwatch diagnose corpus` regenerates the
+  pinned replay corpus. Tests fail when either drifts from the code.
+- A CI job runs the Diagnose fault lab in an isolated namespace on every push.
+- The Egress tab shows how long since each process was last heard from, and
+  `H` toggles the programs seen only in earlier sessions, which are hidden by
+  default. Profiles persist as the drift baseline, so the tab used to open on
+  every program ever observed on the machine.
+
+### Changed
+- eBPF process attribution runs under the sandbox instead of being refused by
+  it. The worker enters with the filesystem policy applied, loads with the
+  capabilities the load needs, drops them, and only then reads an event. The
+  SDK's own reader thread inherits the filesystem policy but keeps its
+  capabilities until the SDK offers an entry hook; that residual is recorded
+  against the `ebpf-reader` component rather than left unsaid.
+- The Diagnose detail pane fills the page. An incident is what the tab is for,
+  and the pane used to stop at its last sentence.
+- The dashboard timeline moved under interfaces in the right-hand column, so
+  the connections table keeps the six rows the full-width strip was taking. A
+  layout too narrow for that column keeps the strip.
+- Diagnose no longer reports conclusions its evidence cannot support: a hop is
+  only blamed for loss that was observed to propagate, receiver-side
+  bufferbloat requires the loaded/idle comparison that places the queue, and a
+  cause whose discriminating check never ran cannot read as `strong`.
+- Confirmation and recovery are scoped per target: a target probed every ten
+  seconds can no longer confirm or close an issue about one probed every five
+  minutes.
+- Closing an issue by hand is recorded as such rather than as a measured
+  recovery credited to the last remediation step.
+- Suppression follows demonstrated dependency: a gateway failure no longer
+  demotes a target reached over a tunnel, and a resolver failure only explains
+  targets that resolved through it.
+- A target probe tries every resolved address rather than only the first, so
+  one dead address in a DNS answer no longer reports a working service as down.
+  The HTTP `Host` header now carries non-default ports and brackets IPv6
+  literals.
+- The throughput chart gives each direction its own scale when their peaks are
+  more than 20× apart, with both axis labels shown; otherwise the shared scale
+  is kept.
+- A dashboard tile that alarms without a matching Diagnose finding says "no
+  issue raised" rather than contradicting the "no issues" verdict beside it.
+- Muted text in the nord, dracula, solarized and sky themes, and the severity
+  red in sky, now meet WCAG contrast against their backgrounds; a test keeps
+  them there.
+
+### Fixed
+- Dense-view saturation labelled its ceiling `0 Mb` for any link under a
+  megabit, because the formatter divided integers by a million. It now reads
+  in Gb, Mb, Kb or bits. Wi-Fi shows this most: the kernel reports no link
+  speed, so the ceiling is the measured peak.
+- An ARP probe that never ran is reported as unmeasured instead of as a failed
+  ARP reply. Unprivileged runs printed "no arp reply from the gateway" on every
+  gateway finding.
+- Split-horizon DNS is no longer ruled out by its own signature: a private
+  answer for a public name supports it rather than refuting it.
+- An inconclusive re-run of a diagnostic test retracts the previous answer
+  instead of leaving the superseded one ranking causes.
+
+### Added (packaging)
 - `cargo binstall netwatch-tui` fetches the release binary instead of
   compiling, so it needs no Rust toolchain build and no libpcap headers.
 - A Fedora COPR repository: `sudo dnf copr enable matthart1983/netwatch`.

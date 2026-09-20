@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Lifetime of a cache entry after the matching kprobe last fired. Matches
@@ -119,71 +118,112 @@ impl EbpfAttributor {
 /// receiver into the attributor cache. Drop to stop the thread.
 pub struct ConnTracker {
     pub attributor: Arc<EbpfAttributor>,
-    /// `EventSource` is held to keep the BPF programs attached for the
-    /// lifetime of the tracker. Dropping it detaches the kprobe.
-    _source: EventSource,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    /// The worker owns the `EventSource`, so the programs stay attached for
+    /// as long as it runs and detach when it exits. Held here to join on
+    /// drop.
+    worker: Option<crate::sandbox::worker::WorkerHandle>,
 }
 
 impl ConnTracker {
-    /// Load and attach the BPF programs, spawn the drain thread, and
-    /// return a tracker. On non-Linux or when the BPF object is missing
-    /// returns the `EbpfError` from the SDK so the caller can surface it
-    /// to the UI.
+    /// Load and attach the BPF programs, then drain decoded events into the
+    /// attribution cache.
+    ///
+    /// Both happen on one sandbox worker, in this order:
+    ///
+    /// 1. The worker enters the sandbox with the filesystem policy applied
+    ///    and CAP_BPF/CAP_PERFMON held, because the load needs them and
+    ///    ordinary entry drops them.
+    /// 2. `EventSource::new()` loads and attaches. The SDK spawns its own
+    ///    reader thread here; created after enforcement, it inherits this
+    ///    thread's Landlock domain.
+    /// 3. The worker drops the load capabilities itself.
+    /// 4. Only then does it read an event.
+    ///
+    /// This used to refuse outright whenever the sandbox was on, which left
+    /// every sandboxed run — the default — on socket polling. What it cannot
+    /// yet do is confine the SDK's reader thread *separately*: that thread
+    /// inherits the filesystem policy but keeps whatever capabilities it was
+    /// created with, until the SDK offers an entry hook of its own. The
+    /// residual is recorded against the `ebpf-reader` component rather than
+    /// being left for someone to discover.
     pub fn start() -> Result<Self, EbpfError> {
-        if !matches!(
-            crate::sandbox::worker::mode(),
-            crate::sandbox::Mode::Disabled
-        ) {
-            return Err(EbpfError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                "eBPF disabled: SDK reader has no pre-processing confinement hook; using socket polling")));
-        }
-        let (source, rx) = EventSource::new()?;
+        use crate::sandbox::{worker, Mode, Retain};
+
         let attributor = EbpfAttributor::new();
         let stop = Arc::new(AtomicBool::new(false));
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<Result<(), EbpfError>>(1);
 
         let thread_attr = Arc::clone(&attributor);
         let thread_stop = Arc::clone(&stop);
-        let join = thread::Builder::new()
-            .name("ebpf-attributor".into())
-            .spawn(move || {
-                let mut last_evict = Instant::now();
-                while !thread_stop.load(Ordering::Relaxed) {
-                    // recv_timeout so the loop checks the stop flag even
-                    // when the kprobe is silent for long stretches.
-                    match rx.recv_timeout(Duration::from_millis(500)) {
-                        Ok(EbpfEvent::Connect(evt)) => record_connect(&thread_attr, evt),
-                        // `EbpfEvent` is non_exhaustive; ignore variants
-                        // from future SDK phases (accept/close/…) until
-                        // we have a use for them.
-                        Ok(_) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        // Sender hung up (EventSource dropped) — exit loop.
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    if last_evict.elapsed() >= Duration::from_secs(10) {
-                        thread_attr.evict_stale(ATTRIBUTION_TTL);
-                        last_evict = Instant::now();
-                    }
+        let sandboxed = !matches!(worker::mode(), Mode::Disabled);
+        let handle = worker::spawn_retaining("ebpf", Retain::BpfLoad, move || {
+            let (source, rx) = match EventSource::new() {
+                Ok(pair) => {
+                    let _ = loaded_tx.send(Ok(()));
+                    pair
                 }
-            })
-            .ok();
+                Err(e) => {
+                    let _ = loaded_tx.send(Err(e));
+                    return;
+                }
+            };
+            // Attached. Nothing below needs the load capabilities, and the
+            // next statement reads kernel-produced bytes.
+            worker::drop_load_caps("ebpf");
+            if sandboxed {
+                worker::note(
+                    "ebpf-reader",
+                    "confined by inheritance: the SDK reader thread takes this \
+                     worker's filesystem policy but has no entry hook of its own",
+                );
+            }
 
-        Ok(Self {
-            attributor,
-            _source: source,
-            stop,
-            join,
-        })
+            let mut last_evict = Instant::now();
+            while !thread_stop.load(Ordering::Relaxed) {
+                // recv_timeout so the loop checks the stop flag even
+                // when the kprobe is silent for long stretches.
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(EbpfEvent::Connect(evt)) => record_connect(&thread_attr, evt),
+                    // `EbpfEvent` is non_exhaustive; ignore variants
+                    // from future SDK phases (accept/close/…) until
+                    // we have a use for them.
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    // Sender hung up (EventSource dropped) — exit loop.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if last_evict.elapsed() >= Duration::from_secs(10) {
+                    thread_attr.evict_stale(ATTRIBUTION_TTL);
+                    last_evict = Instant::now();
+                }
+            }
+            // Dropping the source here, on the worker, detaches the kprobes.
+            drop(source);
+        });
+
+        // The worker reports the load's outcome before it reads anything, so
+        // a failure surfaces as this call's error rather than as silence.
+        match loaded_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(Self {
+                attributor,
+                stop,
+                worker: Some(handle),
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(EbpfError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "eBPF worker did not report a load result",
+            ))),
+        }
     }
 }
 
 impl Drop for ConnTracker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.join.take() {
-            let _ = h.join();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -209,10 +249,38 @@ fn record_connect(attributor: &Arc<EbpfAttributor>, evt: ConnectEvent) {
     );
 }
 
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn a_sandboxed_run_attempts_the_load_instead_of_refusing_it() {
+        // The tracker used to return PermissionDenied whenever the sandbox
+        // was anything but disabled, which left every default run on socket
+        // polling. Whatever this machine's privileges are, the error it
+        // reports now has to come from the load, not from that check.
+        let Err(error) = ConnTracker::start() else {
+            // Loaded: this machine has CAP_BPF, which is the outcome the
+            // change exists to allow.
+            return;
+        };
+        let text = error.to_string();
+        assert!(
+            !text.contains("eBPF disabled"),
+            "refused before trying: {text}"
+        );
+        assert!(
+            !text.contains("pre-processing confinement hook"),
+            "refused before trying: {text}"
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod live_tests {
     use super::*;
     use std::net::{Ipv6Addr, TcpListener, TcpStream};
+    use std::thread;
 
     /// End-to-end on a live kernel: SDK event source → drain thread →
     /// attribution cache, for an IPv6 connect. Loading BPF needs

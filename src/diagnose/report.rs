@@ -345,6 +345,28 @@ impl Report {
                 top.confidence().label(),
                 top.checks_label()
             ));
+            // A strong claim has to say what made it sufficient, and a
+            // qualified one has to say what is still missing. Neither is
+            // recoverable from the pass fraction alone.
+            match (
+                top.confidence(),
+                top.sufficient_evidence(),
+                top.missing_discriminator(),
+            ) {
+                (super::issue::Confidence::Strong, evidence, _) if !evidence.is_empty() => {
+                    m.push_str(&format!(
+                        "Sufficient evidence: {}.\n\n",
+                        evidence.join(", ")
+                    ));
+                }
+                (_, _, Some(missing)) => {
+                    m.push_str(&format!(
+                        "Not measured: {} — {}.\n\n",
+                        missing.name, missing.detail
+                    ));
+                }
+                _ => {}
+            }
             if !top.checks.is_empty() {
                 let rows: Vec<Vec<String>> = top
                     .checks
@@ -749,6 +771,48 @@ mod tests {
             r.summary_line().starts_with("no open findings"),
             "{}",
             r.summary_line()
+        );
+    }
+
+    #[test]
+    fn a_qualified_cause_names_the_measurement_it_is_missing() {
+        use crate::diagnose::issue::{Cause, CheckResult};
+        let mut report = report();
+        report.issues.truncate(1);
+        let issue = &mut report.issues[0];
+        issue.causes = vec![Cause::new(
+            "receiver_queueing",
+            "the receiver is queueing",
+            vec![
+                CheckResult::pass("symptom", "rtt tracks our own tx", "3 MB/s in flight"),
+                CheckResult::skipped(
+                    "discriminator",
+                    "link-level bufferbloat test passed",
+                    "no loaded-rtt test has run",
+                )
+                .weighted(2.0),
+            ],
+        )];
+        let md = report.to_markdown();
+        assert!(
+            md.contains("Not measured: link-level bufferbloat test passed"),
+            "{md}"
+        );
+        assert!(
+            !md.contains("Sufficient evidence: link-level bufferbloat test passed"),
+            "a skipped check cannot be cited as what made the claim sufficient"
+        );
+
+        report.issues[0].causes[0].checks[1] = CheckResult::pass(
+            "discriminator",
+            "link-level bufferbloat test passed",
+            "our uplink stays responsive",
+        )
+        .weighted(2.0);
+        let md = report.to_markdown();
+        assert!(
+            md.contains("Sufficient evidence: link-level bufferbloat test passed"),
+            "{md}"
         );
     }
 

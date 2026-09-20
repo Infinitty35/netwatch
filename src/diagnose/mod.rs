@@ -39,6 +39,7 @@ pub mod probe_io;
 pub mod remediation;
 pub mod report;
 pub mod rules;
+pub mod run;
 pub mod targets;
 
 pub use engine::{Engine, Verdict};
