@@ -109,21 +109,32 @@ Prepared here, but each needs a login CI cannot have:
 
 ## Setting up COPR (one-off)
 
-Not yet done — it needs a Fedora account, which CI cannot create.
+One browser step, then a script.
 
-1. Sign in at <https://copr.fedorainfracloud.org> with a Fedora account.
-2. **New Project**: name `netwatch`, chroots `fedora-rawhide-x86_64`,
-   `fedora-41-x86_64`, `fedora-41-aarch64` (plus EPEL if wanted).
-3. **Packages → Add package → SCM**:
-   - Clone URL `https://github.com/matthart1983/netwatch`
-   - Committish `main`
-   - Subdirectory blank, **Spec File** `packaging/rpm/netwatch.spec`
-   - Build method: `rpkg`
-4. **Settings → Integrations**: copy the webhook URL into this repository's
-   settings (Webhooks → add, content type JSON, "just the push event" or
-   release events).
-5. Verify the first build, then add to the README:
-   `sudo dnf copr enable matthart1983/netwatch && sudo dnf install netwatch`.
+1. **Get an API token.** Log in at <https://copr.fedorainfracloud.org> with a
+   Fedora account, open <https://copr.fedorainfracloud.org/api/> and save the
+   config block it shows to `~/.config/copr`. It looks like:
+
+   ```ini
+   [copr-cli]
+   login = ...
+   username = ...
+   token = ...
+   copr_url = https://copr.fedorainfracloud.org
+   ```
+
+2. **Run the setup.** `scripts/copr-setup.sh` creates the project, registers
+   `packaging/rpm/netwatch.spec` as an SCM package against `main`, and starts
+   the first build. It uses the COPR API directly, so it needs nothing
+   installed beyond curl, and is safe to re-run.
+
+3. **Wire up releases.** Add `COPR_LOGIN`, `COPR_TOKEN` and `COPR_USERNAME` as
+   repository secrets; the `copr` job in `release.yml` then asks COPR to
+   rebuild on every tag. Without them that job skips, so nothing breaks. This
+   replaces the webhook the COPR UI offers.
+
+4. Once a build succeeds, add to the README:
+   `sudo dnf copr enable <user>/netwatch && sudo dnf install netwatch`.
 
 The spec has not been built yet — the first COPR build is also its first real
 test. Expect to iterate on `BuildRequires` once.

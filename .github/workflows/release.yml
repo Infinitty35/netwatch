@@ -396,6 +396,29 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
             ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
 
+  # Ask COPR to rebuild from the tag. A webhook would do the same, but this
+  # keeps the trigger in the workflow where the rest of the release lives, and
+  # skips cleanly when the secrets are absent.
+  copr:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger a COPR build
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+          COPR_USERNAME: ${{ secrets.COPR_USERNAME }}
+        run: |
+          if [ -z "${COPR_LOGIN}" ]; then
+            echo "COPR secrets not configured — skipping (see docs/PACKAGING.md)"
+            exit 0
+          fi
+          curl -sSf -u "${COPR_LOGIN}:${COPR_TOKEN}" \
+            -X POST https://copr.fedorainfracloud.org/api_3/package/build \
+            -F "ownername=${COPR_USERNAME}" \
+            -F "projectname=netwatch" \
+            -F "package_name=netwatch" | head -c 400
+
   publish:
     needs: release
     runs-on: ubuntu-latest
