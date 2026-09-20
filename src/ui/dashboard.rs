@@ -483,26 +483,34 @@ fn render_kpi_tile(
         }
     }
 
-    // Row 1 — the baseline. Row 2 — when it started, if it has.
+    // Row 1 — the baseline. Row 2 — when it started, or why nothing has been
+    // raised about it.
     if inner.height >= 2 {
-        let mut detail = reading.detail.clone();
-        if alarmed && !issue_behind(app, rules) {
-            detail.push_str(" · no issue raised");
-        }
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                widgets::ellipsise(&detail, inner.width.saturating_sub(2) as usize),
+                widgets::ellipsise(&reading.detail, inner.width.saturating_sub(2) as usize),
                 Style::default().fg(t.text_muted),
             ))),
             row(1),
         );
     }
     if inner.height >= 3 {
+        // On its own row rather than appended to the detail: "most on
+        // 54.152.65.118" already fills a fifth of the screen's width, and the
+        // note is the half that got truncated when the two shared a line.
         if let Some(since) = &reading.since {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!("since {since}"),
                     Style::default().fg(reading.severity),
+                ))),
+                row(2),
+            );
+        } else if alarmed && !issue_behind(app, rules) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "no issue raised",
+                    Style::default().fg(t.text_muted),
                 ))),
                 row(2),
             );
