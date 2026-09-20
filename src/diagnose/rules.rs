@@ -837,9 +837,13 @@ mod tests {
         // unintegrated. Generating it is what stops that happening again.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/diagnostic-coverage.md");
         let committed = std::fs::read_to_string(path).expect("coverage doc is committed");
+        // Compared line by line: a Windows checkout rewrites the committed
+        // file to CRLF, and the generator emits LF, so comparing the raw
+        // strings failed there over line endings rather than content.
+        let normalise = |s: &str| s.replace("\r\n", "\n");
         assert_eq!(
-            committed,
-            coverage_markdown(),
+            normalise(&committed),
+            normalise(&coverage_markdown()),
             "run: cargo run -- diagnose coverage --doc"
         );
     }
