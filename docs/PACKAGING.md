@@ -99,9 +99,10 @@ Prepared here, but each needs a login CI cannot have:
 - **winget** — `packaging/winget/`, generated per release by
   `scripts/winget-manifest.sh <tag>`. Needs a fork of `microsoft/winget-pkgs`.
   Neither netwatch nor its closest competitor is on winget today.
-- **AUR `netwatch-tui-bin`** — `packaging/aur/PKGBUILD`, currently maintained by
-  someone else and a release behind. Needs an AUR account, and ideally a
-  co-maintainer offer first.
+- **AUR** — no action needed. `netwatch-tui` (source) tracks releases closely;
+  `netwatch-tui-bin` lags by a release and ships no completions or man page.
+  Both are other people's packages, so the most that is warranted is a comment
+  on the -bin package when it falls behind.
 - **nixpkgs** — no action needed. `r-ryantm`, the nixpkgs update bot, opens the
   bump PRs (it did 0.30.0), so the package catches up on its own cadence
   rather than ours. Only step in if it stalls for several releases.
