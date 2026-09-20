@@ -22,6 +22,9 @@ BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  gcc
 BuildRequires:  libpcap-devel
+# Defines %{_unitdir}; without it the %files list fails with
+# "File must begin with /" on an unexpanded macro.
+BuildRequires:  systemd-rpm-macros
 Requires:       libpcap
 
 %description

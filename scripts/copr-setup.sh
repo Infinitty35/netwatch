@@ -15,7 +15,7 @@ CFG="${COPR_CONFIG:-$HOME/.config/copr}"
 PROJECT="${COPR_PROJECT:-netwatch}"
 REPO_URL="https://github.com/matthart1983/netwatch"
 SPEC="packaging/rpm/netwatch.spec"
-CHROOTS=(fedora-41-x86_64 fedora-41-aarch64 fedora-42-x86_64 fedora-rawhide-x86_64)
+CHROOTS=(fedora-43-x86_64 fedora-43-aarch64 fedora-44-x86_64 fedora-44-aarch64 fedora-rawhide-x86_64)
 
 [ -r "${CFG}" ] || { echo "No COPR config at ${CFG} — see the header of this script." >&2; exit 1; }
 
