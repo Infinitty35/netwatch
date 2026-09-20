@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate winget manifests for a released tag.
 #
-#   scripts/winget-manifest.sh v0.33.0
+#   scripts/winget-manifest.sh v0.32.1
 #
 # Writes packaging/winget/generated/. Submission steps are in
 # packaging/winget/README.md. Run from the repository root.

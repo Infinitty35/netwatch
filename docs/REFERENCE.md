@@ -388,12 +388,12 @@ Some detached workers still lack bounded shutdown; see the
 
 ## Distro packages
 
-From v0.33.0 every release carries `.deb` and `.rpm` packages for x86_64 and
+From v0.32.1 every release carries `.deb` and `.rpm` packages for x86_64 and
 aarch64, built from the same musl-static binary as the tarball:
 
 ```sh
-sudo apt install ./netwatch_0.33.0-1_amd64.deb     # Debian, Ubuntu
-sudo dnf install ./netwatch-0.33.0-1.x86_64.rpm    # Fedora, RHEL
+sudo apt install ./netwatch_0.32.1-1_amd64.deb     # Debian, Ubuntu
+sudo dnf install ./netwatch-0.32.1-1.x86_64.rpm    # Fedora, RHEL
 ```
 
 They install the binary, all three shell completions, the man page, the
@@ -424,7 +424,7 @@ sha256sum --ignore-missing -c SHA256SUMS
 gh attestation verify netwatch-linux-x86_64.tar.gz -R matthart1983/netwatch
 ```
 
-Checksums and attestations are produced from v0.33.0 onward; earlier releases
+Checksums and attestations are produced from v0.32.1 onward; earlier releases
 have neither.
 
 ## Shell completions and the man page

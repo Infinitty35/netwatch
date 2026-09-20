@@ -4,7 +4,7 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
-## [0.33.0] - 2026-09-20
+## [0.32.1] - 2026-09-20
 
 ### Added
 - `.deb` and `.rpm` packages for x86_64 and aarch64 on every release, built
