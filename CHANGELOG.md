@@ -4,6 +4,8 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-20
+
 ### Added
 - `.deb` and `.rpm` packages for x86_64 and aarch64 on every release, built
   from the same static binary as the tarball. They install the binary, the
@@ -27,6 +29,12 @@ All notable changes to NetWatch will be documented in this file.
   autobump updates within hours of each release. The formula in
   `matthart1983/homebrew-tap` is deprecated and no longer updated by the
   release workflow; existing installs keep working.
+
+### Fixed
+- The crates.io publish step recognises cargo's current "already exists on
+  crates.io index" wording, so re-running a release no longer fails there.
+- Windows builds delay-load `wpcap.dll` in test executables as well as the
+  app, so the test binary no longer needs Npcap present to start.
 
 ## [0.32.0] - 2026-09-19
 

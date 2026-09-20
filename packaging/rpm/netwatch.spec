@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.32.0
+Version:        0.33.0
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -81,5 +81,8 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sun Sep 20 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.33.0-1
+- Packaging release: deb/rpm, container image, completions and man page
+
 * Sun Sep 20 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.32.0-1
 - Initial COPR package
