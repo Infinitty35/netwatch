@@ -31,13 +31,12 @@ One binary, no config. `sudo netwatch` and you have live capture with L7 decode,
 ```bash
 brew install netwatch                 # macOS / Linux
 scoop install netwatch                # Windows (needs Npcap)
-cargo binstall netwatch-tui           # prebuilt binary, no compile, no libpcap headers
-cargo install netwatch-tui            # or build it: needs Rust and libpcap headers
-paru -S netwatch-tui                  # Arch (AUR, community-maintained)
-nix-shell -p netwatch                 # NixOS / Nix (community-maintained)
+cargo binstall netwatch-tui           # prebuilt binary, anywhere with Rust
+paru -S netwatch-tui                  # Arch (AUR)
+nix-shell -p netwatch                 # NixOS / Nix
 ```
 
-Debian and Ubuntu, with `apt upgrade` from then on:
+**Debian / Ubuntu** ([apt repository](https://matthart1983.github.io/netwatch/)):
 
 ```bash
 curl -fsSL https://matthart1983.github.io/netwatch/apt/netwatch.gpg \
@@ -48,16 +47,16 @@ https://matthart1983.github.io/netwatch/apt stable main" \
 sudo apt update && sudo apt install netwatch
 ```
 
-Fedora: `sudo dnf copr enable matthart1983/netwatch && sudo dnf install netwatch`.
+**Fedora:** `sudo dnf copr enable matthart1983/netwatch && sudo dnf install netwatch`
 
-Or in a container, with the host's network and processes:
+**Container:** `docker run --rm -it --net=host --pid=host --cap-add=NET_RAW ghcr.io/matthart1983/netwatch`
 
-```bash
-docker run --rm -it --net=host --pid=host --cap-add=NET_RAW --cap-add=NET_ADMIN \
-  ghcr.io/matthart1983/netwatch
-```
-
-Prebuilt binaries are on the [releases page](https://github.com/matthart1983/netwatch/releases/latest). The Linux x86_64/aarch64 binaries are static with libpcap bundled in, so they need nothing installed. There's also an armv5te build for older Marvell Kirkwood NAS boxes (e.g. Iomega ix2-dl) running Debian — libpcap is bundled the same way, but it links against glibc and libatomic, so it needs Debian 12 (bookworm) or newer with `libatomic1` installed. Windows needs [Npcap](https://npcap.com/#download) installed first; building from source needs `libpcap-dev` (Debian), `libpcap-devel` (Fedora) or `libpcap` (Arch). From v0.32.1, releases also ship `.deb` and `.rpm` packages for x86_64 and aarch64 (`sudo apt install ./netwatch_*.deb`, `sudo dnf install ./netwatch-*.rpm`), which place the completions, man page and agent unit for you. They ship `SHA256SUMS` and signed build provenance too — see [verifying a download](docs/REFERENCE.md#verifying-a-download). Shell completions (`completions/`) and a man page (`docs/netwatch.1`) are in the repo. Details in the [install reference](docs/REFERENCE.md#permissions).
+**Binaries** for macOS, Linux (x86_64, aarch64, armv5te) and Windows are on the
+[releases page](https://github.com/matthart1983/netwatch/releases/latest), with
+`.deb`, `.rpm`, checksums and signed provenance. The Linux builds are static and
+need nothing installed; Windows needs [Npcap](https://npcap.com/#download).
+[Verifying a download](docs/REFERENCE.md#verifying-a-download) ·
+[every channel](docs/PACKAGING.md).
 
 ## Run
 
@@ -69,30 +68,6 @@ netwatch --view dense # four boxes, 130x44 or larger
 ```
 
 `1` to `9` and `0` switch tabs, `V` cycles the three views, `?` shows every key. To run without sudo on Linux, grant the capabilities once: `sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' "$(which netwatch)"` ([why and when to repeat it](docs/REFERENCE.md#running-without-sudo-linux)).
-
-## What it does
-
-**Diagnose (tab `9`).** Per-metric baselines scoped to the network that taught them; readiness requires 1,800 distinct samples, so learning time depends on probe cadence. 30 catalogued rules, all with implemented detectors. Runtime coverage states which inputs are available, learning, stale, or unmeasured. A suppression graph groups a dead gateway and its consequences under one finding. Each cause is ranked by the checks that separated it from the others. Automatic TUI resolver changes remain unavailable; Diagnose provides manual steps. An explicit [Linux resolver command](docs/resolver-adapter.md) supports temporary changes to administrator-confirmed unmanaged regular files; managed resolvers remain unsupported. The demo still simulates apply and verified recovery. Existing journals are inspected on startup, and unreadable or corrupt recovery records block further host changes. An issue closes only when the rule's own success condition has held. No model involved. [How it works](docs/REFERENCE.md#how-it-works), [the design](docs/DESIGN-0.30.md#9-9-diagnose).
-
-<p align="center">
-  <img src="docs/media/demo-diagnose.gif" alt="A slow resolver at 33 times its baseline, three ranked causes, a key-bound fix, and the issue closing itself once dns.rtt_p50 has held under 5ms for 60 seconds" width="860">
-</p>
-
-**Decrypt TLS you control.** Point any client's `SSLKEYLOGFILE` at NetWatch and the plaintext of its TLS 1.3 sessions decodes in the Packets tab. Same mechanism as Wireshark, so it only works for traffic you hold the keys to. [TLS decryption](docs/REFERENCE.md#tls-13--12-decryption).
-
-```bash
-sudo netwatch                                              # open Packets (4)
-SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exports keys
-# filter the tab with:  decrypted:true
-```
-
-**Egress drift.** The Egress tab (`0`) learns which hosts, autonomous systems and ports each process reaches. `Enter` promotes that baseline to a rule; the next new destination arrives as `drift` with an alert. It observes and never blocks. Verdicts are `sni`, `ip`, `asn`, `ech`, `drift`, `no rule` and `undeclared` under `strict = true`, because "matched by AS" admits everything a hyperscaler runs and the table should say so. [Rule language and export schema](docs/egress-linter-plan.md).
-
-**Process attribution.** Platform socket polling, PKTAP on macOS, and an optional eBPF kprobe on Linux (`ebpf` feature). Attribution can be missing or stale, especially for short-lived flows; Windows uses its own network/process tools. [Permissions](docs/REFERENCE.md#permissions).
-
-**Threat detection.** C2 beaconing, port scans and DNS tunnelling run in the background. A critical alert freezes the flight recorder so the bundle exists before you look. JA4 fingerprints each TLS and QUIC handshake so you can pivot to every flow from the same client. [Security and forensics](docs/REFERENCE.md#security--forensics), [flight recorder](docs/REFERENCE.md#flight-recorder), [JA4](docs/REFERENCE.md#threat-hunting-with-ja4).
-
-**Linux worker sandbox.** Worker entry points apply a prepared Landlock filesystem policy before processing; capture prepares its device first. Writable grants use dedicated application directories. eBPF attribution is temporarily disabled in sandboxed runs pending an SDK reader hook. Network access remains unrestricted, and privileged capture/restart validation is pending. [Scope and limitations](docs/REFERENCE.md#landlock-sandbox-linux).
 
 ## The tabs
 
@@ -111,29 +86,35 @@ SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exp
 
 [Every keybinding](docs/REFERENCE.md#keyboard-controls), [display filters](docs/REFERENCE.md#display-filters), [decoders](docs/REFERENCE.md#deep-packet-inspection), [themes](docs/REFERENCE.md#themes), [configuration](docs/REFERENCE.md#configuration).
 
-## Three views, one capture
+## Views
 
-`V` cycles between them without a restart; the collectors keep running.
+`V` cycles all three without a restart; the collectors keep running.
 
-**Full** is the ten tabs above.
+| View | Size | For |
+|---|---|---|
+| Full | any | The ten tabs above |
+| Lite (`--lite`) | 80x24 | An SSH session to a Pi, or a tmux split |
+| Dense (`--view dense`) | 130x44+ | The hero image: four boxes, braille throughput, kernel TCP detail |
 
-**Lite** (`--lite`) fits 80x24: throughput, gateway/DNS/internet reachability, top talkers, six keys. For an SSH session to a Pi or a tmux split.
-
-**Dense** (`--view dense`) is the hero image. It needs 130x44 and grows into anything larger. Throughput is braille at two samples per cell, coloured by height so a spike reads before you check the axis. The connection table hoists the selected row's detail, including kernel `cwnd`, `ssthresh`, `mss` and `rwnd`, into the top of its own box. `1` to `4` zoom a box to the whole screen. [Dense and Lite](docs/DESIGN-0.30.md#8-dense-and-lite).
+[Why they look like this](docs/DESIGN-0.30.md#8-dense-and-lite).
 
 ## Docs
 
 | | |
 |---|---|
+| [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions |
+| [Diagnose](docs/REFERENCE.md#how-it-works) | Baselines, the 30 rules, ranked causes, verified closes |
+| [TLS decryption](docs/REFERENCE.md#tls-13--12-decryption) | Point `SSLKEYLOGFILE` at netwatch and read your own traffic |
+| [Egress linting](docs/egress-linter-plan.md) | Observe destinations, promote a policy, alert on what you block |
+| [Security and forensics](docs/REFERENCE.md#security--forensics) | Beaconing, scans, DNS tunnelling, JA4, the flight recorder |
 | [Capability matrix](docs/CAPABILITIES.md) | Platform differences, diagnostic limits and verification scope |
 | [Attribution evidence](docs/attribution.md) | Identity, freshness, coverage denominators and controlled results |
 | [Doctor command](docs/doctor.md) | Read-only setup report, JSON capabilities and optional capture check |
-| [Reference](docs/REFERENCE.md) | Keys, filters, decoders, configuration, permissions, security |
 | [Design 0.30](docs/DESIGN-0.30.md) | Why the screens look the way they do |
 | [Architecture](docs/WIKI.md) | Runtime, source map, permissions model, how to build and verify |
-| [Egress linting](docs/egress-linter-plan.md) | Observe, promote, warn |
 | [AI Insights](docs/INSIGHTS.md) | Optional LLM commentary inside Diagnose, off by default |
 | [Prometheus export](docs/observability-export.md) | Exposed metrics and scrape config |
+| [Packaging](docs/PACKAGING.md) | Every channel, and what updates it |
 | [Changelog](CHANGELOG.md) | Every release |
 
 ## Related
@@ -142,7 +123,7 @@ SSLKEYLOGFILE=/tmp/keys curl https://example.com           # any client that exp
 
 ## Thanks
 
-I packaged none of this. Dominiquini and kemelzaidan maintain [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) and [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR, tomasrivera the [nixpkgs package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix), [scillidan](https://github.com/scillidan) the [Scoop entry](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), and the Homebrew maintainers took the formula into core. File packaging problems with them and netwatch bugs here.
+Much of the packaging is other people's work. Dominiquini and kemelzaidan maintain [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) and [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR, tomasrivera the [nixpkgs package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix), [scillidan](https://github.com/scillidan) the [Scoop entry](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), and the Homebrew maintainers took the formula into core. File packaging problems with them and netwatch bugs here.
 
 [@lamchau](https://github.com/lamchau), [@fdncred](https://github.com/fdncred) and [@PeteE](https://github.com/PeteE) sent patches. Everyone who opened an issue with a repro or argued with a design decision is the reason the output is right on more terminals than mine.
 
