@@ -17,6 +17,7 @@ hand when a release goes out.
 | Scoop (Windows) | ScoopInstaller/Main | the bucket's autoupdate bot | GitHub release |
 | AUR `netwatch-tui`, `netwatch-tui-bin` | community maintainers | community | — |
 | nixpkgs | community maintainer | community | — |
+| conda-forge (`conda install -c conda-forge netwatch`) | community maintainer | community | the tag's source archive |
 | `matthart1983/homebrew-tap` | — | **deprecated**, no longer updated | superseded by homebrew-core |
 
 Only the first five are ours. The others are maintained by other people; if

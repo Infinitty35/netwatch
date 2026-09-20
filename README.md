@@ -8,6 +8,7 @@
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/d/netwatch-tui.svg" alt="downloads"></a>
     <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/v/release/matthart1983/netwatch" alt="Release"></a>
     <a href="https://github.com/matthart1983/netwatch/releases"><img src="https://img.shields.io/github/downloads/matthart1983/netwatch/total?label=GitHub%20downloads" alt="GitHub release downloads"></a>
+    <a href="https://anaconda.org/conda-forge/netwatch"><img src="https://img.shields.io/conda/dn/conda-forge/netwatch?label=conda%20downloads" alt="conda-forge downloads"></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue" alt="Platform">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   </p>
@@ -34,6 +35,7 @@ scoop install netwatch                # Windows (needs Npcap)
 cargo binstall netwatch-tui           # prebuilt binary, anywhere with Rust
 paru -S netwatch-tui                  # Arch (AUR)
 nix-shell -p netwatch                 # NixOS / Nix
+conda install -c conda-forge netwatch # conda / mamba (Linux, macOS)
 ```
 
 **Debian / Ubuntu** ([apt repository](https://matthart1983.github.io/netwatch/)):
@@ -123,7 +125,7 @@ netwatch --view dense # four boxes, 130x44 or larger
 
 ## Thanks
 
-Much of the packaging is other people's work. Dominiquini and kemelzaidan maintain [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) and [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR, tomasrivera the [nixpkgs package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix), [scillidan](https://github.com/scillidan) the [Scoop entry](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), and the Homebrew maintainers took the formula into core. File packaging problems with them and netwatch bugs here.
+Much of the packaging is other people's work. Dominiquini and kemelzaidan maintain [`netwatch-tui`](https://aur.archlinux.org/packages/netwatch-tui) and [`netwatch-tui-bin`](https://aur.archlinux.org/packages/netwatch-tui-bin) on the AUR, tomasrivera the [nixpkgs package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ne/netwatch/package.nix), [scillidan](https://github.com/scillidan) the [Scoop entry](https://github.com/ScoopInstaller/Main/blob/master/bucket/netwatch.json), [pavelzw](https://github.com/pavelzw) the [conda-forge feedstock](https://github.com/conda-forge/netwatch-feedstock), and the Homebrew maintainers took the formula into core. File packaging problems with them and netwatch bugs here.
 
 [@lamchau](https://github.com/lamchau), [@fdncred](https://github.com/fdncred) and [@PeteE](https://github.com/PeteE) sent patches. Everyone who opened an issue with a repro or argued with a design decision is the reason the output is right on more terminals than mine.
 
