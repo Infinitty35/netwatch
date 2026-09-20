@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">NetWatch</h1>
   <p align="center">
-    <strong>A network monitor for the terminal that helps identify the process behind connections, reads TLS you hold the keys to, and tells you what is wrong and how to fix it.</strong>
+    <strong>Network diagnostics in your terminal.</strong>
   </p>
   <p align="center">
     <a href="https://crates.io/crates/netwatch-tui"><img src="https://img.shields.io/crates/v/netwatch-tui.svg" alt="crates.io"></a>
