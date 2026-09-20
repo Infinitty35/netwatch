@@ -2,6 +2,18 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [0.32.3] - 2026-09-20
+
+### Fixed
+- The macOS build's lints: an explicit `drop` of the eBPF event source, which
+  is a stub with no `Drop` on non-Linux, failed `clippy -D warnings` there.
+- The RPM spec's version, which 0.32.2 shipped still reading 0.32.1. COPR
+  builds from the spec rather than from Cargo.toml, so that release's COPR
+  package would have carried the previous version's number.
+
+Everything below shipped in 0.32.2, whose CI was red for the two reasons
+above; 0.32.3 is that release with them fixed.
+
 ## [0.32.2] - 2026-09-20
 
 ### Added

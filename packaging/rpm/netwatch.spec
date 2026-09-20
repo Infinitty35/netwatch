@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.32.1
+Version:        0.32.3
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -84,6 +84,10 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sun Sep 20 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.32.3-1
+- Diagnostic evidence rules, eBPF under the sandbox, and the RPM spec bumped
+  with the crate
+
 * Sun Sep 20 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.32.1-1
 - Packaging release: deb/rpm, container image, completions and man page
 
