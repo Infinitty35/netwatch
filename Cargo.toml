@@ -191,3 +191,44 @@ assets = [
     { source = "CHANGELOG.md", dest = "/usr/share/doc/netwatch/CHANGELOG.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/netwatch/LICENSE", mode = "644", doc = true },
 ]
+
+# ── cargo-binstall ────────────────────────────────────────────────────
+#
+# `cargo binstall netwatch-tui` fetches the release binary instead of
+# compiling, which also means it needs no libpcap headers. The release
+# tarballs hold a binary named after its target (netwatch-linux-x86_64), not
+# `netwatch`, so every override sets `bin-dir` to that name; without it
+# binstall looks for `netwatch` inside the archive and fails.
+#
+# The gnu targets deliberately point at the musl asset: it is static, runs on
+# a glibc host, and there is no separate gnu build to offer them.
+[package.metadata.binstall]
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-linux-x86_64.tar.gz"
+bin-dir = "netwatch-linux-x86_64"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-linux-x86_64.tar.gz"
+bin-dir = "netwatch-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-linux-aarch64.tar.gz"
+bin-dir = "netwatch-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-linux-aarch64.tar.gz"
+bin-dir = "netwatch-linux-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-macos-x86_64.tar.gz"
+bin-dir = "netwatch-macos-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-macos-aarch64.tar.gz"
+bin-dir = "netwatch-macos-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/netwatch-windows-x86_64.exe.zip"
+bin-dir = "netwatch-windows-x86_64.exe"

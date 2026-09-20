@@ -4,6 +4,11 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `cargo binstall netwatch-tui` fetches the release binary instead of
+  compiling, so it needs no Rust toolchain build and no libpcap headers.
+- A Fedora COPR repository: `sudo dnf copr enable matthart1983/netwatch`.
+
 ## [0.32.1] - 2026-09-20
 
 ### Added

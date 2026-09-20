@@ -9,6 +9,7 @@ hand when a release goes out.
 |---|---|---|---|
 | homebrew-core (`brew install netwatch`) | Homebrew | Homebrew autobump, within hours of a tag | the tag's source archive |
 | crates.io (`netwatch-tui`) | `publish` job in `release.yml` | every tag | this repository |
+| `cargo binstall netwatch-tui` | nothing — reads `[package.metadata.binstall]` | every tag | the release tarballs |
 | GitHub release binaries | `build` job | every tag | musl-static (Linux), native (macOS/Windows) |
 | GitHub release `.deb` / `.rpm` | `build` job, `cargo-deb` + `cargo-generate-rpm` | every tag | the same static binary |
 | Fedora COPR | COPR builders from `packaging/rpm/netwatch.spec` | a tag, via webhook | built from source against system libpcap |
@@ -91,6 +92,18 @@ inputs as available — the same profile as a host run. **Packet capture needs a
 rootful container**: rootless Docker or podman cannot grant `CAP_NET_RAW`, and
 capture fails even with `--cap-add`. Use `sudo docker run …`, or run netwatch
 outside a container if you mainly want the Packets tab.
+
+## Repology
+
+Repology tracks which distributions carry netwatch and which are behind:
+<https://repology.org/project/netwatch-tui/versions>.
+
+Two unrelated programs are called netwatch — the other is a C tool from the
+1990s, last released as 1.3.1 — so entries land in two projects. The AUR and
+nixpkgs packages are under `netwatch-tui`; the homebrew formula was grouped
+with the C tool, where 0.32.x reads as "outdated" against 1.3.1.
+[repology-rules#1241](https://github.com/repology/repology-rules/pull/1241)
+moves it across. Check there first if a version looks wrong on Repology.
 
 ## Channels waiting on an account
 

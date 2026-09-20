@@ -31,7 +31,8 @@ One binary, no config. `sudo netwatch` and you have live capture with L7 decode,
 ```bash
 brew install netwatch                 # macOS / Linux
 scoop install netwatch                # Windows (needs Npcap)
-cargo install netwatch-tui            # anywhere with Rust and libpcap headers
+cargo binstall netwatch-tui           # prebuilt binary, no compile, no libpcap headers
+cargo install netwatch-tui            # or build it: needs Rust and libpcap headers
 paru -S netwatch-tui                  # Arch (AUR, community-maintained)
 nix-shell -p netwatch                 # NixOS / Nix (community-maintained)
 ```
