@@ -337,6 +337,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # A tag with a hyphen (v0.33.0-rc.1) is a pre-release: GitHub keeps
+          # /releases/latest pointing at the last real one, so Scoop's
+          # checkver and anyone scripting against `latest` do not pick it up.
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           # When dispatched manually, github.ref is a branch, so be
           # explicit about which tag this release attaches to.
           tag_name: ${{ env.RELEASE_TAG }}
