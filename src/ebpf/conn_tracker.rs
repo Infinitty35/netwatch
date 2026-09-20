@@ -158,7 +158,12 @@ impl ConnTracker {
         let thread_stop = Arc::clone(&stop);
         let sandboxed = !matches!(worker::mode(), Mode::Disabled);
         let handle = worker::spawn_retaining("ebpf", Retain::BpfLoad, move || {
-            let (source, rx) = match EventSource::new() {
+            // Bound, never used again: the programs stay attached for as
+            // long as this binding lives, and detach when the worker exits.
+            // An explicit `drop` at the end of the loop said the same thing,
+            // but the type is a stub with no `Drop` on non-Linux, where that
+            // reads as dropping something that cannot be dropped.
+            let (_source, rx) = match EventSource::new() {
                 Ok(pair) => {
                     let _ = loaded_tx.send(Ok(()));
                     pair
@@ -198,8 +203,6 @@ impl ConnTracker {
                     last_evict = Instant::now();
                 }
             }
-            // Dropping the source here, on the worker, detaches the kprobes.
-            drop(source);
         });
 
         // The worker reports the load's outcome before it reads anything, so
