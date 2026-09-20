@@ -92,6 +92,20 @@ rootful container**: rootless Docker or podman cannot grant `CAP_NET_RAW`, and
 capture fails even with `--cap-add`. Use `sudo docker run …`, or run netwatch
 outside a container if you mainly want the Packets tab.
 
+## Channels waiting on an account
+
+Prepared here, but each needs a login CI cannot have:
+
+- **winget** — `packaging/winget/`, generated per release by
+  `scripts/winget-manifest.sh <tag>`. Needs a fork of `microsoft/winget-pkgs`.
+  Neither netwatch nor its closest competitor is on winget today.
+- **AUR `netwatch-tui-bin`** — `packaging/aur/PKGBUILD`, currently maintained by
+  someone else and a release behind. Needs an AUR account, and ideally a
+  co-maintainer offer first.
+- **nixpkgs** — no action needed. `r-ryantm`, the nixpkgs update bot, opens the
+  bump PRs (it did 0.30.0), so the package catches up on its own cadence
+  rather than ours. Only step in if it stalls for several releases.
+
 ## Setting up COPR (one-off)
 
 Not yet done — it needs a Fedora account, which CI cannot create.

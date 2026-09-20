@@ -1,0 +1,52 @@
+# Maintainer: Matt Hartley <matthew.t.hartley@gmail.com>
+#
+# Binary package: installs the musl-static release binary, so it needs no
+# libpcap at runtime and no Rust toolchain to build. The source package
+# `netwatch-tui` builds from source instead.
+#
+# The release tarball holds the binary alone, so completions, the man page and
+# the licence come from the source tarball (extracted, not built).
+pkgname=netwatch-tui-bin
+_pkgname=netwatch
+pkgver=0.32.0
+pkgrel=1
+pkgdesc="Real-time network diagnostics in your terminal — per-connection throughput, process attribution and a diagnostic engine"
+arch=('x86_64' 'aarch64')
+url="https://github.com/matthart1983/netwatch"
+license=('MIT')
+provides=('netwatch')
+conflicts=('netwatch' 'netwatch-tui')
+options=(!strip)
+source=("${pkgname}-${pkgver}-src.tar.gz::${url}/archive/v${pkgver}.tar.gz")
+source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/netwatch-linux-x86_64.tar.gz")
+source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/netwatch-linux-aarch64.tar.gz")
+# Replace on every version bump: `updpkgsums` fills these in.
+sha256sums=('SKIP')
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    cd "${srcdir}"
+
+    case "${CARCH}" in
+        x86_64)  _bin="netwatch-linux-x86_64" ;;
+        aarch64) _bin="netwatch-linux-aarch64" ;;
+    esac
+    install -Dm0755 "${_bin}" "${pkgdir}/usr/bin/netwatch"
+
+    cd "${_pkgname}-${pkgver}"
+    install -Dm0644 docs/netwatch.1 "${pkgdir}/usr/share/man/man1/netwatch.1"
+    install -Dm0644 completions/netwatch.bash \
+        "${pkgdir}/usr/share/bash-completion/completions/netwatch"
+    install -Dm0644 completions/_netwatch \
+        "${pkgdir}/usr/share/zsh/site-functions/_netwatch"
+    install -Dm0644 completions/netwatch.fish \
+        "${pkgdir}/usr/share/fish/vendor_completions.d/netwatch.fish"
+    install -Dm0644 packaging/systemd/netwatch.service \
+        "${pkgdir}/usr/lib/systemd/system/netwatch.service"
+    install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm0644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
+
+# Capabilities are not granted here. `sudo netwatch` works, or grant them once:
+#   sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' /usr/bin/netwatch

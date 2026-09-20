@@ -21,3 +21,4 @@ perf.data
 perf.data.old
 flamegraph.svg
 packaging/docker/bin/
+packaging/winget/generated/
