@@ -416,8 +416,12 @@ jobs:
       - name: Publish to crates.io (skip if already published)
         run: |
           VERSION="${RELEASE_TAG#v}"
-          # `cargo publish` errors with "crate version is already
-          # uploaded" — match that and exit 0 so re-dispatches stay green.
+          # `cargo publish` refuses a version that is already on crates.io —
+          # match that and exit 0 so re-dispatches and release candidates stay
+          # green. The wording has changed once already ("crate version is
+          # already uploaded" became "already exists on crates.io index"), so
+          # both spellings are matched; a v0.33.0-rc.1 run failed on exactly
+          # that.
           # IMPORTANT: read PIPESTATUS, not $? — piping through `tee` would
           # otherwise hide cargo's exit code (tee always succeeds) and the
           # step would falsely report "Published OK" on real failures like
@@ -427,7 +431,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           if [ "$rc" -eq 0 ]; then
             echo "Published OK"
-          elif grep -q "already uploaded" /tmp/publish.log; then
+          elif grep -qE "already (uploaded|exists on crates.io)" /tmp/publish.log; then
             echo "v${VERSION} already on crates.io — skipping"
           else
             echo "Publish failed (cargo exit $rc) for a reason other than 'already uploaded'"
