@@ -396,6 +396,94 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
             ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
 
+  # Publish an apt repository on GitHub Pages, built from the .deb files the
+  # build job produced. Self-hosted rather than a Launchpad PPA on purpose:
+  # the packages hold a musl-static binary, so they install on any Debian or
+  # Ubuntu, while a PPA would build from source against whatever Rust that
+  # release ships (24.04 LTS is on 1.75, too old for this crate).
+  apt:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Check out the published repo
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: pages
+        continue-on-error: true
+
+      - name: Build the apt tree
+        run: |
+          set -eux
+          # Keep whatever is already published: apt clients pin versions, and
+          # dropping older debs breaks anyone holding one back.
+          mkdir -p pages/apt/pool/main pages/apt/dists/stable/main/binary-amd64 \
+                   pages/apt/dists/stable/main/binary-arm64
+          cp -f *.deb pages/apt/pool/main/
+          cp -f packaging/apt/netwatch-archive-keyring.gpg pages/apt/netwatch.gpg
+
+          cd pages/apt
+          for arch in amd64 arm64; do
+            apt-ftparchive --arch "${arch}" packages pool/main \
+              > "dists/stable/main/binary-${arch}/Packages"
+            gzip -9fk "dists/stable/main/binary-${arch}/Packages"
+          done
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=netwatch \
+            -o APT::FTPArchive::Release::Label=netwatch \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            -o APT::FTPArchive::Release::Components=main \
+            release dists/stable > dists/stable/Release
+
+      - name: Sign the release index
+        env:
+          KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          set -eu
+          if [ -z "${KEY}" ]; then
+            echo "APT_GPG_PRIVATE_KEY not set — skipping the apt repository"
+            echo "APT_SIGNED=false" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+          echo "APT_SIGNED=true" >> "${GITHUB_ENV}"
+          echo "${KEY}" | gpg --batch --import
+          cd pages/apt
+          # Detached (Release.gpg) for older clients, inline (InRelease) for
+          # current ones; apt prefers InRelease and falls back.
+          gpg --batch --yes --local-user "${KEY_ID}" -abs \
+            -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --local-user "${KEY_ID}" --clearsign \
+            -o dists/stable/InRelease dists/stable/Release
+
+      - name: Publish
+        if: env.APT_SIGNED == 'true'
+        run: |
+          set -eux
+          cd pages
+          test -f apt/dists/stable/InRelease
+          git init -q -b gh-pages 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" 2>/dev/null || true
+          # Jekyll would eat directories beginning with an underscore and add
+          # nothing here.
+          touch .nojekyll
+          git add -A
+          git commit -qm "apt: netwatch ${RELEASE_TAG}" || { echo "nothing to publish"; exit 0; }
+          git push -q --force origin gh-pages
+
   # Ask COPR to rebuild from the tag. A webhook would do the same, but this
   # keeps the trigger in the workflow where the rest of the release lives, and
   # skips cleanly when the secrets are absent.

@@ -12,7 +12,8 @@ hand when a release goes out.
 | `cargo binstall netwatch-tui` | nothing — reads `[package.metadata.binstall]` | every tag | the release tarballs |
 | GitHub release binaries | `build` job | every tag | musl-static (Linux), native (macOS/Windows) |
 | GitHub release `.deb` / `.rpm` | `build` job, `cargo-deb` + `cargo-generate-rpm` | every tag | the same static binary |
-| Fedora COPR | COPR builders from `packaging/rpm/netwatch.spec` | a tag, via webhook | built from source against system libpcap |
+| Fedora COPR | COPR builders from `packaging/rpm/netwatch.spec` | the `copr` job on each tag | built from source against system libpcap |
+| apt repo on GitHub Pages | the `apt` job, from the release `.deb` files | every tag | the same static binary |
 | Scoop (Windows) | ScoopInstaller/Main | the bucket's autoupdate bot | GitHub release |
 | AUR `netwatch-tui`, `netwatch-tui-bin` | community maintainers | community | — |
 | nixpkgs | community maintainer | community | — |
@@ -92,6 +93,28 @@ inputs as available — the same profile as a host run. **Packet capture needs a
 rootful container**: rootless Docker or podman cannot grant `CAP_NET_RAW`, and
 capture fails even with `--cap-add`. Use `sudo docker run …`, or run netwatch
 outside a container if you mainly want the Packets tab.
+
+## The apt repository
+
+`https://matthart1983.github.io/netwatch/apt`, served from the `gh-pages`
+branch, amd64 and arm64. The `apt` job in `release.yml` copies each release's
+`.deb` files into `pool/main`, rebuilds the indices with `apt-ftparchive`,
+signs `Release` (both `InRelease` and the detached `Release.gpg`, for old and
+new clients) and force-pushes the branch. Older packages are kept, so a user
+holding a version back does not break.
+
+Self-hosted rather than a Launchpad PPA on purpose: the `.deb` carries a
+musl-static binary, so it installs on any current Debian or Ubuntu. A PPA
+builds from source against the distro's Rust — 24.04 LTS is on 1.75 — and
+forbids network access during builds, so every crate would have to be vendored.
+
+**Signing key.** A dedicated 4096-bit RSA key, "netwatch apt repository",
+expiring 2029-09-19. The public half is `packaging/apt/netwatch-archive-keyring.gpg`
+(published to the site as `apt/netwatch.gpg`); the private half is the
+`APT_GPG_PRIVATE_KEY` repository secret, with its id in `APT_GPG_KEY_ID`. It
+signs nothing but this repository. To rotate: generate a new key, replace both
+secrets and the file, and tell users to re-download the key — there is no
+revocation path that reaches them automatically.
 
 ## Repology
 

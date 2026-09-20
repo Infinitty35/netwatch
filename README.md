@@ -37,6 +37,19 @@ paru -S netwatch-tui                  # Arch (AUR, community-maintained)
 nix-shell -p netwatch                 # NixOS / Nix (community-maintained)
 ```
 
+Debian and Ubuntu, with `apt upgrade` from then on:
+
+```bash
+curl -fsSL https://matthart1983.github.io/netwatch/apt/netwatch.gpg \
+  | sudo tee /usr/share/keyrings/netwatch.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/netwatch.gpg] \
+https://matthart1983.github.io/netwatch/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/netwatch.list
+sudo apt update && sudo apt install netwatch
+```
+
+Fedora: `sudo dnf copr enable matthart1983/netwatch && sudo dnf install netwatch`.
+
 Or in a container, with the host's network and processes:
 
 ```bash
