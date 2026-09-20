@@ -9,6 +9,10 @@ All notable changes to NetWatch will be documented in this file.
   from the same static binary as the tarball. They install the binary, the
   shell completions, the man page and the agent unit, depend on nothing, and
   print the `setcap` command rather than granting capabilities themselves.
+- A multi-arch container image, `ghcr.io/matthart1983/netwatch`, built from the
+  release binary on Alpine (~26 MB). It carries `ss`, `ip`, `ping` and `iw`,
+  which netwatch shells out to; run it with `--net=host --pid=host
+  --cap-add=NET_RAW`. Capture needs a rootful container.
 - An RPM spec (`packaging/rpm/netwatch.spec`) for a Fedora COPR build from
   source against the system libpcap, and `docs/PACKAGING.md` describing every
   channel and the per-release steps.

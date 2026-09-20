@@ -58,6 +58,40 @@ generates `SHA256SUMS`, attests provenance, publishes to crates.io, and
 attaches everything to the GitHub release. Homebrew and Scoop follow on their
 own. COPR builds when its webhook fires.
 
+## Container image
+
+`ghcr.io/matthart1983/netwatch`, multi-arch (amd64 + arm64), built from the
+musl-static release binary on an Alpine base — about 26 MB.
+
+```sh
+docker run --rm -it --net=host --pid=host \
+  --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  ghcr.io/matthart1983/netwatch
+```
+
+Each flag earns its place:
+
+| Flag | Without it |
+|---|---|
+| `--net=host` | netwatch sees the container's veth, not the host's traffic |
+| `--pid=host` | no process attribution: `/proc/<pid>/fd` is the container's |
+| `--cap-add=NET_RAW` | packet capture fails with `socket: Operation not permitted` |
+| `--cap-add=NET_ADMIN` | interface state and some probes degrade |
+
+The image is not `scratch`. netwatch shells out to `ss` and `ip` (iproute2)
+for the connection table and routes, `ping` (iputils) for gateway and internet
+RTT, and `iw` for wireless signal; without `ss` in particular the Connections,
+Processes and Egress tabs are simply empty. Traceroute is native on Linux and
+needs no binary. `chronyc` is left out, so Diagnose reports NTP clock offset as
+unmeasured rather than guessing.
+
+Verified in the image (15-second live sample, rootless podman, host network):
+DNS, gateway, link, wifi, TCP socket metrics and STUN checks all report their
+inputs as available — the same profile as a host run. **Packet capture needs a
+rootful container**: rootless Docker or podman cannot grant `CAP_NET_RAW`, and
+capture fails even with `--cap-add`. Use `sudo docker run …`, or run netwatch
+outside a container if you mainly want the Packets tab.
+
 ## Setting up COPR (one-off)
 
 Not yet done — it needs a Fedora account, which CI cannot create.

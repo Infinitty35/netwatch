@@ -347,6 +347,51 @@ jobs:
             *.rpm
             SHA256SUMS
 
+  # Multi-arch image from the binaries the build job already produced, so the
+  # image, the tarball and the .deb are the same bytes. Pre-release tags get
+  # their version tag but never `:latest`.
+  container:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Lay out the build context
+        run: |
+          set -eux
+          mkdir -p packaging/docker/bin
+          tar xzf netwatch-linux-x86_64.tar.gz
+          tar xzf netwatch-linux-aarch64.tar.gz
+          mv netwatch-linux-x86_64 packaging/docker/bin/netwatch-amd64
+          mv netwatch-linux-aarch64 packaging/docker/bin/netwatch-arm64
+          chmod +x packaging/docker/bin/netwatch-*
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: packaging/docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
+            ${{ contains(env.RELEASE_TAG, '-') && '' || format('ghcr.io/{0}:latest', github.repository) }}
+
   publish:
     needs: release
     runs-on: ubuntu-latest

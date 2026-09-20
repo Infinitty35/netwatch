@@ -20,3 +20,4 @@ demo-linkedin.*
 perf.data
 perf.data.old
 flamegraph.svg
+packaging/docker/bin/
