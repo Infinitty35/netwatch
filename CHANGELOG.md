@@ -2,6 +2,17 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A release no longer goes out from a commit whose CI failed. 0.32.2 and
+  0.32.3 both reached every channel from red commits, because the release
+  workflow started on the tag push and never asked CI. It now waits for CI on
+  the tagged commit and builds nothing unless CI passed. It also refuses a tag
+  that differs from Cargo.toml's version or has no section in this file.
+  `scripts/release.sh X.Y.Z` makes the release commit and tag locally, with
+  the version bumped in Cargo.toml, Cargo.lock, the RPM spec and this file.
+
 ## [0.32.3] - 2026-09-20
 
 ### Fixed
