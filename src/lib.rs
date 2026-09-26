@@ -40,6 +40,7 @@ pub mod dpi;
 pub mod ebpf;
 pub mod event;
 pub mod graph;
+pub mod http;
 pub mod logging;
 pub mod metrics;
 pub mod platform;

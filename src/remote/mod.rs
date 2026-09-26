@@ -170,7 +170,14 @@ impl RemotePublisher {
                     continue;
                 }
 
-                match try_flush_once(&endpoint, &api_key, &host_info, &collectors_ok, &queue) {
+                match try_flush_once(
+                    &endpoint,
+                    &api_key,
+                    &host_info,
+                    &collectors_ok,
+                    &queue,
+                    None,
+                ) {
                     Some(SendOutcome::Ack) => {
                         backoff.reset();
                         next_send_at = now;
@@ -281,13 +288,16 @@ impl RemotePublisher {
 /// outcome. On `Ack` the batch is removed; on `Poison` it is dropped (and
 /// logged) so a bad payload can't wedge the queue; on `Retry` it is left in
 /// place for the next attempt. Shared by the steady-state loop and the
-/// shutdown drain so both speak the identical wire format.
+/// shutdown drain so both speak the identical wire format. With a
+/// `deadline`, the request as a whole gives up at that instant, not just
+/// each read or write within it.
 fn try_flush_once(
     endpoint: &str,
     api_key: &str,
     host_info: &serde_json::Value,
     collectors_ok: &AtomicBool,
     queue: &SnapshotQueue,
+    deadline: Option<Instant>,
 ) -> Option<SendOutcome> {
     if queue.is_empty() {
         return None;
@@ -305,10 +315,14 @@ fn try_flush_once(
         },
     });
 
-    let result = ureq::post(endpoint)
+    let mut request = crate::http::agent()
+        .post(endpoint)
         .set("Authorization", &format!("Bearer {}", api_key))
-        .set("Content-Type", "application/json")
-        .send_json(body);
+        .set("Content-Type", "application/json");
+    if let Some(deadline) = deadline {
+        request = request.timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+    let result = request.send_json(body);
 
     let outcome = match &result {
         Ok(_) => SendOutcome::Ack,
@@ -337,7 +351,8 @@ fn try_flush_once(
 /// Best-effort final flush on shutdown: send batches back-to-back until the
 /// queue empties or `budget` elapses. Retries here are short and unjittered —
 /// we're racing a deadline to avoid losing the last few snapshots, not pacing a
-/// reconnecting fleet.
+/// reconnecting fleet. Each request is cut off at the deadline too, so a
+/// backend that stops answering mid-request can't hold shutdown open.
 fn final_drain(
     endpoint: &str,
     api_key: &str,
@@ -348,10 +363,17 @@ fn final_drain(
 ) {
     let deadline = Instant::now() + budget;
     while !queue.is_empty() && Instant::now() < deadline {
-        if let Some(SendOutcome::Retry) =
-            try_flush_once(endpoint, api_key, host_info, collectors_ok, queue)
-        {
-            thread::sleep(Duration::from_millis(200));
+        if let Some(SendOutcome::Retry) = try_flush_once(
+            endpoint,
+            api_key,
+            host_info,
+            collectors_ok,
+            queue,
+            Some(deadline),
+        ) {
+            thread::sleep(
+                Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
     if !queue.is_empty() {
@@ -663,5 +685,31 @@ mod tests {
         // Server errors recover.
         assert_eq!(outcome_for_status(500), SendOutcome::Retry);
         assert_eq!(outcome_for_status(503), SendOutcome::Retry);
+    }
+
+    /// A backend that accepts the POST and never answers. The shared agent's
+    /// 10 s read timeout alone would outlast the drain's budget.
+    #[test]
+    fn final_drain_stops_at_its_deadline_when_the_backend_goes_quiet() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/api/v1/ingest", listener.local_addr().unwrap());
+        let _silent = thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(8).collect();
+            drop(held);
+        });
+        let queue = SnapshotQueue::new(QUEUE_CAP);
+        queue.push(json!({"n": 1}));
+
+        let started = Instant::now();
+        final_drain(
+            &endpoint,
+            "key",
+            &json!({}),
+            &AtomicBool::new(true),
+            &queue,
+            Duration::from_millis(300),
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(queue.len(), 1, "an unanswered batch stays queued");
     }
 }
