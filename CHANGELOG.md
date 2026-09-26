@@ -12,6 +12,13 @@ All notable changes to NetWatch will be documented in this file.
   that differs from Cargo.toml's version or has no section in this file.
   `scripts/release.sh X.Y.Z` makes the release commit and tag locally, with
   the version bumped in Cargo.toml, Cargo.lock, the RPM spec and this file.
+- Text that someone else chose can no longer drive your terminal. An SNI,
+  HTTP Host, DNS name, SSH banner, PTR record, whois or geo reply, process
+  name or interface name reached the screen raw, so a ClientHello with SNI
+  `ESC ]52;c;… BEL` wrote the viewer's clipboard, and a right-to-left override
+  could make one hostname read as another. Control, bidi and zero-width
+  characters now show as `·`, both where the text is collected and in every
+  drawn frame.
 
 ## [0.32.3] - 2026-09-20
 

@@ -158,7 +158,15 @@ fn lookup_whois(ip: &str) -> Option<WhoisInfo> {
     let url = format!("https://rdap.org/ip/{}", ip);
     let resp = ureq::get(&url).call().ok()?;
     let body = resp.into_string().ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    parse_rdap(&body)
+}
+
+/// The fields we show from an RDAP reply. Each is whatever the registrant
+/// typed, so each is made safe to draw.
+fn parse_rdap(body: &str) -> Option<WhoisInfo> {
+    use crate::ui::sanitize::display_owned;
+
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
 
     let name = v
         .get("name")
@@ -206,11 +214,11 @@ fn lookup_whois(ip: &str) -> Option<WhoisInfo> {
     let net_name = if !name.is_empty() { name } else { handle };
 
     Some(WhoisInfo {
-        net_name,
-        net_range,
-        org,
-        country,
-        description,
+        net_name: display_owned(net_name),
+        net_range: display_owned(net_range),
+        org: display_owned(org),
+        country: display_owned(country),
+        description: display_owned(description),
     })
 }
 
@@ -279,5 +287,27 @@ mod lifecycle_tests {
         let clone = cache.clone();
         assert!(clone.start());
         assert!(!cache.start());
+    }
+
+    #[test]
+    fn rdap_control_characters_are_replaced() {
+        let body = serde_json::json!({
+            "name": "NET\u{1b}]52;c;AAAA\u{7}",
+            "startAddress": "203.0.113.0",
+            "endAddress": "203.0.113.255\u{202E}",
+            "country": "AU\u{9b}2J",
+            "entities": [{
+                "roles": ["registrant"],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Evil\u{200B}Corp"]]],
+            }],
+            "remarks": [{"description": ["line one\nline two"]}],
+        })
+        .to_string();
+        let info = parse_rdap(&body).unwrap();
+        assert_eq!(info.net_name, "NET·]52;c;AAAA·");
+        assert_eq!(info.net_range, "203.0.113.0 - 203.0.113.255·");
+        assert_eq!(info.country, "AU·2J");
+        assert_eq!(info.org, "Evil·Corp");
+        assert_eq!(info.description, "line one·line two");
     }
 }

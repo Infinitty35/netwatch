@@ -129,19 +129,24 @@ fn dns_lookup_reverse(ip: &std::net::IpAddr) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_host_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The PTR name from `host` output, made safe to draw. Whoever controls the
+/// reverse zone for an address chooses this name, and `host` does not escape
+/// everything a terminal acts on.
+fn parse_host_output(text: &str) -> Option<String> {
     // Parse "X.X.X.X.in-addr.arpa domain name pointer hostname."
     let hostname = text
         .lines()
         .find(|l| l.contains("domain name pointer"))?
         .rsplit("pointer ")
         .next()?
-        .trim_end_matches('.')
-        .to_string();
+        .trim_end_matches('.');
     if hostname.is_empty() {
         None
     } else {
-        Some(hostname)
+        Some(crate::ui::sanitize::display(hostname).into_owned())
     }
 }
 
@@ -167,5 +172,18 @@ mod lifecycle_tests {
         let clone = cache.clone();
         assert!(clone.start());
         assert!(!cache.start());
+    }
+
+    #[test]
+    fn ptr_name_control_characters_are_replaced() {
+        let out = "7.113.0.203.in-addr.arpa domain name pointer evil\x1b]52;c;AAAA\x07\u{202E}.example.\n";
+        assert_eq!(
+            parse_host_output(out).as_deref(),
+            Some("evil·]52;c;AAAA··.example")
+        );
+        assert_eq!(
+            parse_host_output("Host 1.2.3.4 not found: 3(NXDOMAIN)\n"),
+            None
+        );
     }
 }

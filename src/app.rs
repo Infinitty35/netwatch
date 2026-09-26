@@ -2131,6 +2131,73 @@ fn build_connection_filter(conn: &Connection) -> String {
     parts.join(" and ")
 }
 
+/// Draw one frame of the TUI: the current view, then any open overlays.
+fn draw_frame(f: &mut Frame, app: &mut App) {
+    let area = f.size();
+    app.ui.last_area = area;
+    // Paint the theme's panel background AND default foreground
+    // first so themes that opt in (sky, paper) get a colored fill
+    // *and* a sane default text color behind everything. Setting
+    // both means ratatui's Buffer retains them under cells —
+    // subsequent renders that use `Style::default()` / `Span::raw`
+    // (no explicit fg) inherit the theme's text_primary instead
+    // of the terminal's own default fg, which would otherwise
+    // wash out unstyled body text on the painted bg.
+    //
+    // Themes with `bg: Color::Reset` paint nothing — terminal
+    // defaults stay in charge, preserving the historical look.
+    if app.theme.bg != ratatui::style::Color::Reset {
+        use ratatui::widgets::{Block, Borders};
+        f.render_widget(
+            Block::default().borders(Borders::NONE).style(
+                ratatui::style::Style::default()
+                    .bg(app.theme.bg)
+                    .fg(app.theme.text_primary),
+            ),
+            area,
+        );
+    }
+    match app.ui.view_mode {
+        ViewMode::Lite => ui::lite::render(f, app, area),
+        ViewMode::Dense => ui::dense::render(f, app, area),
+        ViewMode::Full => match app.ui.current_tab {
+            Tab::Dashboard => ui::dashboard::render(f, app, area),
+            Tab::Connections => ui::connections::render(f, app, area),
+            Tab::Interfaces => ui::interfaces::render(f, app, area),
+            Tab::Packets => ui::packets::render(f, app, area),
+            Tab::Stats => ui::stats::render(f, app, area),
+            Tab::Topology => ui::topology::render(f, app, area),
+            Tab::Timeline => ui::timeline::render(f, app, area),
+            Tab::Processes => ui::processes::render(f, app, area),
+            Tab::Diagnose => ui::diagnose::render(f, app, area),
+            Tab::Egress => ui::egress::render(f, app, area),
+        },
+    }
+    if app.ui.show_help {
+        ui::help::render(f, app, area);
+    }
+    if app.ui.show_settings {
+        ui::settings::render(f, app, area);
+    }
+    if app.ui.show_memory_stats {
+        ui::memory_stats::render(f, app, area);
+    }
+    if app.ui.sort_picker.is_open() {
+        ui::sort_picker::render(
+            f,
+            &app.ui.sort_picker,
+            sort_columns_for_tab(app.ui.current_tab),
+            app.ui.sort_states.get(&app.ui.current_tab),
+            &app.theme,
+            area,
+        );
+    }
+    // Last, after every widget has drawn: no control character reaches the
+    // terminal, whichever view or path put it in a cell. Ingest already
+    // replaces them in what we collect; this catches whatever it missed.
+    ui::sanitize::scrub_buffer(f.buffer_mut());
+}
+
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
@@ -2183,67 +2250,7 @@ pub async fn run<B: Backend>(
     // Each iteration is: render → wait → handle → repeat.
     // Collectors run on background threads and share state via Arc<Mutex<T>>.
     loop {
-        terminal.draw(|f| {
-            let area = f.size();
-            app.ui.last_area = area;
-            // Paint the theme's panel background AND default foreground
-            // first so themes that opt in (sky, paper) get a colored fill
-            // *and* a sane default text color behind everything. Setting
-            // both means ratatui's Buffer retains them under cells —
-            // subsequent renders that use `Style::default()` / `Span::raw`
-            // (no explicit fg) inherit the theme's text_primary instead
-            // of the terminal's own default fg, which would otherwise
-            // wash out unstyled body text on the painted bg.
-            //
-            // Themes with `bg: Color::Reset` paint nothing — terminal
-            // defaults stay in charge, preserving the historical look.
-            if app.theme.bg != ratatui::style::Color::Reset {
-                use ratatui::widgets::{Block, Borders};
-                f.render_widget(
-                    Block::default().borders(Borders::NONE).style(
-                        ratatui::style::Style::default()
-                            .bg(app.theme.bg)
-                            .fg(app.theme.text_primary),
-                    ),
-                    area,
-                );
-            }
-            match app.ui.view_mode {
-                ViewMode::Lite => ui::lite::render(f, &app, area),
-                ViewMode::Dense => ui::dense::render(f, &app, area),
-                ViewMode::Full => match app.ui.current_tab {
-                    Tab::Dashboard => ui::dashboard::render(f, &app, area),
-                    Tab::Connections => ui::connections::render(f, &app, area),
-                    Tab::Interfaces => ui::interfaces::render(f, &app, area),
-                    Tab::Packets => ui::packets::render(f, &app, area),
-                    Tab::Stats => ui::stats::render(f, &app, area),
-                    Tab::Topology => ui::topology::render(f, &app, area),
-                    Tab::Timeline => ui::timeline::render(f, &app, area),
-                    Tab::Processes => ui::processes::render(f, &app, area),
-                    Tab::Diagnose => ui::diagnose::render(f, &app, area),
-                    Tab::Egress => ui::egress::render(f, &app, area),
-                },
-            }
-            if app.ui.show_help {
-                ui::help::render(f, &app, area);
-            }
-            if app.ui.show_settings {
-                ui::settings::render(f, &app, area);
-            }
-            if app.ui.show_memory_stats {
-                ui::memory_stats::render(f, &app, area);
-            }
-            if app.ui.sort_picker.is_open() {
-                ui::sort_picker::render(
-                    f,
-                    &app.ui.sort_picker,
-                    sort_columns_for_tab(app.ui.current_tab),
-                    app.ui.sort_states.get(&app.ui.current_tab),
-                    &app.theme,
-                    area,
-                );
-            }
-        })?;
+        terminal.draw(|f| draw_frame(f, &mut app))?;
 
         match events.next().await? {
             AppEvent::Key(key) => {
@@ -5357,6 +5364,103 @@ mod tests {
         ];
         // No UP interface with IPv4 (besides lo) → any UP non-loopback.
         assert_eq!(App::pick_capture_interface(&info, None), "eno1");
+    }
+}
+
+#[cfg(test)]
+mod render_safety_tests {
+    use super::*;
+    use crate::ui::sanitize::is_unsafe;
+    use ratatui::backend::TestBackend;
+
+    /// An app showing one connection whose SNI and process name carry
+    /// escape sequences, as if an ingest path had let them through.
+    fn app_with_hostile_connection() -> App {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let mut conn = Connection {
+            protocol: "TCP".into(),
+            local_addr: "192.0.2.10:50000".into(),
+            remote_addr: "203.0.113.7:443".into(),
+            state: "ESTABLISHED".into(),
+            pid: Some(4242),
+            process_name: Some("sh\x1b]0;owned\x07".into()),
+            handshake_rtt_us: None,
+            rx_rate: Some(1000.0),
+            tx_rate: Some(100.0),
+            attribution: Default::default(),
+            evidence: Default::default(),
+            app_protocol: Some(crate::dpi::AppProtocol::Tls {
+                sni: Some("\x1b]52;c;AAAA\x07".into()),
+                alpn: Some("h2\u{202E}".into()),
+                ech: false,
+                ja4: None,
+            }),
+            retransmits: 0,
+            out_of_order: 0,
+        };
+        conn.evidence.observe();
+        app.connection_collector.publish_for_test(vec![conn]);
+        app.ui.connection_group = ConnectionGroup::None;
+        app
+    }
+
+    fn draw(app: &mut App) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal.draw(|f| draw_frame(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn unsafe_cells(buf: &Buffer) -> Vec<String> {
+        buf.content
+            .iter()
+            .filter(|c| c.symbol().chars().any(is_unsafe))
+            .map(|c| format!("{:?}", c.symbol()))
+            .collect()
+    }
+
+    /// The review's case: a ClientHello with SNI `ESC ]52;c;AAAA BEL` wrote
+    /// the viewer's clipboard as soon as its connection row was drawn.
+    #[test]
+    fn a_connection_row_with_an_osc52_sni_draws_no_control_character() {
+        let mut app = app_with_hostile_connection();
+        app.ui.current_tab = Tab::Connections;
+        let buf = draw(&mut app);
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("·]52;c;AAAA·"), "row was not drawn");
+        assert_eq!(unsafe_cells(&buf), Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_view_draws_a_control_character() {
+        let mut app = app_with_hostile_connection();
+        let tabs = [
+            Tab::Dashboard,
+            Tab::Connections,
+            Tab::Interfaces,
+            Tab::Packets,
+            Tab::Stats,
+            Tab::Topology,
+            Tab::Timeline,
+            Tab::Processes,
+            Tab::Diagnose,
+            Tab::Egress,
+        ];
+        for tab in tabs {
+            app.ui.current_tab = tab;
+            assert_eq!(
+                unsafe_cells(&draw(&mut app)),
+                Vec::<String>::new(),
+                "{tab:?}"
+            );
+        }
+        for view in [ViewMode::Lite, ViewMode::Dense] {
+            app.ui.view_mode = view;
+            assert_eq!(
+                unsafe_cells(&draw(&mut app)),
+                Vec::<String>::new(),
+                "{view:?}"
+            );
+        }
     }
 }
 

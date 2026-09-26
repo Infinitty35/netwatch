@@ -55,7 +55,8 @@ impl ConfigCollector {
             config: NetworkConfig {
                 gateway: None,
                 dns_servers: Vec::new(),
-                hostname,
+                // Topology draws it, and `sethostname` accepts any bytes.
+                hostname: crate::ui::sanitize::display_owned(hostname),
             },
         }
     }

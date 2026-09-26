@@ -7,6 +7,7 @@
 //! for 3.1) and a client ID string — both useful to surface.
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 pub struct MqttClassifier;
 
@@ -69,7 +70,7 @@ fn parse_connect(body: &[u8]) -> Option<AppProtocol> {
         client_id: if client_id.is_empty() {
             None
         } else {
-            Some(client_id.to_string())
+            Some(display(client_id).into_owned())
         },
     })
 }
@@ -116,6 +117,27 @@ mod tests {
             r,
             AppProtocol::Mqtt {
                 client_id: Some("my-client".into()),
+            }
+        );
+    }
+
+    /// The client id is the client's to choose.
+    #[test]
+    fn client_id_control_characters_are_replaced() {
+        let cid = "cam\x1b]52;c;AAAA\x07\u{200B}".as_bytes();
+        let mut body = vec![0x00, 0x04];
+        body.extend_from_slice(b"MQTT");
+        body.extend_from_slice(&[4, 0, 0, 60]);
+        body.extend_from_slice(&(cid.len() as u16).to_be_bytes());
+        body.extend_from_slice(cid);
+        let mut payload = vec![0x10, body.len() as u8];
+        payload.extend_from_slice(&body);
+
+        let r = MqttClassifier.classify(&payload, true).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Mqtt {
+                client_id: Some("cam·]52;c;AAAA··".into()),
             }
         );
     }

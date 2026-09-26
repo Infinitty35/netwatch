@@ -59,6 +59,16 @@ mod tests {
         assert!(LlmnrClassifier.classify(&p, true).is_none());
     }
 
+    /// Any host on the link can send an LLMNR query, for any name.
+    #[test]
+    fn qname_control_characters_are_replaced() {
+        let p = build_dns_query(&["wpad\x1b]0;owned\x07"], 1);
+        match LlmnrClassifier.classify(&p, false) {
+            Some(AppProtocol::Llmnr { qname, .. }) => assert_eq!(qname, "wpad·]0;owned·"),
+            other => panic!("expected Llmnr{{..}}, got {:?}", other),
+        }
+    }
+
     #[test]
     fn garbage_returns_none() {
         let p = vec![0u8; 8];

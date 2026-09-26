@@ -17,6 +17,7 @@ pub mod procname;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+use crate::ui::sanitize::display_owned;
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -54,7 +55,26 @@ pub struct InterfaceInfo {
     pub is_wireless: Option<bool>,
 }
 
+/// Interface names are the host's to choose: Linux accepts any byte but `/`,
+/// `:` and whitespace, ESC included, and a Windows alias is whatever an admin
+/// typed. Each name is made safe to draw here, so every caller gets it that
+/// way. The cost is that a name this changes no longer opens its device, and
+/// only whoever named the interface can cause that.
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
+    platform_interface_stats().map(displayable_stats)
+}
+
+fn displayable_stats(stats: HashMap<String, InterfaceStats>) -> HashMap<String, InterfaceStats> {
+    stats
+        .into_iter()
+        .map(|(name, mut stats)| {
+            stats.name = display_owned(stats.name);
+            (display_owned(name), stats)
+        })
+        .collect()
+}
+
+fn platform_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     #[cfg(target_os = "linux")]
     return linux::collect_interface_stats();
 
@@ -72,7 +92,14 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
 /// tell us. Used to bias capture-interface selection toward the NIC that
 /// actually carries traffic — on multi-NIC machines enumeration order says
 /// nothing about which port has the cable (issue #43).
+///
+/// Made safe to draw like [`collect_interface_stats`], so it still matches
+/// the names [`collect_interface_info`] returns.
 pub fn default_route_interface() -> Option<String> {
+    platform_default_route_interface().map(display_owned)
+}
+
+fn platform_default_route_interface() -> Option<String> {
     #[cfg(target_os = "linux")]
     return linux::default_route_interface();
 
@@ -162,7 +189,22 @@ pub fn link_speed_bps(_iface: &str) -> Option<u64> {
     None
 }
 
+/// Names made safe to draw, as in [`collect_interface_stats`].
 pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
+    platform_interface_info().map(displayable_info)
+}
+
+fn displayable_info(infos: Vec<InterfaceInfo>) -> Vec<InterfaceInfo> {
+    infos
+        .into_iter()
+        .map(|mut info| {
+            info.name = display_owned(info.name);
+            info
+        })
+        .collect()
+}
+
+fn platform_interface_info() -> Result<Vec<InterfaceInfo>> {
     #[cfg(target_os = "linux")]
     return linux::collect_interface_info();
 
@@ -197,5 +239,44 @@ mod link_speed_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod interface_name_tests {
+    use super::*;
+
+    const HOSTILE: &str = "eth\x1b]0;owned\x07\u{202E}0";
+
+    /// `ip link add $'eth\e]0;owned\a0' type dummy` puts an escape sequence
+    /// in every view that lists interfaces.
+    #[test]
+    fn interface_name_control_characters_are_replaced() {
+        let stats = InterfaceStats {
+            name: HOSTILE.into(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_drops: 0,
+            tx_drops: 0,
+            signal_dbm: None,
+            tx_retries: None,
+        };
+        let stats = displayable_stats(HashMap::from([(HOSTILE.to_string(), stats)]));
+        assert_eq!(stats["eth·]0;owned··0"].name, "eth·]0;owned··0");
+
+        let info = InterfaceInfo {
+            name: HOSTILE.into(),
+            ipv4: None,
+            ipv6: None,
+            mac: None,
+            mtu: None,
+            is_up: true,
+            is_wireless: None,
+        };
+        assert_eq!(displayable_info(vec![info])[0].name, "eth·]0;owned··0");
     }
 }

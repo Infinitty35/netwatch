@@ -647,7 +647,13 @@ impl NetworkIntelCollector {
         let alert = if event.qname.len() > DNS_TUNNEL_QNAME_LEN {
             // Check 1: very long qname.
             let msg = format!("Suspicious DNS: long query name ({}b)", event.qname.len());
-            let detail = format!("Query: {}", &event.qname[..event.qname.len().min(120)]);
+            // A byte cap, so back off to a char boundary: a label may be any
+            // UTF-8, and the `·` that replaces a control character is two bytes.
+            let mut end = event.qname.len().min(120);
+            while !event.qname.is_char_boundary(end) {
+                end -= 1;
+            }
+            let detail = format!("Query: {}", &event.qname[..end]);
             Some((AlertSeverity::Warning, msg, detail))
         } else if let Some(stats) = self.domain_tunnel_stats.get(&base) {
             // Check 2: high rate + many unique subdomains to one base domain.
@@ -824,6 +830,21 @@ mod tests {
             intel.active_alerts[0].category,
             AlertCategory::DnsTunnel
         ));
+    }
+
+    /// A qname whose 120th byte falls inside a multi-byte character, here the
+    /// `·` that ingest put in place of an ESC, used to panic the UI thread.
+    #[test]
+    fn long_qname_alert_cuts_on_a_char_boundary() {
+        let mut intel = NetworkIntelCollector::new();
+        let prefix = "a".repeat(119);
+        intel.on_dns_query(DnsQueryEvent {
+            txid: 1,
+            client_ip: "192.168.1.1".into(),
+            server_ip: "8.8.8.8".into(),
+            qname: format!("{prefix}{}.example.com", crate::ui::sanitize::REPLACEMENT),
+        });
+        assert_eq!(intel.active_alerts[0].detail, format!("Query: {prefix}"));
     }
 
     #[test]

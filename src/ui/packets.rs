@@ -423,7 +423,7 @@ fn preview_decrypted_bytes(bytes: &[u8], max_bytes: usize) -> String {
     };
     match std::str::from_utf8(trimmed) {
         Ok(s) => {
-            let mut out = s.replace(|c: char| c.is_control() && c != '\n', "·");
+            let mut out = crate::ui::sanitize::display_multiline(s).into_owned();
             if bytes.len() > max_bytes {
                 out.push('…');
             }
@@ -2448,6 +2448,18 @@ mod tests {
         assert_eq!(full.len(), 5000);
         let capped = preview_decrypted_bytes(&bytes, 100);
         assert!(capped.ends_with('…'));
+    }
+
+    /// Decrypted plaintext and HTTP/3 bodies are the server's to write. The
+    /// preview keeps its line breaks and loses everything else a terminal
+    /// would act on, bidi overrides included.
+    #[test]
+    fn preview_decrypted_replaces_control_characters_but_keeps_newlines() {
+        let body = "HTTP/1.1 200 OK\r\nX: \x1b]52;c;AAAA\x07\u{202E}\n\nbody";
+        assert_eq!(
+            preview_decrypted_bytes(body.as_bytes(), body.len()),
+            "HTTP/1.1 200 OK·\nX: ·]52;c;AAAA··\n\nbody"
+        );
     }
 
     fn dns_packet(

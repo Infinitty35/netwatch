@@ -337,6 +337,12 @@ impl ConnectionCollector {
         self
     }
 
+    /// Publish `rows` as if a poll had produced them, for render tests.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, rows: Vec<Connection>) {
+        *safe_write(&self.snapshot, "connections::publish") = Arc::new(rows);
+    }
+
     pub fn with_capture_stats(mut self, stats: Arc<super::packets::CaptureStats>) -> Self {
         self.capture_stats = Some(stats);
         self
@@ -472,6 +478,7 @@ impl ConnectionCollector {
             // nor version-stamped. Runs on the final (pid, name) pairs so it
             // corrects PKTAP and eBPF names too, not just lsof's.
             canonicalize_process_names(&mut result);
+            sanitize_process_names(&mut result);
 
             #[cfg(not(target_os = "linux"))]
             for conn in &mut result {
@@ -592,6 +599,19 @@ fn canonicalize_process_names(connections: &mut [Connection]) {
             conn.evidence.process = None;
             conn.evidence.unknown_reason = Some(super::attribution::UnknownReason::IdentityChanged);
         }
+    }
+}
+
+/// Make every process name safe to draw. Any local user can name a process
+/// whatever they like (`exec -a`, `prctl(PR_SET_NAME)`, the file name), and
+/// netwatch often runs with more privilege than they have. Runs after every
+/// attribution source has settled the name.
+fn sanitize_process_names(connections: &mut [Connection]) {
+    for conn in connections {
+        conn.process_name = conn
+            .process_name
+            .take()
+            .map(crate::ui::sanitize::display_owned);
     }
 }
 
@@ -1687,6 +1707,21 @@ mod tests {
         conns[1].process_name = Some("Google Chrome Helper".into());
         canonicalize_process_names(&mut conns);
         assert_eq!(conns[0].process_name, conns[1].process_name);
+    }
+
+    /// `exec -a $'sh\e]0;owned\a' sleep 60` is all it takes for any local
+    /// user to put an escape sequence in the process column.
+    #[test]
+    fn process_name_control_characters_are_replaced() {
+        let mut conns = vec![
+            make_conn("TCP", "1.2.3.4:1", "5.6.7.8:443", "ESTABLISHED", 1),
+            make_conn("TCP", "1.2.3.4:2", "5.6.7.9:443", "ESTABLISHED", 2),
+        ];
+        conns[0].process_name = Some("sh\x1b]0;owned\x07\u{202E}".into());
+        conns[1].process_name = None;
+        sanitize_process_names(&mut conns);
+        assert_eq!(conns[0].process_name.as_deref(), Some("sh·]0;owned··"));
+        assert_eq!(conns[1].process_name, None);
     }
 
     #[test]

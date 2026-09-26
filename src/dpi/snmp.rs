@@ -13,6 +13,7 @@
 //! we skip community extraction for it.
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 pub struct SnmpClassifier;
 
@@ -39,7 +40,7 @@ impl Classifier for SnmpClassifier {
         // For v1/v2c the community is the next field (OCTET STRING).
         let community = if v == 0 || v == 1 {
             let (s, _) = read_tlv(after_version, 0x04)?;
-            std::str::from_utf8(s).ok().map(|s| s.to_string())
+            std::str::from_utf8(s).ok().map(|s| display(s).into_owned())
         } else {
             None
         };
@@ -130,6 +131,20 @@ mod tests {
             AppProtocol::Snmp {
                 version: "v1".into(),
                 community: Some("private".into()),
+            }
+        );
+    }
+
+    /// The community is the sender's to choose, and it is shown in full.
+    #[test]
+    fn community_control_characters_are_replaced() {
+        let p = build_v2c_get("public\x1b]52;c;AAAA\x07\u{2066}".as_bytes());
+        let r = SnmpClassifier.classify(&p, false).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Snmp {
+                version: "v2c".into(),
+                community: Some("public·]52;c;AAAA··".into()),
             }
         );
     }

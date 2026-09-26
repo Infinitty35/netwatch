@@ -8,6 +8,7 @@
 //! (the protoversion) to avoid matching arbitrary text that starts with "SSH".
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 /// RFC 4253 caps the identification string at 255 bytes including CRLF.
 const MAX_BANNER: usize = 255;
@@ -38,7 +39,7 @@ impl Classifier for SshClassifier {
             return None;
         }
         Some(AppProtocol::Ssh {
-            version: version.to_string(),
+            version: display(version).into_owned(),
         })
     }
 }
@@ -91,6 +92,19 @@ mod tests {
             r,
             AppProtocol::Ssh {
                 version: "SSH-2.0-libssh_0.10.4".into()
+            }
+        );
+    }
+
+    /// The banner is the peer's to choose, and it is shown whole.
+    #[test]
+    fn banner_control_characters_are_replaced() {
+        let p = "SSH-2.0-x\x1b]52;c;AAAA\x07\u{202E}y\r\n";
+        let r = SshClassifier.classify(p.as_bytes(), true).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Ssh {
+                version: "SSH-2.0-x·]52;c;AAAA··y".into()
             }
         );
     }

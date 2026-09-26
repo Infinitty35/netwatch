@@ -27,6 +27,7 @@ use tls_parser::{
 
 use super::ja4::{self, Ja4Input};
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 /// IANA TLS ExtensionType code point for `encrypted_client_hello`
 /// (draft-ietf-tls-esni). tls-parser 0.12 doesn't have a typed variant
@@ -163,7 +164,7 @@ pub fn extract_handshake_metadata(handshake_bytes: &[u8]) -> HandshakeMetadata {
                 meta.sni = entries
                     .first()
                     .and_then(|(_, host)| std::str::from_utf8(host).ok())
-                    .map(|s| s.to_string());
+                    .map(|s| display(s).into_owned());
             }
             TlsExtension::ALPN(protos) => {
                 if let Some(first) = protos.first() {
@@ -238,12 +239,14 @@ impl Classifier for TlsClassifier {
                                     sni = entries
                                         .first()
                                         .and_then(|(_, host)| std::str::from_utf8(host).ok())
-                                        .map(|s| s.to_string());
+                                        .map(|s| display(s).into_owned());
                                 }
                                 TlsExtension::ALPN(protos) => {
                                     if let Some(first) = protos.first() {
                                         alpn_first_bytes = Some(*first);
-                                        alpn = std::str::from_utf8(first).ok().map(String::from);
+                                        alpn = std::str::from_utf8(first)
+                                            .ok()
+                                            .map(|s| display(s).into_owned());
                                     }
                                 }
                                 TlsExtension::SignatureAlgorithms(algs) => {
@@ -544,5 +547,61 @@ mod tests {
             }
             other => panic!("expected Tls{{..}}, got {:?}", other),
         }
+    }
+
+    /// A minimal TLS 1.2 ClientHello record carrying one SNI and one ALPN
+    /// protocol, both taken verbatim, so a test can put anything in them.
+    fn client_hello(sni: &[u8], alpn: &[u8]) -> Vec<u8> {
+        let be16 = |n: usize| (n as u16).to_be_bytes();
+        let mut exts = vec![0x00, 0x00];
+        exts.extend_from_slice(&be16(sni.len() + 5));
+        exts.extend_from_slice(&be16(sni.len() + 3));
+        exts.push(0x00); // host_name
+        exts.extend_from_slice(&be16(sni.len()));
+        exts.extend_from_slice(sni);
+        exts.extend_from_slice(&[0x00, 0x10]);
+        exts.extend_from_slice(&be16(alpn.len() + 3));
+        exts.extend_from_slice(&be16(alpn.len() + 1));
+        exts.push(alpn.len() as u8);
+        exts.extend_from_slice(alpn);
+
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x42; 32]); // random
+        body.push(0); // session id
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // one cipher suite
+        body.extend_from_slice(&[0x01, 0x00]); // null compression
+        body.extend_from_slice(&be16(exts.len()));
+        body.extend_from_slice(&exts);
+
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&be16(handshake.len()));
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// The SNI is the peer's to choose. OSC 52 in it would write the viewer's
+    /// clipboard the moment the connection row was drawn.
+    #[test]
+    fn sni_and_alpn_control_characters_are_replaced() {
+        let hello = client_hello(b"\x1b]52;c;AAAA\x07.example", b"h2\x1b[2J\xe2\x80\xae");
+        match TlsClassifier.classify(&hello, true) {
+            Some(AppProtocol::Tls { sni, alpn, .. }) => {
+                assert_eq!(sni.as_deref(), Some("·]52;c;AAAA·.example"));
+                assert_eq!(alpn.as_deref(), Some("h2·[2J·"));
+            }
+            other => panic!("expected Tls{{..}}, got {:?}", other),
+        }
+    }
+
+    /// The QUIC path reads the SNI through `extract_handshake_metadata`.
+    #[test]
+    fn handshake_metadata_sni_control_characters_are_replaced() {
+        let hello = client_hello(b"evil\x07\xe2\x80\xaemoc.example", b"h3");
+        let meta = extract_handshake_metadata(&hello[5..]);
+        assert_eq!(meta.sni.as_deref(), Some("evil··moc.example"));
     }
 }

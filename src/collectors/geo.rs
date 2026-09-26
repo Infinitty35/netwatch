@@ -15,6 +15,21 @@ pub struct GeoInfo {
     pub org: String,
 }
 
+impl GeoInfo {
+    /// Every field comes from a database file or an HTTP reply we did not
+    /// write (ip-api is cleartext, so anyone on path writes it), so each is
+    /// made safe to draw on the way in.
+    fn new(country_code: String, country: String, city: String, org: String) -> Self {
+        use crate::ui::sanitize::display_owned;
+        Self {
+            country_code: display_owned(country_code),
+            country: display_owned(country),
+            city: display_owned(city),
+            org: display_owned(org),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum GeoEntry {
     Resolved(GeoInfo),
@@ -97,12 +112,7 @@ impl MaxMindReader {
             String::new()
         };
 
-        Some(GeoInfo {
-            country_code,
-            country,
-            city,
-            org,
-        })
+        Some(GeoInfo::new(country_code, country, city, org))
     }
 }
 
@@ -297,23 +307,26 @@ fn lookup_geo_online(ip: &str) -> Option<GeoInfo> {
     );
     let resp = ureq::get(&url).call().ok()?;
     let body = resp.into_string().ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    parse_ip_api(&body)
+}
+
+fn parse_ip_api(body: &str) -> Option<GeoInfo> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
 
     if v.get("status")?.as_str()? != "success" {
         return None;
     }
 
-    Some(GeoInfo {
-        country_code: v.get("countryCode")?.as_str()?.to_string(),
-        country: v.get("country")?.as_str()?.to_string(),
-        city: v.get("city")?.as_str().unwrap_or("").to_string(),
-        org: v
-            .get("org")
+    Some(GeoInfo::new(
+        v.get("countryCode")?.as_str()?.to_string(),
+        v.get("country")?.as_str()?.to_string(),
+        v.get("city")?.as_str().unwrap_or("").to_string(),
+        v.get("org")
             .or_else(|| v.get("as"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -486,6 +499,23 @@ mod tests {
         assert!(!cache.has_offline_db());
         // Should still work via online fallback path
         assert!(cache.lookup("192.168.1.1").is_none()); // private
+    }
+
+    #[test]
+    fn ip_api_control_characters_are_replaced() {
+        let body = serde_json::json!({
+            "status": "success",
+            "countryCode": "AU",
+            "country": "Aus\u{202E}tralia",
+            "city": "Syd\u{1b}]52;c;AAAA\u{7}",
+            "org": "Evil\u{FEFF}Net",
+        })
+        .to_string();
+        let info = parse_ip_api(&body).unwrap();
+        assert_eq!(info.country_code, "AU");
+        assert_eq!(info.country, "Aus·tralia");
+        assert_eq!(info.city, "Syd·]52;c;AAAA·");
+        assert_eq!(info.org, "Evil·Net");
     }
 }
 

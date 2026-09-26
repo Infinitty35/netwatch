@@ -7,6 +7,7 @@
 //! notifications) — that's the service the message is about.
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 pub struct SsdpClassifier;
 
@@ -36,9 +37,11 @@ impl Classifier for SsdpClassifier {
         let target = text.lines().find_map(|l| {
             let lower = l.to_ascii_lowercase();
             if let Some(v) = lower.strip_prefix("st:") {
-                Some(v.trim().to_string())
+                Some(display(v.trim()).into_owned())
             } else {
-                lower.strip_prefix("nt:").map(|v| v.trim().to_string())
+                lower
+                    .strip_prefix("nt:")
+                    .map(|v| display(v.trim()).into_owned())
             }
         });
 
@@ -75,6 +78,20 @@ mod tests {
             AppProtocol::Ssdp {
                 method: "NOTIFY".into(),
                 target: Some("upnp:rootdevice".into()),
+            }
+        );
+    }
+
+    /// Any host on the link can multicast a NOTIFY with any target.
+    #[test]
+    fn target_control_characters_are_replaced() {
+        let p = "NOTIFY * HTTP/1.1\r\nNT: upnp:\x1b]52;c;AAAA\x07\u{FEFF}x\r\n\r\n";
+        let r = SsdpClassifier.classify(p.as_bytes(), false).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Ssdp {
+                method: "NOTIFY".into(),
+                target: Some("upnp:·]52;c;aaaa··x".into()),
             }
         );
     }

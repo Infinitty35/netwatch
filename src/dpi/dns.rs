@@ -22,6 +22,7 @@
 //! - We cap qname at 253 bytes (RFC 1035 max).
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display_owned;
 
 const MAX_QNAME_LEN: usize = 253;
 const HEADER_LEN: usize = 12;
@@ -97,7 +98,7 @@ impl Classifier for DnsClassifier {
             return None;
         }
         Some(AppProtocol::Dns {
-            qname: name,
+            qname: display_owned(name),
             qtype,
             rcode,
         })
@@ -183,6 +184,25 @@ mod tests {
     #[test]
     fn rejects_tcp_path() {
         assert!(DnsClassifier.classify(QUERY_EXAMPLE_COM_A, true).is_none());
+    }
+
+    /// A label is any 63 bytes the sender likes, so a query for an
+    /// attacker's name can carry an escape sequence into every view that
+    /// shows DNS.
+    #[test]
+    fn qname_control_characters_are_replaced() {
+        let mut payload = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["\x1b]52;c;AAAA\x07", "evil\u{202E}moc", "example"] {
+            payload.push(label.len() as u8);
+            payload.extend_from_slice(label.as_bytes());
+        }
+        payload.extend_from_slice(&[0, 0, 1, 0, 1]);
+        match DnsClassifier.classify(&payload, false) {
+            Some(AppProtocol::Dns { qname, .. }) => {
+                assert_eq!(qname, "·]52;c;AAAA·.evil·moc.example");
+            }
+            other => panic!("expected Dns{{..}}, got {:?}", other),
+        }
     }
 
     #[test]

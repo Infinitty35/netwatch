@@ -9,6 +9,7 @@ pub mod lite;
 pub mod memory_stats;
 pub mod packets;
 pub mod processes;
+pub mod sanitize;
 pub mod settings;
 pub mod sort_picker;
 pub mod stats;

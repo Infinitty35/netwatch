@@ -428,6 +428,8 @@ fn analysis_loop(
 
 /// Strip markdown formatting that renders as literal noise in a TUI.
 /// Removes **bold**, *italic*, `code`, and ## headers; collapses blank lines.
+/// Also makes each line safe to draw: the prompt quotes hostnames and SNIs a
+/// peer chose, and a model will repeat them, escape sequences included.
 fn clean_insight_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_blank = false;
@@ -455,7 +457,7 @@ fn clean_insight_text(text: &str) -> String {
             }
             prev_blank = true;
         } else {
-            out.push_str(line);
+            out.push_str(&crate::ui::sanitize::display(line));
             out.push('\n');
             prev_blank = false;
         }
@@ -785,5 +787,14 @@ mod tests {
         // protocol_counts only reflect the last 500 (indices 100..600)
         assert_eq!(snap.protocol_counts.get("OLD").copied().unwrap_or(0), 400);
         assert_eq!(snap.protocol_counts.get("NEW").copied().unwrap_or(0), 100);
+    }
+
+    #[test]
+    fn insight_text_control_characters_are_replaced() {
+        let reply = "## Summary\n\nTraffic to **evil\x1b]52;c;AAAA\x07.example**\u{202E}.\n";
+        assert_eq!(
+            clean_insight_text(reply),
+            "Summary\n\nTraffic to evil·]52;c;AAAA·.example·."
+        );
     }
 }

@@ -2592,10 +2592,9 @@ fn extract_sni(handshake: &[u8]) -> Option<String> {
                     u16::from_be_bytes([handshake[pos + 3], handshake[pos + 4]]) as usize;
                 let name_start = pos + 5;
                 if name_start + name_len <= handshake.len() {
-                    return Some(
-                        String::from_utf8_lossy(&handshake[name_start..name_start + name_len])
-                            .to_string(),
-                    );
+                    let name =
+                        String::from_utf8_lossy(&handshake[name_start..name_start + name_len]);
+                    return Some(crate::ui::sanitize::display(&name).into_owned());
                 }
             }
             return None;
@@ -4060,6 +4059,30 @@ mod tests {
         let stream = tracker.get_stream(idx).unwrap();
         assert_eq!(stream.retransmits_a_to_b, 0);
         assert_eq!(stream.out_of_order_a_to_b, 0);
+    }
+
+    /// The QUIC Initial fallback reads the SNI with its own walker, so it
+    /// needs the same treatment as `dpi::tls`.
+    #[test]
+    fn quic_fallback_sni_control_characters_are_replaced() {
+        let name = b"\x1b]52;c;AAAA\x07.example";
+        let mut hello = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        hello.extend_from_slice(&[0; 32]); // random
+        hello.push(0); // session id
+        hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        let n = name.len() as u16;
+        let mut ext = vec![0x00, 0x00];
+        ext.extend_from_slice(&(n + 5).to_be_bytes());
+        ext.extend_from_slice(&(n + 3).to_be_bytes());
+        ext.push(0); // host_name
+        ext.extend_from_slice(&n.to_be_bytes());
+        ext.extend_from_slice(name);
+        hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&ext);
+        assert_eq!(
+            extract_sni_for_quic(&hello).as_deref(),
+            Some("·]52;c;AAAA·.example")
+        );
     }
 }
 

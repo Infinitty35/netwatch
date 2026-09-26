@@ -13,6 +13,7 @@
 //! misclassified.
 
 use super::{AppProtocol, Classifier};
+use crate::ui::sanitize::display;
 
 /// Methods per RFC 7231 plus PATCH (RFC 5789). Upper-case, as on the wire.
 const METHODS: &[&str] = &[
@@ -57,7 +58,7 @@ impl Classifier for HttpClassifier {
         // The request-target sits between the method and the ` HTTP/1.x` token.
         let path = parts
             .next()
-            .map(|s| s.to_string())
+            .map(|s| display(s).into_owned())
             .filter(|s| !s.is_empty());
 
         let host = find_host_header(slice);
@@ -105,7 +106,7 @@ fn find_host_header(slice: &[u8]) -> Option<String> {
                 let value = &value[1..]; // skip ':'
                 return std::str::from_utf8(value)
                     .ok()
-                    .map(|s| s.trim().to_string())
+                    .map(|s| display(s.trim()).into_owned())
                     .filter(|s| !s.is_empty());
             }
         }
@@ -220,6 +221,23 @@ mod tests {
                 method: "CONNECT".into(),
                 host: Some("example.com:443".into()),
                 path: Some("example.com:443".into()),
+                status: None,
+            }
+        );
+    }
+
+    /// Host and path are the client's to choose. A cleartext request can
+    /// carry OSC 52 or a bidi override into the connections table.
+    #[test]
+    fn host_and_path_control_characters_are_replaced() {
+        let p = "GET /a\x1b]52;c;AAAA\x07 HTTP/1.1\r\nHost: evil\u{202E}moc.example\x1b[2J\r\n\r\n";
+        let r = HttpClassifier.classify(p.as_bytes(), true).unwrap();
+        assert_eq!(
+            r,
+            AppProtocol::Http {
+                method: "GET".into(),
+                host: Some("evil·moc.example·[2J".into()),
+                path: Some("/a·]52;c;AAAA·".into()),
                 status: None,
             }
         );
