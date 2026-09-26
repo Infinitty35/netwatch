@@ -9,10 +9,11 @@
 //! 2. For a STREAM that starts at offset 0 (so we have the head of the
 //!    request/response stream), parse the HTTP/3 framing layer
 //!    (RFC 9114 §7.1) and concatenate DATA-frame payloads.
-//! 3. Sniff / trial-decompress the body. The `Content-Encoding` lives in
-//!    the QPACK-compressed HEADERS frame, which we deliberately do *not*
-//!    decode — instead we detect gzip / zlib by magic bytes and attempt
-//!    brotli (which has no magic) as a fallback.
+//! 3. Sniff / trial-decompress the body. gzip and zlib are detected by
+//!    magic bytes. brotli has none, so it is tried only when the HEADERS
+//!    frame says `content-encoding: br` in a form readable without QPACK
+//!    decoder state (a static-table entry or a literal value; see
+//!    [`fields_declare_brotli`]). Output is capped at [`MAX_H3_BODY_BYTES`].
 //!
 //! ## Scope
 //! [`H3StreamReassembler`] (Phase 3b) accumulates STREAM-frame bytes per
@@ -58,6 +59,20 @@ pub struct DecodedBody {
     /// Stream the body came from (HTTP/3 request/response stream id).
     pub stream_id: u64,
     pub bytes: Vec<u8>,
+    /// The body decompressed to more than [`MAX_H3_BODY_BYTES`] and `bytes`
+    /// holds only the first of them.
+    pub truncated: bool,
+}
+
+impl DecodedBody {
+    /// Its size for a label: "N bytes", or "first N bytes" when truncated.
+    pub fn size_label(&self) -> String {
+        if self.truncated {
+            format!("first {} bytes", self.bytes.len())
+        } else {
+            format!("{} bytes", self.bytes.len())
+        }
+    }
 }
 
 /// Read a QUIC variable-length integer (RFC 9000 §16). Returns the value
@@ -230,14 +245,23 @@ pub fn extract_stream_chunks(frames: &[u8]) -> Vec<StreamChunk> {
 const H3_FRAME_DATA: u64 = 0x00;
 const H3_FRAME_HEADERS: u64 = 0x01;
 
+/// The DATA-frame payload of one HTTP/3 stream, and whether its HEADERS
+/// declared `content-encoding: br`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3Payload {
+    pub body: Vec<u8>,
+    pub brotli: bool,
+}
+
 /// Parse the HTTP/3 framing layer of a request/response stream that starts
 /// at offset 0 and concatenate the DATA-frame payloads. Returns `None` if
 /// the bytes don't parse as H3 framing or carry no DATA. A trailing frame
 /// truncated by the packet boundary is tolerated (we keep what parsed).
-pub fn h3_data_payload(stream: &[u8]) -> Option<Vec<u8>> {
+pub fn h3_data_payload(stream: &[u8]) -> Option<H3Payload> {
     let mut out = Vec::new();
     let mut pos = 0;
     let mut saw_known_frame = false;
+    let mut brotli = false;
     while pos < stream.len() {
         let (ftype, tu) = read_varint(&stream[pos..])?;
         let Some((flen, lu)) = read_varint(stream.get(pos + tu..)?) else {
@@ -263,7 +287,9 @@ pub fn h3_data_payload(stream: &[u8]) -> Option<Vec<u8>> {
                 if body_end > stream.len() {
                     break;
                 }
-                pos = body_end; // QPACK-compressed; we skip it
+                // QPACK-compressed; read only for the content coding.
+                brotli |= fields_declare_brotli(&stream[body_start..body_end]);
+                pos = body_end;
             }
             // Unknown/extension/GREASE frame — skip by its length.
             _ => {
@@ -275,56 +301,170 @@ pub fn h3_data_payload(stream: &[u8]) -> Option<Vec<u8>> {
         }
     }
     if saw_known_frame && !out.is_empty() {
-        Some(out)
+        Some(H3Payload { body: out, brotli })
     } else {
         None
     }
 }
 
-/// Sniff / trial-decompress an HTTP body. gzip and zlib are detected by
-/// magic bytes; brotli has none, so it's attempted last. Returns the coding
-/// and the decompressed bytes, or `None` if nothing produced sane output.
-pub fn decompress_body(body: &[u8]) -> Option<(BodyEncoding, Vec<u8>)> {
-    if body.len() < 2 {
-        return None;
-    }
-    // gzip: 1f 8b.
-    if body[0] == 0x1f && body[1] == 0x8b {
-        if let Some(out) = inflate_gzip(body) {
-            return Some((BodyEncoding::Gzip, out));
+/// QPACK static-table indexes (RFC 9204 Appendix A) of the two
+/// `content-encoding` entries: 42 is `content-encoding: br`, 43 is
+/// `content-encoding: gzip`.
+const QPACK_CONTENT_ENCODING_BR: u64 = 42;
+const QPACK_CONTENT_ENCODING_GZIP: u64 = 43;
+
+/// Whether a HEADERS frame's QPACK field section (RFC 9204 §4.5) says
+/// `content-encoding: br`. Reads only what needs no decoder state: the
+/// static-table entry, or a literal `br` value under a static or literal
+/// `content-encoding` name. A dynamic-table reference, or a name we would
+/// need Huffman-decoding to read, reads as "not br".
+fn fields_declare_brotli(fields: &[u8]) -> bool {
+    fn walk(fields: &[u8]) -> Option<bool> {
+        // Section prefix: Required Insert Count, then sign + Delta Base.
+        let (_, a) = read_prefixed_int(fields, 8)?;
+        let (_, b) = read_prefixed_int(fields.get(a..)?, 7)?;
+        let mut pos = a + b;
+        while let Some(&first) = fields.get(pos) {
+            let line = &fields[pos..];
+            if first & 0x80 != 0 {
+                // Indexed field line: 1 T index(6).
+                let (index, n) = read_prefixed_int(line, 6)?;
+                if first & 0x40 != 0 && index == QPACK_CONTENT_ENCODING_BR {
+                    return Some(true);
+                }
+                pos += n;
+            } else if first & 0x40 != 0 {
+                // Literal with name reference: 01 N T index(4), value.
+                let (index, n) = read_prefixed_int(line, 4)?;
+                let (value, huffman, m) = read_string(line.get(n..)?, 7)?;
+                let static_name = first & 0x10 != 0
+                    && matches!(
+                        index,
+                        QPACK_CONTENT_ENCODING_BR | QPACK_CONTENT_ENCODING_GZIP
+                    );
+                if static_name && value_is_br(value, huffman) {
+                    return Some(true);
+                }
+                pos += n + m;
+            } else if first & 0x20 != 0 {
+                // Literal with literal name: 001 N H length(3), name, value.
+                let (name, name_huffman, n) = read_string(line, 3)?;
+                let (value, huffman, m) = read_string(line.get(n..)?, 7)?;
+                if !name_huffman
+                    && name.eq_ignore_ascii_case(b"content-encoding")
+                    && value_is_br(value, huffman)
+                {
+                    return Some(true);
+                }
+                pos += n + m;
+            } else if first & 0x10 != 0 {
+                // Indexed with post-base index: 0001 index(4). Dynamic.
+                pos += read_prefixed_int(line, 4)?.1;
+            } else {
+                // Literal with post-base name reference: 0000 N index(3), value.
+                let (_, n) = read_prefixed_int(line, 3)?;
+                pos += n + read_string(line.get(n..)?, 7)?.2;
+            }
         }
+        Some(false)
     }
-    // zlib/deflate: 0x78 with a valid FCHECK (common variants 0x01/0x9c/0xda).
-    if body[0] == 0x78 {
-        if let Some(out) = inflate_zlib(body) {
-            return Some((BodyEncoding::Deflate, out));
+    walk(fields).unwrap_or(false)
+}
+
+/// Read an HPACK/QPACK prefixed integer (RFC 7541 §5.1) held in the low
+/// `bits` bits of the first byte. Returns the value and bytes consumed.
+fn read_prefixed_int(buf: &[u8], bits: u32) -> Option<(u64, usize)> {
+    let max = (1u64 << bits) - 1;
+    let value = u64::from(*buf.first()?) & max;
+    if value < max {
+        return Some((value, 1));
+    }
+    let mut value = value;
+    for (i, &byte) in buf.iter().enumerate().skip(1) {
+        let shift = 7 * (i as u32 - 1);
+        if shift > 56 {
+            return None;
         }
-    }
-    // brotli — no magic, so only accept if it yields non-empty output.
-    if let Some(out) = inflate_brotli(body) {
-        if !out.is_empty() {
-            return Some((BodyEncoding::Brotli, out));
+        value = value.checked_add(u64::from(byte & 0x7f) << shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
         }
     }
     None
 }
 
-fn inflate_gzip(body: &[u8]) -> Option<Vec<u8>> {
-    let mut d = flate2::read::GzDecoder::new(body);
-    let mut out = Vec::new();
-    d.read_to_end(&mut out).ok().map(|_| out)
+/// Read a string literal (RFC 9204 §4.1.2): a Huffman flag just above a
+/// `bits`-bit length prefix, then that many bytes. Returns the bytes, the
+/// flag and the bytes consumed.
+fn read_string(buf: &[u8], bits: u32) -> Option<(&[u8], bool, usize)> {
+    let huffman = buf.first()? & (1 << bits) != 0;
+    let (len, n) = read_prefixed_int(buf, bits)?;
+    let end = n.checked_add(usize::try_from(len).ok()?)?;
+    Some((buf.get(n..end)?, huffman, end))
 }
 
-fn inflate_zlib(body: &[u8]) -> Option<Vec<u8>> {
-    let mut d = flate2::read::ZlibDecoder::new(body);
-    let mut out = Vec::new();
-    d.read_to_end(&mut out).ok().map(|_| out)
+/// `br` as sent: plain, or Huffman-coded (RFC 7541 Appendix B: `b` is
+/// 100011, `r` is 101100, padded with ones to 0x8e 0xcf).
+fn value_is_br(value: &[u8], huffman: bool) -> bool {
+    if huffman {
+        value == [0x8e, 0xcf]
+    } else {
+        value.eq_ignore_ascii_case(b"br")
+    }
 }
 
-fn inflate_brotli(body: &[u8]) -> Option<Vec<u8>> {
-    let mut d = brotli::Decompressor::new(body, 4096);
+/// Most bytes one body decompresses to. A small compressed body can expand
+/// a thousandfold, so without a cap one response could take gigabytes.
+pub const MAX_H3_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Sniff / trial-decompress an HTTP body. gzip and zlib are detected by
+/// magic bytes. brotli has none, so it's tried only when `brotli_declared`
+/// (the response's HEADERS said `content-encoding: br`): trial-decoding
+/// arbitrary bytes as brotli gives false positives. Returns the coding, the
+/// decompressed bytes (at most [`MAX_H3_BODY_BYTES`]) and whether the body
+/// was cut short there, or `None` if nothing produced sane output.
+pub fn decompress_body(
+    body: &[u8],
+    brotli_declared: bool,
+) -> Option<(BodyEncoding, Vec<u8>, bool)> {
+    if body.len() < 2 {
+        return None;
+    }
+    // gzip: 1f 8b.
+    if body[0] == 0x1f && body[1] == 0x8b {
+        if let Some((out, truncated)) = inflate(flate2::read::GzDecoder::new(body)) {
+            return Some((BodyEncoding::Gzip, out, truncated));
+        }
+    }
+    // zlib/deflate: 0x78 with a valid FCHECK (common variants 0x01/0x9c/0xda).
+    if body[0] == 0x78 {
+        if let Some((out, truncated)) = inflate(flate2::read::ZlibDecoder::new(body)) {
+            return Some((BodyEncoding::Deflate, out, truncated));
+        }
+    }
+    // brotli — only accept if it yields non-empty output.
+    if brotli_declared {
+        if let Some((out, truncated)) = inflate(brotli::Decompressor::new(body, 4096)) {
+            if !out.is_empty() {
+                return Some((BodyEncoding::Brotli, out, truncated));
+            }
+        }
+    }
+    None
+}
+
+/// Read a decoder to the end or to [`MAX_H3_BODY_BYTES`], whichever comes
+/// first. The flag is true when the decoder had more to give.
+fn inflate(mut decoder: impl Read) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    d.read_to_end(&mut out).ok().map(|_| out)
+    decoder
+        .by_ref()
+        .take(MAX_H3_BODY_BYTES)
+        .read_to_end(&mut out)
+        .ok()?;
+    let truncated =
+        out.len() as u64 == MAX_H3_BODY_BYTES && !matches!(decoder.read(&mut [0u8; 1]), Ok(0));
+    Some((out, truncated))
 }
 
 /// Per-stream byte cap and concurrent-stream cap, to bound memory on a busy
@@ -447,11 +587,12 @@ impl H3StreamReassembler {
                 st.decoded_len = clen;
                 let prev_len = st.decoded.as_ref().map(|d| d.bytes.len());
                 st.decoded = h3_data_payload(&st.data[..clen])
-                    .and_then(|body| decompress_body(&body))
-                    .map(|(encoding, bytes)| DecodedBody {
+                    .and_then(|p| decompress_body(&p.body, p.brotli))
+                    .map(|(encoding, bytes, truncated)| DecodedBody {
                         encoding,
                         stream_id,
                         bytes,
+                        truncated,
                     });
                 if let Some(body) = &st.decoded {
                     if Some(body.bytes.len()) != prev_len {
@@ -547,10 +688,80 @@ mod tests {
             (zlib(&payload), BodyEncoding::Deflate),
             (brotli(&payload), BodyEncoding::Brotli),
         ] {
-            let (enc, out) = decompress_body(&mk).expect("must decompress");
+            let (enc, out, truncated) = decompress_body(&mk, true).expect("must decompress");
             assert_eq!(enc, want);
             assert_eq!(out, payload);
+            assert!(!truncated);
         }
+    }
+
+    #[test]
+    fn brotli_is_tried_only_when_the_headers_declare_it() {
+        let payload = b"hello world, this is a compressible body ".repeat(8);
+        assert_eq!(decompress_body(&brotli(&payload), false), None);
+        // The magic-number codings don't need the header.
+        assert!(decompress_body(&gzip(&payload), false).is_some());
+    }
+
+    #[test]
+    fn decompression_stops_at_the_cap_and_says_so() {
+        let cap = MAX_H3_BODY_BYTES as usize;
+        let (_, out, truncated) = decompress_body(&gzip(&vec![0; cap + 1]), false).unwrap();
+        assert_eq!(out.len(), cap);
+        assert!(truncated);
+        let shown = DecodedBody {
+            encoding: BodyEncoding::Gzip,
+            stream_id: 0,
+            bytes: out,
+            truncated,
+        };
+        assert_eq!(shown.size_label(), format!("first {cap} bytes"));
+        // Exactly the cap is the whole body, not a truncated one.
+        let (_, out, truncated) = decompress_body(&gzip(&vec![0; cap]), false).unwrap();
+        assert_eq!(out.len(), cap);
+        assert!(!truncated);
+    }
+
+    /// A QPACK field section with an empty dynamic table, then `lines`.
+    fn fields(lines: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x00, 0x00];
+        f.extend_from_slice(lines);
+        f
+    }
+
+    #[test]
+    fn content_encoding_br_is_read_from_every_stateless_form() {
+        // Static entry 42, `content-encoding: br`.
+        assert!(fields_declare_brotli(&fields(&[0xc0 | 42])));
+        // Static name 42 with a Huffman-coded `br` value (index 42 spills
+        // past the 4-bit prefix: 15 + 27).
+        assert!(fields_declare_brotli(&fields(&[
+            0x5f, 0x1b, 0x82, 0x8e, 0xcf
+        ])));
+        // Static name 43 (`content-encoding: gzip`) with a plain `br` value.
+        assert!(fields_declare_brotli(&fields(&[
+            0x5f, 0x1c, 0x02, b'b', b'r'
+        ])));
+        // A literal name (length 16 = 7 + 9) and a plain value, after an
+        // unrelated static `:status: 200` (index 25).
+        let mut literal = vec![0xc0 | 25, 0x27, 0x09];
+        literal.extend_from_slice(b"content-encoding");
+        literal.extend_from_slice(&[0x02, b'b', b'r']);
+        assert!(fields_declare_brotli(&fields(&literal)));
+    }
+
+    #[test]
+    fn other_codings_and_unreadable_sections_are_not_brotli() {
+        // Static entry 43, `content-encoding: gzip`.
+        assert!(!fields_declare_brotli(&fields(&[0xc0 | 43])));
+        // Static entry 31, `accept-encoding: gzip, deflate, br`.
+        assert!(!fields_declare_brotli(&fields(&[0xc0 | 31])));
+        // Dynamic-table entry 42: its content is unknown without decoder state.
+        assert!(!fields_declare_brotli(&fields(&[0x80 | 42])));
+        // Cut off inside an integer, and inside a string.
+        assert!(!fields_declare_brotli(&fields(&[0x5f])));
+        assert!(!fields_declare_brotli(&fields(&[0x5f, 0x1b, 0x82, 0x8e])));
+        assert!(!fields_declare_brotli(&[]));
     }
 
     #[test]
@@ -590,8 +801,39 @@ mod tests {
         stream.extend(varint(fake_qpack.len() as u64));
         stream.extend_from_slice(&fake_qpack);
         stream.extend(h3_data_frame(b"real-body"));
-        let body = h3_data_payload(&stream).expect("must find DATA after HEADERS");
-        assert_eq!(body, b"real-body");
+        let payload = h3_data_payload(&stream).expect("must find DATA after HEADERS");
+        assert_eq!(payload.body, b"real-body");
+        assert!(!payload.brotli);
+    }
+
+    /// Build an HTTP/3 HEADERS frame carrying a QPACK field section.
+    fn h3_headers_frame(section: &[u8]) -> Vec<u8> {
+        let mut f = varint(H3_FRAME_HEADERS);
+        f.extend(varint(section.len() as u64));
+        f.extend_from_slice(section);
+        f
+    }
+
+    #[test]
+    fn reassembler_decodes_brotli_only_under_a_br_header() {
+        let body = b"a brotli response body ".repeat(40);
+        let data = h3_data_frame(&brotli(&body));
+
+        let mut declared = h3_headers_frame(&fields(&[0xc0 | 42]));
+        declared.extend_from_slice(&data);
+        let mut r = H3StreamReassembler::new();
+        r.ingest(false, &stream_frame(0, 0, &declared));
+        let bodies = r.decoded_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0].encoding, BodyEncoding::Brotli);
+        assert_eq!(bodies[0].bytes, body);
+        assert_eq!(bodies[0].size_label(), format!("{} bytes", body.len()));
+
+        let mut undeclared = h3_headers_frame(&fields(&[0xc0 | 25]));
+        undeclared.extend_from_slice(&data);
+        let mut r = H3StreamReassembler::new();
+        r.ingest(false, &stream_frame(0, 0, &undeclared));
+        assert!(r.decoded_bodies().is_empty());
     }
 
     #[test]

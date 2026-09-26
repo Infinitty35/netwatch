@@ -312,10 +312,10 @@ pub fn format_packet_for_clipboard(
             for decoded in h3_bodies {
                 let _ = writeln!(
                     s,
-                    "  ── HTTP/3 stream {} · {} body ({} bytes) ──",
+                    "  ── HTTP/3 stream {} · {} body ({}) ──",
                     decoded.stream_id,
                     decoded.encoding.label(),
-                    decoded.bytes.len()
+                    decoded.size_label()
                 );
                 s.push_str(&preview_decrypted_bytes(
                     &decoded.bytes,
@@ -1039,10 +1039,10 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                     for decoded in &bodies {
                         detail_lines.push(Line::from(Span::styled(
                             format!(
-                                "  HTTP/3 stream {} · {} body → {} bytes",
+                                "  HTTP/3 stream {} · {} body → {}",
                                 decoded.stream_id,
                                 decoded.encoding.label(),
-                                decoded.bytes.len()
+                                decoded.size_label()
                             ),
                             Style::default().fg(app.theme.status_good),
                         )));
@@ -1211,10 +1211,10 @@ fn render_detail(f: &mut Frame, app: &App, packets: &[CapturedPacket], area: Rec
                                 .unwrap_or_default();
                             for decoded in &bodies {
                                 body.push_str(&format!(
-                                    "\n── HTTP/3 stream {} · {} body ({} bytes) ──\n",
+                                    "\n── HTTP/3 stream {} · {} body ({}) ──\n",
                                     decoded.stream_id,
                                     decoded.encoding.label(),
-                                    decoded.bytes.len()
+                                    decoded.size_label()
                                 ));
                                 body.push_str(&preview_decrypted_bytes(&decoded.bytes, 16384));
                             }
