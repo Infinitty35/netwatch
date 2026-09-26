@@ -1888,6 +1888,11 @@ impl App {
             self.conn_tick = 0;
             self.connection_collector.update();
             let conns = self.connection_collector.connections();
+            // Reverse DNS resolves only the far ends of these connections,
+            // not every address a packet claims to come from.
+            self.packet_collector
+                .dns_cache
+                .set_peers(conns.iter().map(|c| c.remote_addr.as_str()));
             self.connection_timeline.update(&conns);
             // Observe-mode egress profiling (Horizon 3): learn per-process
             // {SNI, ASN, port} baselines from the live connection table, and

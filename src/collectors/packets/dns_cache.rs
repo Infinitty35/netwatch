@@ -1,24 +1,84 @@
 //! Reverse-DNS cache: asynchronous PTR resolution on a background worker
 //! thread, with bounded eviction and pending-entry expiry.
+//!
+//! Only the far ends of this host's own connections are looked up (see
+//! [`DnsCache::set_peers`]). Every captured packet asks for both of its
+//! addresses, and anyone can send a packet from any address, so looking up
+//! every source let a flood of spoofed sources fill the queue and the cache.
 
-use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
-const DNS_CACHE_MAX: usize = 4096; // max resolved hostname entries kept in memory
+const DNS_CACHE_MAX: usize = 4096; // max entries kept in memory, pending ones included
+
+/// Lookups queued for the resolver thread at most. `host -W 1` can take a
+/// second each, so a request far back in a longer queue would outlive
+/// `DNS_PENDING_TIMEOUT` before it ran. A request that finds the queue full
+/// is dropped and asked again on a later lookup.
+const DNS_QUEUE_MAX: usize = 256;
 
 #[derive(Clone)]
 pub struct DnsCache {
-    cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
-    tx: std_mpsc::Sender<String>,
+    cache: Arc<Mutex<Entries>>,
+    tx: std_mpsc::SyncSender<String>,
     pending_rx: Arc<Mutex<Option<std_mpsc::Receiver<String>>>>,
+    /// Addresses a PTR lookup may be queued for. Anything else is only read
+    /// from the cache.
+    peers: Arc<Mutex<HashSet<IpAddr>>>,
+}
+
+/// The cache's entries, evicted least recently used first.
+#[derive(Default)]
+struct Entries {
+    map: HashMap<String, Slot>,
+    /// Advanced on every read and write; a slot keeps the value from its
+    /// last one.
+    clock: u64,
+}
+
+struct Slot {
+    entry: DnsEntry,
+    used: u64,
+}
+
+impl Entries {
+    fn get(&mut self, ip: &str) -> Option<&DnsEntry> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.map.get_mut(ip).map(|slot| {
+            slot.used = clock;
+            &slot.entry
+        })
+    }
+
+    /// Insert or replace. A new address in a full cache first evicts the
+    /// least recently used quarter, so the sort is paid once per
+    /// `DNS_CACHE_MAX / 4` insertions.
+    fn put(&mut self, ip: String, entry: DnsEntry) {
+        if self.map.len() >= DNS_CACHE_MAX && !self.map.contains_key(&ip) {
+            let mut by_use: Vec<(u64, String)> = self
+                .map
+                .iter()
+                .map(|(ip, slot)| (slot.used, ip.clone()))
+                .collect();
+            by_use.sort_unstable();
+            for (_, ip) in by_use.into_iter().take(DNS_CACHE_MAX / 4) {
+                self.map.remove(&ip);
+            }
+        }
+        self.clock += 1;
+        let used = self.clock;
+        self.map.insert(ip, Slot { entry, used });
+    }
 }
 
 /// Per-IP resolution state in `DnsCache`.
 ///
 /// Transitions:
-///   None → Pending   (first lookup: request queued to resolver thread)
+///   None → Pending   (first lookup of a peer: request queued to resolver
+///                     thread; stays None if the queue is full)
 ///   Pending → Resolved | Failed  (resolver thread writes result back)
 ///
 /// `Pending` entries carry the time they were inserted so stale ones can be
@@ -38,13 +98,38 @@ const DNS_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 impl DnsCache {
     pub(crate) fn new() -> Self {
-        let (tx, rx) = std_mpsc::channel::<String>();
-        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = std_mpsc::sync_channel::<String>(DNS_QUEUE_MAX);
+        let cache = Arc::new(Mutex::new(Entries::default()));
         Self {
             cache,
             tx,
             pending_rx: Arc::new(Mutex::new(Some(rx))),
+            peers: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Replace the set of addresses PTR lookups may be queued for with the
+    /// remote ends of `remote_addrs`, the connection table's `ip:port` (or
+    /// `[ip]:port`) strings. Wildcards and unspecified addresses are skipped.
+    ///
+    /// A connection in the table has one end on this host, so the rule is:
+    /// resolve a peer this host is talking to, never an address merely seen
+    /// on the wire. A spoofed source gets a row only as a half-open
+    /// connection, and the kernel bounds how many of those it keeps.
+    pub fn set_peers<'a>(&self, remote_addrs: impl IntoIterator<Item = &'a str>) {
+        let peers: HashSet<IpAddr> = remote_addrs
+            .into_iter()
+            .filter_map(|addr| crate::app::parse_addr_parts(addr).0)
+            .filter_map(|ip| parse_ip(&ip))
+            .filter(|ip| !ip.is_unspecified())
+            .collect();
+        *crate::app::safe_lock(&self.peers, "dns_cache::set_peers") = peers;
+    }
+
+    fn is_peer(&self, ip: &str) -> bool {
+        parse_ip(ip).is_some_and(|ip| {
+            crate::app::safe_lock(&self.peers, "dns_cache::is_peer").contains(&ip)
+        })
     }
 
     /// Start PTR resolution explicitly, once across all clones.
@@ -58,18 +143,8 @@ impl DnsCache {
                 let hostname = resolve_ip(&ip);
                 let mut c = crate::app::safe_lock(&resolver_cache, "dns_cache::resolve");
                 match hostname {
-                    Some(name) => {
-                        c.insert(ip, DnsEntry::Resolved(name));
-                    }
-                    None => {
-                        c.insert(ip, DnsEntry::Failed);
-                    }
-                }
-                if c.len() > DNS_CACHE_MAX {
-                    let keys: Vec<String> = c.keys().take(DNS_CACHE_MAX / 4).cloned().collect();
-                    for k in keys {
-                        c.remove(&k);
-                    }
+                    Some(name) => c.put(ip, DnsEntry::Resolved(name)),
+                    None => c.put(ip, DnsEntry::Failed),
                 }
             }
         });
@@ -93,20 +168,35 @@ impl DnsCache {
             }
             None => {}
         }
-        cache.insert(
-            ip.to_string(),
-            DnsEntry::Pending {
-                queued_at: std::time::Instant::now(),
-            },
-        );
-        if let Err(e) = self.tx.send(ip.to_string()) {
-            // Channel send only fails if the resolver thread has died.
-            // Symptom would be lookups silently stalled forever — log so
-            // we can tell that's what happened.
-            tracing::error!(target: "netwatch::dns_cache", error = %e, "resolver thread is gone; reverse-DNS will not progress");
+        if !self.is_peer(ip) {
+            return None;
+        }
+        match self.tx.try_send(ip.to_string()) {
+            Ok(()) => cache.put(
+                ip.to_string(),
+                DnsEntry::Pending {
+                    queued_at: std::time::Instant::now(),
+                },
+            ),
+            // Queue full: record nothing, so the next lookup asks again.
+            Err(std_mpsc::TrySendError::Full(_)) => {}
+            Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
+                // Channel send only fails if the resolver thread has died.
+                // Symptom would be lookups silently stalled forever — log so
+                // we can tell that's what happened.
+                tracing::error!(target: "netwatch::dns_cache", error = %e, "resolver thread is gone; reverse-DNS will not progress");
+            }
         }
         None
     }
+}
+
+/// An address as the capture and the connection table print it: IPv6
+/// possibly with a `%zone`, IPv4 possibly mapped into IPv6. Both reduce to
+/// the plain address, so the two sources agree.
+fn parse_ip(ip: &str) -> Option<IpAddr> {
+    let ip = ip.split('%').next()?;
+    ip.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
 }
 
 fn resolve_ip(ip: &str) -> Option<String> {
@@ -157,6 +247,7 @@ mod lifecycle_tests {
     #[test]
     fn prepared_cache_queues_until_explicit_start_and_clones_share_one_worker() {
         let cache = DnsCache::new();
+        cache.set_peers(["192.0.2.1:443"]);
         cache.lookup("192.0.2.1");
         assert_eq!(
             cache
@@ -177,7 +268,7 @@ mod lifecycle_tests {
     #[test]
     fn lookup_reads_through_a_cache_the_capture_thread_poisoned() {
         let cache = DnsCache::new();
-        cache.cache.lock().unwrap().insert(
+        cache.cache.lock().unwrap().put(
             "192.0.2.1".into(),
             DnsEntry::Resolved("host.example".into()),
         );
@@ -188,6 +279,83 @@ mod lifecycle_tests {
         assert!(cache.cache.is_poisoned());
         assert_eq!(cache.lookup("192.0.2.1").as_deref(), Some("host.example"));
         assert_eq!(cache.lookup("192.0.2.2"), None);
+    }
+
+    /// What the resolver thread would be handed next, drained.
+    fn queued(cache: &DnsCache) -> Vec<String> {
+        let rx = cache.pending_rx.lock().unwrap();
+        rx.as_ref().unwrap().try_iter().collect()
+    }
+
+    #[test]
+    fn only_peers_of_this_hosts_connections_are_looked_up() {
+        let cache = DnsCache::new();
+        cache.set_peers([
+            "198.51.100.7:443",
+            "[2001:db8::7]:443",
+            "[::ffff:198.51.100.8]:22",
+            "*:*",
+            "0.0.0.0:*",
+        ]);
+        // A source merely seen on the wire, say a spoofed one: cache only.
+        assert_eq!(cache.lookup("203.0.113.9"), None);
+        assert_eq!(cache.lookup("0.0.0.0"), None);
+        assert!(queued(&cache).is_empty());
+        assert!(cache.cache.lock().unwrap().map.is_empty());
+
+        cache.lookup("198.51.100.7");
+        cache.lookup("2001:db8::7");
+        // The v4-mapped row and the plain v4 packet address are one peer.
+        cache.lookup("198.51.100.8");
+        assert_eq!(
+            queued(&cache),
+            ["198.51.100.7", "2001:db8::7", "198.51.100.8"]
+        );
+
+        // The next refresh replaces the set: a closed connection's peer is
+        // no longer looked up once its pending entry is gone.
+        cache.set_peers(["192.0.2.1:80"]);
+        cache.cache.lock().unwrap().map.clear();
+        cache.lookup("198.51.100.7");
+        assert!(queued(&cache).is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_request_and_records_nothing() {
+        let cache = DnsCache::new();
+        let peers: Vec<String> = (0..DNS_QUEUE_MAX + 10)
+            .map(|i| format!("10.{}.{}.1:443", i / 256, i % 256))
+            .collect();
+        cache.set_peers(peers.iter().map(String::as_str));
+        for peer in &peers {
+            cache.lookup(peer.trim_end_matches(":443"));
+        }
+        assert_eq!(cache.cache.lock().unwrap().map.len(), DNS_QUEUE_MAX);
+        assert_eq!(queued(&cache).len(), DNS_QUEUE_MAX);
+        // With room again, a dropped request is asked for on its next lookup.
+        let dropped = peers.last().unwrap().trim_end_matches(":443");
+        cache.lookup(dropped);
+        assert_eq!(queued(&cache), [dropped]);
+    }
+
+    #[test]
+    fn the_cache_is_capped_and_evicts_the_least_recently_used() {
+        let mut entries = Entries::default();
+        let failed = |i: usize| format!("10.0.{}.{}", i / 256, i % 256);
+        for i in 0..DNS_CACHE_MAX {
+            entries.put(failed(i), DnsEntry::Failed);
+        }
+        // Read the oldest entry, so it is no longer the least recently used.
+        assert!(entries.get(&failed(0)).is_some());
+        entries.put("192.0.2.1".into(), DnsEntry::Failed);
+        assert_eq!(entries.map.len(), DNS_CACHE_MAX - DNS_CACHE_MAX / 4 + 1);
+        assert!(entries.map.contains_key(&failed(0)));
+        assert!(!entries.map.contains_key(&failed(1)));
+        assert!(entries.map.contains_key(&failed(DNS_CACHE_MAX / 4 + 1)));
+        for i in 0..DNS_CACHE_MAX * 2 {
+            entries.put(format!("10.1.{}.{}", i / 256, i % 256), DnsEntry::Failed);
+            assert!(entries.map.len() <= DNS_CACHE_MAX);
+        }
     }
 
     #[test]
