@@ -14,6 +14,8 @@ pub struct Component {
 struct Policy {
     mode: Mode,
     paths: SandboxPaths,
+    /// Shared by every worker and the UI, the capture thread included, so
+    /// every access goes through `safe_lock`.
     components: Mutex<BTreeMap<String, Component>>,
     #[cfg(target_os = "linux")]
     prepared: Result<landlock::RulesetCreated, String>,
@@ -133,7 +135,7 @@ pub fn mode() -> Mode {
 }
 pub fn begin(name: &str) {
     if let Some(p) = POLICY.get() {
-        let mut components = p.components.lock().unwrap();
+        let mut components = crate::app::safe_lock(&p.components, "worker::begin");
         if components.get(name).is_some_and(|s| s.error.is_some()) {
             return;
         }
@@ -155,7 +157,7 @@ pub fn begin(name: &str) {
 /// failure, because a partial guarantee is not the one strict promises.
 pub fn note(name: &str, detail: impl Into<String>) {
     if let Some(p) = POLICY.get() {
-        let mut components = p.components.lock().unwrap();
+        let mut components = crate::app::safe_lock(&p.components, "worker::note");
         let detail = detail.into();
         let strict = matches!(p.mode, Mode::Strict);
         components.insert(
@@ -171,7 +173,7 @@ pub fn note(name: &str, detail: impl Into<String>) {
 
 pub fn fail(name: &str, error: impl Into<String>) {
     if let Some(p) = POLICY.get() {
-        p.components.lock().unwrap().insert(
+        crate::app::safe_lock(&p.components, "worker::fail").insert(
             name.into(),
             Component {
                 ready: false,
@@ -215,7 +217,7 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
         PROBES.lock().unwrap().insert(name.into(), denied);
     }
     let allowed = !matches!(p.mode, Mode::Strict) || report.mode.warnings.is_empty();
-    let mut components = p.components.lock().unwrap();
+    let mut components = crate::app::safe_lock(&p.components, "worker::enter");
     let earlier_error = components.get(name).and_then(|s| s.error.clone());
     // Never overwrite evidence that an earlier entry ran without full protection.
     let error = earlier_error
@@ -233,7 +235,7 @@ pub fn enter_retaining(name: &str, retain: super::Retain) -> bool {
 pub fn snapshot() -> BTreeMap<String, Component> {
     POLICY
         .get()
-        .map(|p| p.components.lock().unwrap().clone())
+        .map(|p| crate::app::safe_lock(&p.components, "worker::snapshot").clone())
         .unwrap_or_default()
 }
 /// Start with a bounded entry handshake. A timed-out worker is never released.
@@ -484,6 +486,47 @@ mod tests {
         assert_eq!(shutdown(Duration::from_secs(2)), 0);
         // Parent thread remains unrestricted: tests changed the real workers only.
         assert_eq!(std::fs::read(root.join("secret")).unwrap(), b"sentinel");
+    }
+
+    /// The capture thread records its state in the component map and the UI
+    /// reads it for Settings and the capability report. Once poisoned, the
+    /// map used to panic the next capture start and every screen that read it.
+    #[test]
+    fn a_poisoned_component_map_still_records_and_reads() {
+        const CHILD: &str = "NETWATCH_WORKER_POISON_TEST";
+        // POLICY is process-wide, so install and poison it in a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::worker::tests::a_poisoned_component_map_still_records_and_reads",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        install(Mode::Disabled, SandboxPaths::default()).unwrap();
+        let components = &POLICY.get().unwrap().components;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = components.lock().unwrap();
+            panic!("worker bug");
+        }));
+        assert!(components.is_poisoned());
+        begin("capture");
+        assert!(enter("capture"));
+        fail("capture", "Capture stopped");
+        note("ebpf", "partly confined");
+        let states = snapshot();
+        assert_eq!(states["capture"].error.as_deref(), Some("Capture stopped"));
+        assert_eq!(states["ebpf"].error.as_deref(), Some("partly confined"));
     }
 }
 
