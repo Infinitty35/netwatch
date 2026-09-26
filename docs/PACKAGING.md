@@ -50,16 +50,30 @@ installed package ever comes with capabilities already applied.
 
 Most of it is automatic. By hand:
 
-1. Bump `version` in `Cargo.toml`.
-2. Bump `Version:` in `packaging/rpm/netwatch.spec` and add a `%changelog`
-   entry. `tests/packaging.rs` fails until the two versions match.
-3. Write the `CHANGELOG.md` entry.
-4. Commit, merge to `main`, tag `vX.Y.Z`, push the tag.
+1. Write the release notes under `## [Unreleased]` in `CHANGELOG.md`, and
+   commit them.
+2. On `main`, or on a `release/X.Y.Z` branch for a hotfix, run
+   `scripts/release.sh X.Y.Z "summary"`. It bumps the version in `Cargo.toml`,
+   `Cargo.lock` and `packaging/rpm/netwatch.spec`, and adds the spec's
+   `%changelog` entry. It turns `[Unreleased]` into the version's section,
+   runs `cargo test`, then commits and tags `vX.Y.Z`. It pushes nothing.
+3. Run the push commands it prints.
 
-The release workflow then builds every target, produces the packages,
-generates `SHA256SUMS`, attests provenance, publishes to crates.io, and
-attaches everything to the GitHub release. Homebrew and Scoop follow on their
-own. COPR builds when its webhook fires.
+The release workflow's first job runs `scripts/release-guard.sh`, which
+refuses a tag that is not Cargo.toml's version or has no CHANGELOG section.
+It then waits for `ci.yml` to pass on the tagged commit, and the workflow
+builds nothing unless it does. CI runs by itself only on the head of a push to
+`main` and on pull requests into it. For a tag anywhere else, such as on a
+release branch or on a commit pushed together with a later one, ask for CI on
+the tag with `gh workflow run ci.yml --ref vX.Y.Z`. For a release branch,
+`release.sh` prints that command. If CI failed, fix it and release the fix. If the failure
+was flaky, re-run the failed run with the `gh run rerun <id> --failed` the
+guard prints, and then the release workflow.
+
+Once the guard passes, the workflow builds every target, produces the
+packages, generates `SHA256SUMS`, attests provenance, publishes to crates.io,
+and attaches everything to the GitHub release. Homebrew and Scoop follow on
+their own. COPR builds when its webhook fires.
 
 ## Container image
 

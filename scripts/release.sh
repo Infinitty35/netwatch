@@ -7,12 +7,15 @@
 # renames CHANGELOG.md's `## [Unreleased]` to `## [X.Y.Z] - <today>`. Then it
 # runs `cargo test`, commits "release: netwatch vX.Y.Z — <summary>" and makes
 # the annotated tag. It pushes nothing; the push commands are printed at the
-# end. The release workflow refuses a tag that disagrees with Cargo.toml or
-# has no CHANGELOG heading, and waits for CI to pass on the tagged commit.
+# end. The release workflow (scripts/release-guard.sh) refuses a tag that
+# disagrees with Cargo.toml or has no CHANGELOG heading, and waits for CI to
+# pass on the tagged commit.
 #
 # Refuses to start on a dirty tree, a detached HEAD, a branch other than
-# `main` or `release/X.Y.Z`, a branch behind its remote, a tag that already
-# exists, a version not above the current one, or an empty `[Unreleased]`.
+# `main` or `release/X.Y.Z`, a branch behind origin's branch of the same name,
+# a tag that already exists, a version not above the current one, an
+# `[Unreleased]` with no notes, or no git user.name and user.email for the
+# RPM %changelog entry.
 #
 # package.nix is not touched: it is still at 0.26.1, and should be bumped by
 # someone who can check that it builds with nix.
@@ -62,15 +65,25 @@ if [ -n "$(git status --porcelain)" ]; then
     die "the working tree is not clean; commit or remove the changes above first"
 fi
 
-# Behind its remote, the release commit could not be pushed without a merge,
-# and the tag would name a commit that never reaches the branch. Only checked
-# against a remote branch of the same name: a release branch that tracks
-# origin/main is expected to be behind it.
-if upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) &&
-    [ "${upstream#*/}" = "${branch}" ]; then
-    git fetch --quiet "${upstream%%/*}" "${branch}" || die "could not fetch ${upstream}"
-    behind=$(git rev-list --count "HEAD..${upstream}")
-    [ "${behind}" -eq 0 ] || die "${branch} is ${behind} commit(s) behind ${upstream}; pull first"
+# Behind origin's branch of the same name, the release commit could not be
+# pushed without a merge, and the tag would name a commit that never reaches
+# the branch. Checked whatever the branch tracks: a release branch made from
+# origin/main tracks origin/main, which is expected to be ahead of it, and a
+# main may track nothing.
+if git remote get-url origin > /dev/null 2>&1; then
+    found=0
+    git ls-remote --quiet --exit-code origin "refs/heads/${branch}" > /dev/null || found=$?
+    case "${found}" in
+        0)
+            git fetch --quiet origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" ||
+                die "could not fetch origin/${branch}"
+            behind=$(git rev-list --count "HEAD..refs/remotes/origin/${branch}")
+            [ "${behind}" -eq 0 ] ||
+                die "${branch} is ${behind} commit(s) behind origin/${branch}; pull first"
+            ;;
+        2) ;; # --exit-code's "no such branch": nothing on origin to be behind
+        *) die "could not reach origin to compare ${branch} with it" ;;
+    esac
 fi
 
 git rev-parse --quiet --verify "refs/tags/${TAG}" > /dev/null && die "${TAG} already exists"
@@ -86,17 +99,20 @@ fi
 grep -q "^## \[${VERSION}\]" CHANGELOG.md && die "CHANGELOG.md already has a ${VERSION} section"
 unreleased=$(awk '/^## \[Unreleased\][[:space:]]*$/ { on = 1; next }
     on && /^## \[/ { exit }
-    on && NF { n++ }
+    on && NF && !/^#/ { n++ }
     END { print n + 0 }' CHANGELOG.md)
 [ "${unreleased}" -gt 0 ] ||
-    die "CHANGELOG.md has no '## [Unreleased]' section, or it is empty; write the release notes there first"
+    die "CHANGELOG.md has no '## [Unreleased]' section, or no notes in it; write the release notes there first"
+
+name=$(git config user.name) && email=$(git config user.email) ||
+    die "git has no user.name or user.email, which sign the RPM %changelog entry"
 
 echo "==> ${current} -> ${VERSION} on ${branch}"
 
 # Handed to awk through the environment: `awk -v` would read backslashes in
 # the summary as escapes.
 TODAY=$(date +%F)
-RPM_HEAD="* $(LC_ALL=C date '+%a %b %d %Y') $(git config user.name) <$(git config user.email)> - ${VERSION}-1"
+RPM_HEAD="* $(LC_ALL=C date '+%a %b %d %Y') ${name} <${email}> - ${VERSION}-1"
 export V="${VERSION}" SUMMARY TODAY RPM_HEAD
 
 rewrite Cargo.toml '/^\[/ { pkg = ($0 == "[package]") }
@@ -129,7 +145,8 @@ if [ "${branch}" = main ]; then
 else
     # ci.yml runs on pushes to main and pull requests into it, so a release
     # branch has to ask for CI, or the release workflow finds no run to wait on.
-    echo "  git push origin ${branch}"
-    echo "  gh workflow run ci.yml --ref ${branch}"
-    echo "  git push origin ${TAG}"
+    # Asked for on the tag, not the branch, so that it tests the tagged commit
+    # even if the branch moves; the release workflow waits five minutes for it.
+    echo "  git push --atomic origin ${branch} ${TAG}"
+    echo "  gh workflow run ci.yml --ref ${TAG}"
 fi

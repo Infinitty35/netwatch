@@ -42,58 +42,14 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Tag matches Cargo.toml and the CHANGELOG
-        run: |
-          set -eu
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          if [ "v${version}" != "${RELEASE_TAG}" ]; then
-            echo "::error::${RELEASE_TAG} is not the crate's version: Cargo.toml says ${version}"
-            exit 1
-          fi
-          if ! awk -v h="## [${version}]" 'index($0, h) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no '## [${version}]' heading"
-            exit 1
-          fi
-
-      # Every ci.yml run on the tagged commit must have passed. The tag and the
-      # commit are usually pushed together, so this waits while CI is still
-      # running, and gives it five minutes to show up at all.
-      - name: CI passed on the tagged commit
+      # The tag is Cargo.toml's version and has a CHANGELOG section, and every
+      # ci.yml run on the tagged commit passed. The script waits up to five
+      # minutes for CI to start and 30 for it to finish; tests/release.rs runs
+      # it against a fake gh.
+      - name: Tag is the release, and CI passed on it
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          # The commit the tag names. Not $GITHUB_SHA: on a manual dispatch
-          # that is the head of the branch the workflow was started from.
-          sha=$(git rev-parse HEAD)
-          start=$(date +%s)
-          while :; do
-            runs=$(gh run list -R "${GITHUB_REPOSITORY}" --workflow ci.yml --commit "${sha}" \
-              --json conclusion,status,event,url)
-            total=$(jq length <<< "${runs}")
-            running=$(jq '[.[] | select(.status != "completed")] | length' <<< "${runs}")
-            failed=$(jq '[.[] | select(.status == "completed" and .conclusion != "success")] | length' <<< "${runs}")
-            elapsed=$(( $(date +%s) - start ))
-            if [ "${failed}" -gt 0 ]; then
-              jq -r '.[] | "\(.status) \(.conclusion) \(.event) \(.url)"' <<< "${runs}"
-              echo "::error::CI did not pass on ${sha}. Fix it and tag the fix, or re-run CI and then this workflow."
-              exit 1
-            fi
-            if [ "${total}" -gt 0 ] && [ "${running}" -eq 0 ]; then
-              jq -r '.[] | "\(.conclusion) \(.event) \(.url)"' <<< "${runs}"
-              break
-            fi
-            if [ "${total}" -eq 0 ] && [ "${elapsed}" -ge 300 ]; then
-              echo "::error::No CI run for ${sha}. ci.yml runs on pushes to main and pull requests into it; for a commit on any other branch, run 'gh workflow run ci.yml --ref <branch>', then re-run this workflow once it passes."
-              exit 1
-            fi
-            if [ "${elapsed}" -ge 1800 ]; then
-              echo "::error::CI on ${sha} was still running after 30 minutes"
-              exit 1
-            fi
-            echo "Waiting on CI for ${sha}: ${total} run(s), ${running} still running"
-            sleep 30
-          done
+        run: scripts/release-guard.sh "${RELEASE_TAG}"
 
   build:
     needs: guard
