@@ -21,6 +21,12 @@ const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024; // 2 MB per reassembled stream
                                                  // insert). Stream u32 indices are never reused, so evicted indices stay invalid.
 pub(crate) const MAX_STREAMS: usize = 1024;
 pub(crate) const STREAM_EVICT_BATCH: usize = 256;
+/// Bytes all streams may hold between them: payloads, decrypted plaintext,
+/// HTTP/3 buffers and per-segment overhead. The per-stream and stream-count
+/// caps alone let a peer that opens enough flows fill 1280 × 2 MB, 2.5 GB.
+/// Past the budget the least recently seen streams go, down to 7/8 of it, so
+/// one sweep covers many packets.
+const MAX_ALL_STREAMS_BYTES: usize = 256 * 1024 * 1024;
 const CAPTURE_SNAPLEN: i32 = 65535; // capture full frames (no truncation)
 const CAPTURE_TIMEOUT_MS: i32 = 100; // pcap read timeout; controls batch latency
 const CAPTURE_BATCH_SIZE: usize = 64; // packets processed per tick before yielding
@@ -258,7 +264,7 @@ impl Stream {
             quic_crypto_buf: Vec::new(),
             quic_client_random: None,
             quic_decrypt: QuicDecryptState::default(),
-            quic_h3: crate::dpi::http3::H3StreamReassembler::new(),
+            held_bytes: 0,
             highest_seq_a_to_b: None,
             highest_seq_b_to_a: None,
             retransmits_a_to_b: 0,
@@ -286,6 +292,17 @@ pub struct StreamSegment {
     /// or undecryptable) segments. Lets the stream view "follow" the decrypted
     /// conversation instead of the encrypted wire bytes.
     pub decrypted: Option<Vec<u8>>,
+}
+
+impl StreamSegment {
+    /// What this segment costs against [`MAX_ALL_STREAMS_BYTES`]. The fixed
+    /// part counts too, or a flood of one-byte segments would look free.
+    fn held_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.timestamp.len()
+            + self.payload.len()
+            + self.decrypted.as_ref().map_or(0, Vec::len)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -339,7 +356,9 @@ pub struct Stream {
     #[allow(dead_code)]
     pub index: u32,
     pub key: StreamKey,
-    pub segments: Vec<StreamSegment>,
+    /// Shared, so a clone of the stream (the UI takes one per frame) copies
+    /// pointers rather than every payload.
+    pub segments: Vec<Arc<StreamSegment>>,
     pub total_bytes_a_to_b: u64,
     pub total_bytes_b_to_a: u64,
     pub packet_count: u32,
@@ -366,10 +385,8 @@ pub struct Stream {
     /// QUIC 1-RTT decryption state (cipher suite, per-direction DCID length
     /// and largest packet number) discovered/tracked across the flow.
     pub quic_decrypt: QuicDecryptState,
-    /// Cross-packet HTTP/3 stream reassembly (Phase 3b): accumulates decrypted
-    /// STREAM-frame data per HTTP/3 stream id so response bodies larger than one
-    /// 1-RTT packet decode/decompress instead of truncating.
-    pub quic_h3: crate::dpi::http3::H3StreamReassembler,
+    /// This stream's share of `StreamTracker::held_bytes`.
+    held_bytes: usize,
     /// Monotonic ns timestamp of the last packet seen on this flow. Drives LRU
     /// eviction when the tracker exceeds MAX_STREAMS.
     last_seen_ns: u64,
@@ -445,6 +462,16 @@ pub struct StreamTracker {
     /// when decryption isn't configured. Wrapped in `Arc` so the
     /// background watcher thread and the capture loop share one map.
     pub keylog: std::sync::Arc<crate::dpi::tls_decrypt::KeylogStore>,
+    /// Cross-packet HTTP/3 stream reassembly (Phase 3b), keyed by stream
+    /// index: accumulates decrypted STREAM-frame data per HTTP/3 stream id so
+    /// response bodies larger than one 1-RTT packet decode/decompress instead
+    /// of truncating. Held here rather than on `Stream` so `get_stream`'s
+    /// clone doesn't copy up to 64 buffered bodies.
+    quic_h3: HashMap<u32, crate::dpi::http3::H3StreamReassembler>,
+    /// Bytes held across all streams, against `byte_budget`.
+    held_bytes: usize,
+    /// [`MAX_ALL_STREAMS_BYTES`]; a field so tests can use a small one.
+    byte_budget: usize,
 }
 
 /// Per-stream AEAD state for TLS application data, tagged by protocol
@@ -492,6 +519,50 @@ impl StreamTracker {
             next_index: 0,
             tls_keys: HashMap::new(),
             keylog: crate::dpi::tls_decrypt::KeylogStore::new(),
+            quic_h3: HashMap::new(),
+            held_bytes: 0,
+            byte_budget: MAX_ALL_STREAMS_BYTES,
+        }
+    }
+
+    /// Forget a stream everywhere it is held. Indices stay invalid forever
+    /// (never reused).
+    fn remove_stream(&mut self, idx: u32) {
+        if let Some(s) = self.all_streams.remove(&idx) {
+            if self.streams.get(&s.key) == Some(&idx) {
+                self.streams.remove(&s.key);
+            }
+            self.held_bytes = self.held_bytes.saturating_sub(s.held_bytes);
+        }
+        self.tls_keys.remove(&idx);
+        self.quic_h3.remove(&idx);
+    }
+
+    /// Count `bytes` more held by stream `idx`, then enforce the budget.
+    fn charge(&mut self, idx: u32, bytes: usize) {
+        let Some(s) = self.all_streams.get_mut(&idx) else {
+            return;
+        };
+        s.held_bytes += bytes;
+        self.held_bytes += bytes;
+        if self.held_bytes <= self.byte_budget {
+            return;
+        }
+        // Over budget: drop the least recently seen streams that hold
+        // anything, never the one being charged, down to 7/8 of the budget.
+        let target = self.byte_budget - self.byte_budget / 8;
+        let mut by_age: Vec<(u64, u32)> = self
+            .all_streams
+            .values()
+            .filter(|s| s.index != idx && s.held_bytes > 0)
+            .map(|s| (s.last_seen_ns, s.index))
+            .collect();
+        by_age.sort_unstable();
+        for (_, old) in by_age {
+            if self.held_bytes <= target {
+                break;
+            }
+            self.remove_stream(old);
         }
     }
 
@@ -510,9 +581,7 @@ impl StreamTracker {
         // (lower index) first; tuples sort lexicographically.
         by_age.sort_unstable();
         for &(_, idx) in by_age.iter().take(STREAM_EVICT_BATCH) {
-            if let Some(s) = self.all_streams.remove(&idx) {
-                self.streams.remove(&s.key);
-            }
+            self.remove_stream(idx);
         }
     }
 
@@ -545,9 +614,8 @@ impl StreamTracker {
                         && timestamp_ns.saturating_sub(s.last_seen_ns) > 60_000_000_000)
             });
         if replace {
-            if let Some(old) = self.streams.remove(&key) {
-                self.all_streams.remove(&old);
-                self.tls_keys.remove(&old);
+            if let Some(&old) = self.streams.get(&key) {
+                self.remove_stream(old);
             }
         }
         let stream_index = if let Some(&idx) = self.streams.get(&key) {
@@ -826,13 +894,16 @@ impl StreamTracker {
             && stream.total_payload_bytes < MAX_STREAM_BYTES
         {
             stream.total_payload_bytes += payload.len();
-            stream.segments.push(StreamSegment {
+            let segment = StreamSegment {
                 packet_id,
                 timestamp: timestamp.to_string(),
                 direction,
                 payload: payload.to_vec(),
                 decrypted: None,
-            });
+            };
+            let cost = segment.held_bytes();
+            stream.segments.push(Arc::new(segment));
+            self.charge(stream_index, cost);
         }
 
         stream_index
@@ -852,6 +923,7 @@ impl StreamTracker {
         packet_id: u64,
         plaintext: Vec<u8>,
     ) {
+        let mut grown = 0;
         if let Some(stream) = self.all_streams.get_mut(&stream_index) {
             if let Some(seg) = stream
                 .segments
@@ -859,9 +931,12 @@ impl StreamTracker {
                 .rev()
                 .find(|s| s.packet_id == packet_id)
             {
-                seg.decrypted = Some(plaintext);
+                let added = plaintext.len();
+                let replaced = Arc::make_mut(seg).decrypted.replace(plaintext);
+                grown = added.saturating_sub(replaced.map_or(0, |p| p.len()));
             }
         }
+        self.charge(stream_index, grown);
     }
 
     /// Attempt to decrypt a TLS 1.3 Application Data record carried by
@@ -1132,6 +1207,7 @@ impl StreamTracker {
                     crate::dpi::quic::QuicVersion::V1,
                     largest_pn,
                 ) {
+                    let mut grown = 0;
                     if let Some(s) = self.all_streams.get_mut(&stream_index) {
                         s.quic_decrypt.suite = Some(suite);
                         if client_to_server {
@@ -1143,8 +1219,12 @@ impl StreamTracker {
                         }
                         // Buffer the decrypted frames for cross-packet HTTP/3
                         // reassembly (Phase 3b); decode happens lazily in the UI.
-                        s.quic_h3.ingest(client_to_server, &plain);
+                        let h3 = self.quic_h3.entry(stream_index).or_default();
+                        let before = h3.held_bytes();
+                        h3.ingest(client_to_server, &plain);
+                        grown = h3.held_bytes().saturating_sub(before);
                     }
+                    self.charge(stream_index, grown);
                     tracing::trace!(target: "netwatch::dpi::quic", stream_index, client_to_server, dcid_len, pn, plain_len = plain.len(), "decrypted QUIC 1-RTT packet");
                     return Some(plain);
                 }
@@ -1248,10 +1328,25 @@ impl StreamTracker {
         sampled.retain(|idx| self.all_streams.contains_key(idx));
     }
 
+    /// Reassembled HTTP/3 bodies for a flow. Decoding can grow what the
+    /// stream holds, so it is charged like any other growth.
+    pub fn quic_h3_bodies(&mut self, index: u32) -> Vec<crate::dpi::http3::DecodedBody> {
+        let Some(h3) = self.quic_h3.get_mut(&index) else {
+            return Vec::new();
+        };
+        let before = h3.held_bytes();
+        let bodies = h3.decoded_bodies();
+        let grown = h3.held_bytes().saturating_sub(before);
+        self.charge(index, grown);
+        bodies
+    }
+
     pub fn clear(&mut self) {
         self.streams.clear();
         self.all_streams.clear();
         self.tls_keys.clear();
+        self.quic_h3.clear();
+        self.held_bytes = 0;
     }
 }
 
@@ -1995,6 +2090,9 @@ impl PacketCollector {
         }
     }
 
+    /// A copy of one stream for the UI, which takes one per frame. Segments
+    /// are shared `Arc`s and HTTP/3 buffers stay in the tracker, so the copy
+    /// is the bookkeeping plus one pointer per segment, not the payloads.
     pub fn get_stream(&self, index: u32) -> Option<Stream> {
         crate::app::safe_lock(&self.stream_tracker, "packets::get_stream")
             .get_stream(index)
@@ -2005,11 +2103,7 @@ impl PacketCollector {
     /// per stream) and clones only the decoded bodies, not the whole `Stream`,
     /// so the UI can call it per render frame.
     pub fn quic_h3_bodies(&self, index: u32) -> Vec<crate::dpi::http3::DecodedBody> {
-        crate::app::safe_lock(&self.stream_tracker, "packets::quic_h3_bodies")
-            .all_streams
-            .get_mut(&index)
-            .map(|s| s.quic_h3.decoded_bodies())
-            .unwrap_or_default()
+        crate::app::safe_lock(&self.stream_tracker, "packets::quic_h3_bodies").quic_h3_bodies(index)
     }
 }
 
@@ -3705,6 +3799,90 @@ mod tests {
             !tracker.streams.contains_key(&first_flow_key),
             "oldest flow was not evicted"
         );
+    }
+
+    /// One packet carrying `payload` on flow `port`, seen at `ns`.
+    fn track_on(tracker: &mut StreamTracker, port: u16, payload: &[u8], ns: u64) -> u32 {
+        tracker.track_packet(
+            "10.0.0.1",
+            port,
+            "10.0.0.2",
+            80,
+            StreamProtocol::Tcp,
+            payload,
+            ns,
+            "t",
+            Some(TCP_FLAG_ACK),
+            Some(1),
+            ns,
+        )
+    }
+
+    #[test]
+    fn byte_budget_evicts_the_least_recently_seen_streams() {
+        // Well under the per-stream and stream-count caps: only the global
+        // budget can stop this.
+        let mut tracker = StreamTracker::new();
+        tracker.byte_budget = 64 * 1024;
+        let payload = [0x41u8; 1000];
+        for i in 0..100u16 {
+            track_on(&mut tracker, 40_000 + i, &payload, u64::from(i));
+            assert!(tracker.held_bytes <= tracker.byte_budget);
+        }
+        assert_eq!(
+            tracker.held_bytes,
+            tracker
+                .all_streams
+                .values()
+                .map(|s| s.held_bytes)
+                .sum::<usize>(),
+            "the running total drifted from the streams'"
+        );
+        assert_eq!(tracker.streams.len(), tracker.all_streams.len());
+        // The oldest flows went; the newest, and every flow after the oldest
+        // survivor, stayed.
+        assert!(tracker.get_stream(0).is_none());
+        let oldest = *tracker.all_streams.keys().min().unwrap();
+        assert!((oldest..100).all(|i| tracker.get_stream(i).is_some()));
+    }
+
+    #[test]
+    fn byte_budget_counts_overhead_and_decrypted_text() {
+        let mut tracker = StreamTracker::new();
+        let idx = track_on(&mut tracker, 40_000, b"x", 1);
+        // A one-byte payload still costs its segment's fixed size.
+        assert!(tracker.held_bytes > std::mem::size_of::<StreamSegment>());
+        let before = tracker.held_bytes;
+        tracker.attach_segment_decrypted(idx, 1, vec![0; 5000]);
+        assert_eq!(tracker.held_bytes, before + 5000);
+        tracker.clear();
+        assert_eq!(tracker.held_bytes, 0);
+    }
+
+    #[test]
+    fn get_stream_shares_segments_instead_of_copying_them() {
+        let collector = PacketCollector::new();
+        let idx = track_on(
+            &mut collector.stream_tracker.lock().unwrap(),
+            40_000,
+            b"payload",
+            1,
+        );
+        let (a, b) = (
+            collector.get_stream(idx).unwrap(),
+            collector.get_stream(idx).unwrap(),
+        );
+        assert!(Arc::ptr_eq(&a.segments[0], &b.segments[0]));
+        // Attaching plaintext afterwards copies that one segment, leaving the
+        // UI's copy as it was.
+        collector
+            .stream_tracker
+            .lock()
+            .unwrap()
+            .attach_segment_decrypted(idx, 1, b"plain".to_vec());
+        assert!(a.segments[0].decrypted.is_none());
+        let c = collector.get_stream(idx).unwrap();
+        assert_eq!(c.segments[0].decrypted.as_deref(), Some(&b"plain"[..]));
     }
 
     // ── Capture-thread panics ───────────────────────────────

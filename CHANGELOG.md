@@ -25,6 +25,19 @@ All notable changes to NetWatch will be documented in this file.
   and opening a stream crashed netwatch. Capture now stops with `Capture
   stopped: internal error: …` in the Packets header, and the rest of the app
   carries on.
+- Traffic someone else sends can no longer make netwatch's memory grow
+  without limit. Every spoofed source address queued a reverse-DNS lookup, a
+  small compressed HTTP/3 body could inflate to gigabytes, captured streams
+  could hold 2.5 GB between them, and a `--metrics` client that sent its
+  request a byte at a time kept a thread for as long as it liked. Reverse DNS
+  now resolves only the far ends of this host's own connections, from a
+  bounded queue and cache. HTTP/3 bodies stop at 4 MiB and are marked
+  truncated, and brotli is tried only when the response says
+  `content-encoding: br`. Streams share a 256 MiB budget and the least
+  recently active go first. The metrics endpoint reads at most 8 KiB within
+  5 s per request, serves 16 clients at once, and warns at startup when it is
+  reachable from the network. Remote, geo and whois requests now time out
+  when a server stops answering.
 
 ## [0.32.3] - 2026-09-20
 

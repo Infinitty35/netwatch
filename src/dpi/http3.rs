@@ -575,6 +575,15 @@ impl H3StreamReassembler {
         }
     }
 
+    /// Bytes buffered and decoded across all streams, for the stream
+    /// tracker's memory budget.
+    pub fn held_bytes(&self) -> usize {
+        self.streams
+            .values()
+            .map(|st| st.data.len() + st.decoded.as_ref().map_or(0, |d| d.bytes.len()))
+            .sum()
+    }
+
     /// Bodies recovered so far — one per (stream, direction) whose contiguous
     /// prefix decodes. Decodes lazily and caches per stream, re-running the
     /// decompressor only when the contiguous prefix has grown, so calling this
