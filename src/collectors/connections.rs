@@ -603,9 +603,10 @@ fn canonicalize_process_names(connections: &mut [Connection]) {
 }
 
 /// Make every process name safe to draw. Any local user can name a process
-/// whatever they like (`exec -a`, `prctl(PR_SET_NAME)`, the file name), and
-/// netwatch often runs with more privilege than they have. Runs after every
-/// attribution source has settled the name.
+/// whatever they like through the executable's file name, or through
+/// `prctl(PR_SET_NAME)` when its path can't be read, and netwatch often runs
+/// with more privilege than they have. Runs after every attribution source
+/// has settled the name.
 fn sanitize_process_names(connections: &mut [Connection]) {
     for conn in connections {
         conn.process_name = conn
@@ -1709,8 +1710,9 @@ mod tests {
         assert_eq!(conns[0].process_name, conns[1].process_name);
     }
 
-    /// `exec -a $'sh\e]0;owned\a' sleep 60` is all it takes for any local
-    /// user to put an escape sequence in the process column.
+    /// `cp /bin/sleep $'/tmp/sh\e]0;owned\a'` and running the copy is all it
+    /// takes for any local user to put an escape sequence in the process
+    /// column.
     #[test]
     fn process_name_control_characters_are_replaced() {
         let mut conns = vec![

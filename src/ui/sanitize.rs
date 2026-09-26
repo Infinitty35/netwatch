@@ -35,8 +35,10 @@ pub fn is_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            // Zero-width space, non-joiner, joiner, and the LRM/RLM marks.
-            '\u{200B}'..='\u{200F}'
+            // Arabic letter mark, which reorders text like RLM.
+            '\u{061C}'
+                // Zero-width space, non-joiner, joiner, and the LRM/RLM marks.
+                | '\u{200B}'..='\u{200F}'
                 // Bidi embeddings and overrides ("trojan source").
                 | '\u{202A}'..='\u{202E}'
                 // Word joiner.
@@ -142,9 +144,9 @@ mod tests {
         // "gnp.exe" reads as "exe.png" under a right-to-left override.
         assert_eq!(display("gnp\u{202E}.exe"), "gnp·.exe");
         for c in [
-            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
-            '\u{202C}', '\u{202D}', '\u{2060}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
-            '\u{FEFF}',
+            '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}',
+            '\u{202B}', '\u{202C}', '\u{202D}', '\u{2060}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{FEFF}',
         ] {
             assert_eq!(
                 display(&format!("a{c}b")),
