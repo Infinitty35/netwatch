@@ -190,7 +190,7 @@ impl KeylogStore {
         let Some(secret) = decode_hex(secret_hex) else {
             return false;
         };
-        let mut w = self.inner.write().unwrap();
+        let mut w = crate::app::safe_write(&self.inner, "tls_decrypt::ingest");
         let entry = w.entry(client_random).or_default();
         match label {
             KeylogLabel::ClientApplicationTrafficSecret0 => entry.client_application = Some(secret),
@@ -215,7 +215,9 @@ impl KeylogStore {
     }
 
     pub fn lookup(&self, client_random: &[u8; 32]) -> Option<Secrets> {
-        self.inner.read().unwrap().get(client_random).cloned()
+        crate::app::safe_read(&self.inner, "tls_decrypt::lookup")
+            .get(client_random)
+            .cloned()
     }
 }
 
@@ -864,6 +866,26 @@ mod tests {
         let cr = "00".repeat(32);
         let secret = "11".repeat(32);
         let line = format!("CLIENT_TRAFFIC_SECRET_0 {cr} {secret}");
+        assert!(store.ingest_line(&line));
+        let secrets = store.lookup(&[0u8; 32]).expect("should be indexed");
+        assert_eq!(secrets.client_application, Some(vec![0x11; 32]));
+    }
+
+    #[test]
+    fn a_poisoned_store_still_ingests_and_answers_lookups() {
+        // The capture thread reads this store on every TLS record, so a
+        // watcher that panicked holding it must not take capture down too.
+        let store = KeylogStore::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = store.inner.write().unwrap();
+            panic!("watcher bug");
+        }));
+        assert!(store.inner.is_poisoned());
+        let line = format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}",
+            "00".repeat(32),
+            "11".repeat(32)
+        );
         assert!(store.ingest_line(&line));
         let secrets = store.lookup(&[0u8; 32]).expect("should be indexed");
         assert_eq!(secrets.client_application, Some(vec![0x11; 32]));

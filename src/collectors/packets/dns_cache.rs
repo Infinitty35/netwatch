@@ -56,7 +56,7 @@ impl DnsCache {
         crate::sandbox::worker::spawn("reverse-dns", move || {
             while let Some(ip) = crate::sandbox::worker::receive(&rx) {
                 let hostname = resolve_ip(&ip);
-                let mut c = resolver_cache.lock().unwrap();
+                let mut c = crate::app::safe_lock(&resolver_cache, "dns_cache::resolve");
                 match hostname {
                     Some(name) => {
                         c.insert(ip, DnsEntry::Resolved(name));
@@ -80,7 +80,7 @@ impl DnsCache {
         if ip == "—" || ip.is_empty() {
             return None;
         }
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = crate::app::safe_lock(&self.cache, "dns_cache::lookup");
         match cache.get(ip) {
             Some(DnsEntry::Resolved(name)) => return Some(name.clone()),
             Some(DnsEntry::Failed) => return None,
@@ -172,6 +172,22 @@ mod lifecycle_tests {
         let clone = cache.clone();
         assert!(clone.start());
         assert!(!cache.start());
+    }
+
+    #[test]
+    fn lookup_reads_through_a_cache_the_capture_thread_poisoned() {
+        let cache = DnsCache::new();
+        cache.cache.lock().unwrap().insert(
+            "192.0.2.1".into(),
+            DnsEntry::Resolved("host.example".into()),
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = cache.cache.lock().unwrap();
+            panic!("parser bug");
+        }));
+        assert!(cache.cache.is_poisoned());
+        assert_eq!(cache.lookup("192.0.2.1").as_deref(), Some("host.example"));
+        assert_eq!(cache.lookup("192.0.2.2"), None);
     }
 
     #[test]

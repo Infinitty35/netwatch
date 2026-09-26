@@ -19,6 +19,12 @@ All notable changes to NetWatch will be documented in this file.
   could make one hostname read as another. Control, bidi and zero-width
   characters now show as `·`, both where the text is collected and in every
   drawn frame.
+- A packet that makes a parser panic no longer stops capture without a word.
+  The capture thread died while the header still said it was capturing, and
+  if it died holding the stream table, the connection list stopped updating
+  and opening a stream crashed netwatch. Capture now stops with `Capture
+  stopped: internal error: …` in the Packets header, and the rest of the app
+  carries on.
 
 ## [0.32.3] - 2026-09-20
 

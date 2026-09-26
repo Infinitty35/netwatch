@@ -1303,7 +1303,7 @@ impl CaptureStats {
         self.received.store(0, Ordering::Relaxed);
         self.dropped.store(0, Ordering::Relaxed);
         self.rate_pps.store(0, Ordering::Relaxed);
-        *self.observed_at.lock().unwrap() = None;
+        *crate::app::safe_lock(&self.observed_at, "packets::stats_reset") = None;
     }
 }
 
@@ -1341,6 +1341,39 @@ pub(crate) fn prepare_capture(
         })?;
     }
     Ok(cap)
+}
+
+/// Run one frame's parsing and stream tracking, catching a panic in it.
+///
+/// Every parser here reads bytes a peer chose. A panic in one used to end the
+/// capture thread silently: the list stopped growing while the header still
+/// said capturing. It now stops this generation and leaves an error that the
+/// Packets header and the capability report show. Returns false if `step`
+/// panicked.
+fn run_capture_step(
+    capturing: &AtomicBool,
+    error: &Mutex<Option<String>>,
+    step: impl FnOnce(),
+) -> bool {
+    let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) else {
+        return true;
+    };
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into());
+    tracing::error!(target: "netwatch::capture", panic = %message, "capture step panicked; capture stopped");
+    // A cancelled generation must not overwrite a newer start's error.
+    if capturing.load(Ordering::SeqCst) {
+        // Panic text can quote the packet bytes that caused it.
+        *crate::app::safe_lock(error, "packets::capture_panic") = Some(format!(
+            "Capture stopped: internal error: {}",
+            crate::ui::sanitize::display(&message)
+        ));
+        capturing.store(false, Ordering::SeqCst);
+    }
+    false
 }
 
 pub struct PacketCollector {
@@ -1468,7 +1501,8 @@ impl PacketCollector {
             while capturing.load(Ordering::Relaxed) {
                 if last_poll.elapsed() >= STATS_POLL {
                     if let Ok(s) = cap.stats() {
-                        *stats.observed_at.lock().unwrap() = Some(std::time::Instant::now());
+                        *crate::app::safe_lock(&stats.observed_at, "packets::stats_poll") =
+                            Some(std::time::Instant::now());
                         let received = s.received as u64;
                         let elapsed = last_poll.elapsed().as_secs_f64();
                         // pcap's counter is monotonic within a capture, but a
@@ -1510,77 +1544,92 @@ impl PacketCollector {
                         if packet.header.caplen > CAPTURE_SNAPLEN as u32 {
                             continue;
                         }
-                        if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
-                            if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
-                                let proto = if parsed.tcp_flags.is_some() {
-                                    StreamProtocol::Tcp
-                                } else {
-                                    StreamProtocol::Udp
-                                };
-                                let payload = extract_app_payload(packet.data, proto);
-                                let (idx, app_proto, decrypted) = {
-                                    let mut t =
-                                        crate::app::safe_lock(&tracker, "packets::capture_loop");
-                                    let i = t.track_packet(
-                                        &parsed.src_ip,
-                                        sp,
-                                        &parsed.dst_ip,
-                                        dp,
-                                        proto,
-                                        &payload,
-                                        parsed.id,
-                                        &parsed.timestamp,
-                                        parsed.tcp_flags,
-                                        parsed.tcp_seq,
-                                        parsed.timestamp_ns,
-                                    );
-                                    let ap = t.get_stream(i).and_then(|s| s.app_protocol.clone());
-                                    // TLS-decrypt the application-data record carried by
-                                    // *this* TCP segment, if we have keys for the flow.
-                                    // Determines direction from initiator info on the stream.
-                                    let client_to_server = t
-                                        .get_stream(i)
-                                        .and_then(|s| s.initiator.as_ref())
-                                        .map(|(ip, port)| {
-                                            ip.as_str() == parsed.src_ip.as_str() && *port == sp
-                                        })
-                                        .unwrap_or(true);
-                                    let dec = t
-                                        .try_decrypt_tls_record(i, &payload, client_to_server)
-                                        .or_else(|| {
-                                            // QUIC 1-RTT short-header packets ride UDP; the
-                                            // TLS path above no-ops on them.
-                                            if proto == StreamProtocol::Udp {
-                                                t.try_decrypt_quic_1rtt(
-                                                    i,
-                                                    &payload,
-                                                    client_to_server,
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                    // Mirror the decrypted plaintext onto this
-                                    // packet's stream segment so the stream view
-                                    // can follow the decrypted conversation.
-                                    if let Some(ref pt) = dec {
-                                        t.attach_segment_decrypted(i, parsed.id, pt.clone());
+                        let survived = run_capture_step(&capturing, &error, || {
+                            if let Some(mut parsed) = parse_packet(packet.data, &counter, &dns) {
+                                if let (Some(sp), Some(dp)) = (parsed.src_port, parsed.dst_port) {
+                                    let proto = if parsed.tcp_flags.is_some() {
+                                        StreamProtocol::Tcp
+                                    } else {
+                                        StreamProtocol::Udp
+                                    };
+                                    let payload = extract_app_payload(packet.data, proto);
+                                    let (idx, app_proto, decrypted) = {
+                                        let mut t = crate::app::safe_lock(
+                                            &tracker,
+                                            "packets::capture_loop",
+                                        );
+                                        let i = t.track_packet(
+                                            &parsed.src_ip,
+                                            sp,
+                                            &parsed.dst_ip,
+                                            dp,
+                                            proto,
+                                            &payload,
+                                            parsed.id,
+                                            &parsed.timestamp,
+                                            parsed.tcp_flags,
+                                            parsed.tcp_seq,
+                                            parsed.timestamp_ns,
+                                        );
+                                        let ap =
+                                            t.get_stream(i).and_then(|s| s.app_protocol.clone());
+                                        // TLS-decrypt the application-data record carried by
+                                        // *this* TCP segment, if we have keys for the flow.
+                                        // Determines direction from initiator info on the stream.
+                                        let client_to_server = t
+                                            .get_stream(i)
+                                            .and_then(|s| s.initiator.as_ref())
+                                            .map(|(ip, port)| {
+                                                ip.as_str() == parsed.src_ip.as_str() && *port == sp
+                                            })
+                                            .unwrap_or(true);
+                                        let dec = t
+                                            .try_decrypt_tls_record(i, &payload, client_to_server)
+                                            .or_else(|| {
+                                                // QUIC 1-RTT short-header packets ride UDP; the
+                                                // TLS path above no-ops on them.
+                                                if proto == StreamProtocol::Udp {
+                                                    t.try_decrypt_quic_1rtt(
+                                                        i,
+                                                        &payload,
+                                                        client_to_server,
+                                                    )
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                        // Mirror the decrypted plaintext onto this
+                                        // packet's stream segment so the stream view
+                                        // can follow the decrypted conversation.
+                                        if let Some(ref pt) = dec {
+                                            t.attach_segment_decrypted(i, parsed.id, pt.clone());
+                                        }
+                                        (i, ap, dec)
+                                    };
+                                    parsed.stream_index = Some(idx);
+                                    parsed.app_protocol = app_proto;
+                                    parsed.decrypted_plaintext = decrypted;
+                                }
+                                batch.push(parsed);
+                                if batch.len() >= CAPTURE_BATCH_SIZE {
+                                    let mut pkts =
+                                        crate::app::safe_write(&packets, "packets::flush");
+                                    pkts.extend(batch.drain(..));
+                                    if pkts.len() > MAX_PACKETS {
+                                        let excess = pkts.len() - MAX_PACKETS;
+                                        pkts.drain(0..excess);
                                     }
-                                    (i, ap, dec)
-                                };
-                                parsed.stream_index = Some(idx);
-                                parsed.app_protocol = app_proto;
-                                parsed.decrypted_plaintext = decrypted;
-                            }
-                            batch.push(parsed);
-                            if batch.len() >= CAPTURE_BATCH_SIZE {
-                                let mut pkts = packets.write().unwrap();
-                                pkts.extend(batch.drain(..));
-                                if pkts.len() > MAX_PACKETS {
-                                    let excess = pkts.len() - MAX_PACKETS;
-                                    pkts.drain(0..excess);
                                 }
                             }
+                        });
+                        if !survived {
+                            // run_capture_step has logged the panic. Clear any poison
+                            // it left, or after a restart each of these locks would
+                            // log it again for every packet.
+                            tracker.clear_poison();
+                            packets.clear_poison();
+                            counter.clear_poison();
+                            break;
                         }
                     }
                     Err(pcap::Error::TimeoutExpired) => {
@@ -1590,7 +1639,7 @@ impl PacketCollector {
                         // `capturing` ~50x/sec so quit and interface switches
                         // stay responsive (issue #41).
                         if !batch.is_empty() {
-                            let mut pkts = packets.write().unwrap();
+                            let mut pkts = crate::app::safe_write(&packets, "packets::flush");
                             pkts.extend(batch.drain(..));
                             if pkts.len() > MAX_PACKETS {
                                 let excess = pkts.len() - MAX_PACKETS;
@@ -1608,7 +1657,7 @@ impl PacketCollector {
 
             // Flush remaining batch on shutdown
             if !batch.is_empty() {
-                let mut pkts = packets.write().unwrap();
+                let mut pkts = crate::app::safe_write(&packets, "packets::flush");
                 pkts.extend(batch.drain(..));
                 if pkts.len() > MAX_PACKETS {
                     let excess = pkts.len() - MAX_PACKETS;
@@ -1639,7 +1688,7 @@ impl PacketCollector {
     }
 
     pub fn clear(&self) {
-        self.packets.write().unwrap().clear();
+        crate::app::safe_write(&self.packets, "packets::clear").clear();
         crate::app::safe_lock(&self.stream_tracker, "packets::reset").clear();
     }
 
@@ -1667,7 +1716,7 @@ impl PacketCollector {
     }
 
     pub fn get_packets(&self) -> std::sync::RwLockReadGuard<'_, Vec<CapturedPacket>> {
-        self.packets.read().unwrap()
+        crate::app::safe_read(&self.packets, "packets::get_packets")
     }
 
     /// Bytes for a seeded packet: something that reads like the protocol in
@@ -1947,9 +1996,7 @@ impl PacketCollector {
     }
 
     pub fn get_stream(&self, index: u32) -> Option<Stream> {
-        self.stream_tracker
-            .lock()
-            .unwrap()
+        crate::app::safe_lock(&self.stream_tracker, "packets::get_stream")
             .get_stream(index)
             .cloned()
     }
@@ -1958,9 +2005,7 @@ impl PacketCollector {
     /// per stream) and clones only the decoded bodies, not the whole `Stream`,
     /// so the UI can call it per render frame.
     pub fn quic_h3_bodies(&self, index: u32) -> Vec<crate::dpi::http3::DecodedBody> {
-        self.stream_tracker
-            .lock()
-            .unwrap()
+        crate::app::safe_lock(&self.stream_tracker, "packets::quic_h3_bodies")
             .all_streams
             .get_mut(&index)
             .map(|s| s.quic_h3.decoded_bodies())
@@ -3659,6 +3704,137 @@ mod tests {
         assert!(
             !tracker.streams.contains_key(&first_flow_key),
             "oldest flow was not evicted"
+        );
+    }
+
+    // ── Capture-thread panics ───────────────────────────────
+
+    /// Poison `lock` the way a panicking capture step does: by unwinding
+    /// while holding it.
+    fn poison<T>(lock: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().unwrap();
+            panic!("parser bug");
+        }));
+        assert!(lock.is_poisoned());
+    }
+
+    #[test]
+    fn stream_accessors_read_through_a_poisoned_tracker() {
+        let collector = PacketCollector::new();
+        let idx = collector.stream_tracker.lock().unwrap().track_packet(
+            "1.1.1.1",
+            1234,
+            "2.2.2.2",
+            443,
+            StreamProtocol::Udp,
+            b"hello",
+            1,
+            "t",
+            None,
+            None,
+            0,
+        );
+        poison(&collector.stream_tracker);
+        assert_eq!(collector.get_stream(idx).map(|s| s.packet_count), Some(1));
+        assert!(collector.quic_h3_bodies(idx).is_empty());
+    }
+
+    #[test]
+    fn packet_list_reads_through_a_poisoned_lock() {
+        let collector = PacketCollector::new();
+        collector.packets.write().unwrap().push(make_packet(
+            "TCP",
+            "1.1.1.1",
+            "2.2.2.2",
+            Some(1234),
+            Some(80),
+            "x",
+        ));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = collector.packets.write().unwrap();
+            panic!("parser bug");
+        }));
+        assert!(collector.packets.is_poisoned());
+        assert_eq!(collector.get_packets().len(), 1);
+        collector.clear();
+        assert!(collector.get_packets().is_empty());
+
+        *collector.stats.observed_at.lock().unwrap() = Some(std::time::Instant::now());
+        poison(&collector.stats.observed_at);
+        collector.stats.reset();
+        assert!(collector
+            .stats
+            .observed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[test]
+    fn a_panicking_parser_stops_capture_and_says_why() {
+        let capturing = AtomicBool::new(true);
+        let error = Mutex::new(None);
+        let tracker = Mutex::new(StreamTracker::new());
+        let survived = run_capture_step(&capturing, &error, || {
+            let _held = tracker.lock().unwrap();
+            // A parser bug: cutting a peer's name inside a character.
+            let sni = String::from("host.é");
+            let _ = &sni[..sni.len() - 1];
+        });
+        assert!(!survived);
+        assert!(!capturing.load(Ordering::SeqCst));
+        let message = error.lock().unwrap().clone().unwrap();
+        assert!(
+            message.starts_with("Capture stopped: internal error: "),
+            "{message}"
+        );
+        assert!(message.contains("not a char boundary"), "{message}");
+        // The step unwound through the tracker's guard.
+        assert!(tracker.is_poisoned());
+    }
+
+    #[test]
+    fn a_capture_panic_that_quotes_the_packet_is_made_safe_to_draw() {
+        let capturing = AtomicBool::new(true);
+        let error = Mutex::new(None);
+        let sni = "\u{1b}]52;c;AAAA\u{7}";
+        run_capture_step(&capturing, &error, || panic!("unexpected SNI {sni}"));
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("Capture stopped: internal error: unexpected SNI ·]52;c;AAAA·")
+        );
+
+        // A payload that is not text still says something.
+        let capturing = AtomicBool::new(true);
+        run_capture_step(&capturing, &error, || std::panic::panic_any(7u8));
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("Capture stopped: internal error: unknown panic")
+        );
+    }
+
+    #[test]
+    fn a_capture_step_that_returns_keeps_capturing() {
+        let capturing = AtomicBool::new(true);
+        let error = Mutex::new(None);
+        let mut ran = false;
+        assert!(run_capture_step(&capturing, &error, || ran = true));
+        assert!(ran);
+        assert!(capturing.load(Ordering::SeqCst));
+        assert!(error.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_cancelled_capture_leaves_the_newer_error_alone() {
+        let capturing = AtomicBool::new(false);
+        let error = Mutex::new(Some("BPF filter error: newer start".to_string()));
+        assert!(!run_capture_step(&capturing, &error, || panic!(
+            "old worker"
+        )));
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("BPF filter error: newer start")
         );
     }
 

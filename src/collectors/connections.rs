@@ -1,4 +1,4 @@
-use crate::app::{safe_read, safe_write};
+use crate::app::{safe_lock, safe_read, safe_write};
 use crate::collectors::packets::{StreamKey, StreamProtocol, StreamTracker};
 #[cfg(target_os = "macos")]
 use crate::platform::pktap::PktapAttributor;
@@ -391,7 +391,7 @@ impl ConnectionCollector {
             let mut result: Vec<Connection> = Vec::new();
 
             let (stream_bytes, app_protos, anomalies, handshake_rtts, generations) = {
-                let tracker = stream_tracker.lock().unwrap();
+                let tracker = safe_lock(&stream_tracker, "connections::stream_snapshot");
                 (
                     tracker.snapshot_bytes(),
                     tracker.snapshot_app_protocols(),
@@ -2561,6 +2561,30 @@ mod tests {
         assert_eq!(state.rate_for(&key, LocalSide::A), Some((2000.0, 1000.0)));
         // Local is addr_b (10.0.0.2): rx = a_to_b = 1000, tx = b_to_a = 2000.
         assert_eq!(state.rate_for(&key, LocalSide::B), Some((1000.0, 2000.0)));
+    }
+
+    /// The capture thread shares the stream tracker. A poll after it panicked
+    /// holding the tracker used to die on the poisoned lock with `busy` still
+    /// set, and the connection list never updated again.
+    #[test]
+    fn update_finishes_with_a_poisoned_stream_tracker() {
+        use std::time::Duration;
+        let tracker = Arc::new(Mutex::new(StreamTracker::new()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = tracker.lock().unwrap();
+            panic!("parser bug");
+        }));
+        assert!(tracker.is_poisoned());
+        let collector = ConnectionCollector::new(tracker);
+        collector.update();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while collector.busy.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !collector.busy.load(Ordering::SeqCst),
+            "the poll died on the poisoned tracker"
+        );
     }
 }
 
