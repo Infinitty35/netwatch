@@ -15,11 +15,11 @@
 //! the dependency surface minimal; it only serves two tiny GET endpoints.
 
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::safe_lock;
 use crate::collectors::connections::ConnectionCollector;
@@ -32,6 +32,19 @@ pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9464";
 
 /// Prometheus text exposition content type (format version 0.0.4).
 const PROM_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Longest request line read, terminator included. A scrape's is a few dozen
+/// bytes; without a cap a client could send one endless line into memory.
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
+
+/// Time a client gets to send its whole request line. A deadline for the
+/// line, not a timeout per read, so dribbling one byte every few seconds
+/// can't hold a connection open.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Connections served at once. Each has its own thread; past this a new
+/// connection is closed unanswered rather than given another.
+const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Clone, Default)]
 pub struct InterfaceMetrics {
@@ -70,6 +83,8 @@ pub struct MetricsExporter {
     addr: String,
     snapshot: Arc<Mutex<Option<MetricsSnapshot>>>,
     collectors_ok: Arc<AtomicBool>,
+    /// Connections being served now, at most [`MAX_CONNECTIONS`].
+    active: Arc<AtomicUsize>,
 }
 
 impl MetricsExporter {
@@ -78,6 +93,7 @@ impl MetricsExporter {
             addr: addr.into(),
             snapshot: Arc::new(Mutex::new(None)),
             collectors_ok: Arc::new(AtomicBool::new(true)),
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -150,13 +166,27 @@ impl MetricsExporter {
             }
         };
         tracing::info!(target: "netwatch::metrics", addr = %self.addr, "metrics endpoint listening (/metrics, /healthz)");
+        if let Some(warning) = listener
+            .local_addr()
+            .ok()
+            .and_then(|addr| exposure_warning(&addr))
+        {
+            // The daemon's stderr is its journal; the log file alone is
+            // somewhere nobody looks at startup.
+            eprintln!("netwatch: {warning}");
+            tracing::warn!(target: "netwatch::metrics", "{warning}");
+        }
+        self.serve(listener);
+    }
 
+    fn serve(&self, listener: TcpListener) {
         if let Err(error) = listener.set_nonblocking(true) {
             tracing::warn!(%error, "metrics listener nonblocking setup failed");
             return;
         }
         let snapshot = self.snapshot.clone();
         let collectors_ok = self.collectors_ok.clone();
+        let active = self.active.clone();
         crate::sandbox::worker::spawn("metrics-listener", move || {
             while !crate::sandbox::worker::stopping() {
                 let stream = match listener.accept() {
@@ -170,15 +200,71 @@ impl MetricsExporter {
                         break;
                     }
                 };
+                let Some(slot) = ConnectionSlot::claim(&active) else {
+                    tracing::debug!(target: "netwatch::metrics", "connection limit reached; refusing");
+                    drop(stream);
+                    continue;
+                };
                 let snapshot = snapshot.clone();
                 let collectors_ok = collectors_ok.clone();
                 // One short-lived thread per connection so a slow client can't
                 // block scrapes; connections are closed after a single request.
                 crate::sandbox::worker::spawn("metrics-client", move || {
+                    let _slot = slot;
                     handle_conn(stream, &snapshot, &collectors_ok)
                 });
             }
         });
+    }
+}
+
+/// The startup warning for a listener anyone on the network can scrape, or
+/// `None` on loopback. The endpoint has no authentication.
+fn exposure_warning(addr: &std::net::SocketAddr) -> Option<String> {
+    (!addr.ip().is_loopback()).then(|| {
+        format!(
+            "metrics endpoint on {addr} is reachable from the network and has no \
+             authentication; bind to 127.0.0.1 unless a firewall limits who can reach it"
+        )
+    })
+}
+
+/// One of the [`MAX_CONNECTIONS`] places, given back when dropped, so a
+/// handler that panics still frees its place.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl ConnectionSlot {
+    fn claim(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONNECTIONS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(active)))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reads from a client until a fixed deadline. Each read's timeout is the
+/// time left, so the deadline holds however the client paces its bytes.
+struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
     }
 }
 
@@ -187,15 +273,36 @@ fn handle_conn(
     snapshot: &Arc<Mutex<Option<MetricsSnapshot>>>,
     collectors_ok: &Arc<AtomicBool>,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // Everywhere but Linux an accepted socket inherits the listener's
+    // non-blocking flag, and the deadline below needs blocking reads.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(REQUEST_DEADLINE));
 
     // Read only the request line; we don't need headers or a body for GET.
     let mut request_line = String::new();
     {
-        let mut reader = BufReader::new(&stream);
+        let reader = DeadlineReader {
+            stream: &stream,
+            deadline: Instant::now() + REQUEST_DEADLINE,
+        };
+        let mut reader = BufReader::new(reader).take(MAX_REQUEST_LINE);
         if reader.read_line(&mut request_line).is_err() {
             return;
         }
+    }
+    if request_line.is_empty() {
+        return;
+    }
+    if !request_line.ends_with('\n') {
+        // Cut off at the cap (or the client hung up mid-line, and won't
+        // read this anyway).
+        respond(
+            &stream,
+            "414 URI Too Long",
+            "text/plain; charset=utf-8",
+            "request line too long\n",
+        );
+        return;
     }
 
     let mut parts = request_line.split_whitespace();
@@ -228,11 +335,15 @@ fn handle_conn(
         ),
     };
 
+    respond(&stream, status, content_type, &body);
+}
+
+fn respond(mut stream: &TcpStream, status: &str, content_type: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = (&stream).write_all(response.as_bytes());
+    let _ = stream.write_all(response.as_bytes());
 }
 
 /// Strip the query string from a request target, leaving just the path.
@@ -531,5 +642,105 @@ mod tests {
     fn route_strips_query_string() {
         assert_eq!(route_path("/metrics?foo=bar"), "/metrics");
         assert_eq!(route_path("/healthz"), "/healthz");
+    }
+
+    #[test]
+    fn warns_only_when_reachable_beyond_loopback() {
+        for addr in ["127.0.0.1:9464", "[::1]:9464"] {
+            assert_eq!(exposure_warning(&addr.parse().unwrap()), None, "{addr}");
+        }
+        for addr in ["0.0.0.0:9464", "[::]:9464", "192.0.2.10:9464"] {
+            let warning = exposure_warning(&addr.parse().unwrap()).expect(addr);
+            assert!(warning.contains("no authentication"), "{warning}");
+        }
+    }
+
+    /// Serve on an ephemeral loopback port, as `start` does on its address.
+    fn serve_ephemeral() -> (MetricsExporter, std::net::SocketAddr) {
+        let exporter = MetricsExporter::new("127.0.0.1:0");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        exporter.serve(listener);
+        (exporter, addr)
+    }
+
+    /// Send `request` and read until the server hangs up. A reset reads as
+    /// whatever arrived before it.
+    fn exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = stream.write_all(request);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    fn wait_for_active(exporter: &MetricsExporter, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while exporter.active.load(Ordering::Acquire) != want {
+            assert!(Instant::now() < deadline, "never reached {want} active");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn request_line_is_capped_at_8_kib() {
+        let (_exporter, addr) = serve_ephemeral();
+        let tail = " HTTP/1.1\r\n";
+        let path = "a".repeat(MAX_REQUEST_LINE as usize - "GET /".len() - tail.len());
+        let at_cap = format!("GET /{path}{tail}");
+        assert_eq!(at_cap.len() as u64, MAX_REQUEST_LINE);
+        assert!(exchange(addr, at_cap.as_bytes()).starts_with("HTTP/1.1 404"));
+        // As many bytes with no end of line: the cap ends the read, not the
+        // client, and the line is refused.
+        let endless = "a".repeat(MAX_REQUEST_LINE as usize);
+        assert!(exchange(addr, endless.as_bytes()).starts_with("HTTP/1.1 414"));
+    }
+
+    /// Slowloris: clients that send their request a byte at a time and never
+    /// finish it. Each keeps its place only until the request deadline, and
+    /// while all places are taken a new connection is closed unanswered.
+    #[test]
+    fn slow_clients_are_cut_off_at_the_deadline_and_capped() {
+        let (exporter, addr) = serve_ephemeral();
+        let started = Instant::now();
+        let slow: Vec<TcpStream> = (0..MAX_CONNECTIONS)
+            .map(|_| TcpStream::connect(addr).unwrap())
+            .collect();
+        wait_for_active(&exporter, MAX_CONNECTIONS);
+
+        let refused_at = Instant::now();
+        let refused = exchange(addr, b"GET /healthz HTTP/1.1\r\n");
+        assert!(!refused.starts_with("HTTP/1.1"), "{refused}");
+        assert!(refused_at.elapsed() < Duration::from_secs(2));
+
+        let writers: Vec<TcpStream> = slow.iter().map(|s| s.try_clone().unwrap()).collect();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                for mut writer in &writers {
+                    let _ = writer.write_all(b"G");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        for mut client in slow {
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            // End of stream or a reset: either way the server hung up.
+            let read = client.read(&mut [0u8; 64]);
+            assert!(!matches!(read, Ok(n) if n > 0), "{read:?}");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= REQUEST_DEADLINE - Duration::from_millis(500)
+                && elapsed < REQUEST_DEADLINE * 2,
+            "{elapsed:?}"
+        );
+
+        wait_for_active(&exporter, 0);
+        assert!(exchange(addr, b"GET /healthz HTTP/1.1\r\n").starts_with("HTTP/1.1 200"));
     }
 }
