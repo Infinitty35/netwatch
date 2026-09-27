@@ -2,6 +2,18 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A metrics test that failed on macOS. macOS answers `setsockopt` with
+  `EINVAL` on a socket whose peer has already closed, and the slow-client
+  test set its read timeout after the server had hung up.
+
+0.32.4 was tagged but never published: the new release guard saw that test
+fail on the tagged commit and stopped the release before it built anything.
+0.32.5 is 0.32.4 with the test fixed; everything under 0.32.4 below ships in
+this release.
+
 ## [0.32.4] - 2026-09-27
 
 A security release. Text a peer chose could drive your terminal, traffic a
