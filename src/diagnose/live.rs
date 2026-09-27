@@ -214,10 +214,7 @@ impl LiveSampler {
         // baseline has to be fed that p50 — feeding it the latest single probe
         // taught it a noisier, lower number than the one it was later asked
         // to judge, and the 3σ test drifted with the difference.
-        let dns_p50 = {
-            let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
-            percentile(&samples, 0.5).or(health.dns_rtt_ms)
-        };
+        let dns_p50 = dns_p50_to_learn(health.dns_rtt_ms, &health.dns_rtt_history);
         if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), dns_p50) {
             if health.completed.dns_target.as_ref() == Some(&resolver) {
                 if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
@@ -706,6 +703,20 @@ fn nat(app: &App) -> Option<NatObs> {
 
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
 /// "no measurement" and "zero milliseconds" are different claims.
+/// The DNS p50 the baseline may learn from this cycle, or `None` when the
+/// cycle got no reply. The p50 comes from the history, which still holds the
+/// replies from before an outage; learning it while the resolver is silent
+/// would advance the baseline on timings that did not happen again, and
+/// narrow its spread with every failed probe.
+fn dns_p50_to_learn(
+    latest: Option<f64>,
+    history: &std::collections::VecDeque<Option<f64>>,
+) -> Option<f64> {
+    let latest = latest?;
+    let samples: Vec<f64> = history.iter().flatten().copied().collect();
+    percentile(&samples, 0.5).or(Some(latest))
+}
+
 fn percentile(values: &[f64], p: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -888,6 +899,22 @@ mod tests {
                 verify.metric
             );
         }
+    }
+
+    #[test]
+    fn a_dns_cycle_without_a_reply_teaches_the_baseline_nothing() {
+        let history: std::collections::VecDeque<Option<f64>> =
+            [Some(12.0), Some(14.0), Some(13.0), None].into();
+        // The resolver stopped answering: the history still has old replies,
+        // but this cycle measured nothing.
+        assert_eq!(dns_p50_to_learn(None, &history), None);
+        // A reply this cycle learns the p50 the rule judges.
+        assert_eq!(dns_p50_to_learn(Some(13.0), &history), Some(13.0));
+        // A first reply with no history yet learns that reply.
+        assert_eq!(
+            dns_p50_to_learn(Some(9.0), &std::collections::VecDeque::new()),
+            Some(9.0)
+        );
     }
 
     #[test]
