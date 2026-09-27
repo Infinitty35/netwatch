@@ -107,7 +107,7 @@ fn healthy_iface() -> IfaceObs {
     IfaceObs {
         counter_window_secs: None,
         name: IFACE.into(),
-        carrier: true,
+        carrier: Some(true),
         rx_errors: 0,
         tx_errors: 0,
         rx_dropped: 0,
@@ -115,7 +115,7 @@ fn healthy_iface() -> IfaceObs {
         errors_per_min: 0,
         drops_per_min: 0,
         link_rate_bps: Some(1e9),
-        wireless: false,
+        wireless: Some(false),
         signal_dbm: None,
         tx_retry_pct: None,
         rx_bps: 3.1e6,

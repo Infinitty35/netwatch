@@ -185,8 +185,8 @@ fn build(input: &Input<'_>) -> Builder {
     b.flag("dns.cross_validated", cross.map(|c| c.validated));
 
     let iface = obs.iface.as_ref();
-    b.flag("iface.carrier", iface.map(|i| i.carrier));
-    b.flag("iface.wireless", iface.map(|i| i.wireless));
+    b.flag("iface.carrier", iface.and_then(|i| i.carrier));
+    b.flag("iface.wireless", iface.and_then(|i| i.wireless));
     b.put(
         "iface.errors_per_min",
         iface.map(|i| i.errors_per_min as f64),

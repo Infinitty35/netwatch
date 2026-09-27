@@ -432,7 +432,9 @@ impl LiveSampler {
                 .min(60.0),
         );
 
-        let wireless = info.and_then(|i| i.is_wireless).unwrap_or(false);
+        // No info is unknown, not "carrier up, wired", and info that does
+        // not say whether the link is a radio leaves just that unknown.
+        let wireless = info.and_then(|i| i.is_wireless);
         // Retries as a share of frames sent over the same minute. Both are
         // lifetime counters, so the rate is delta over delta. The window
         // moves every tick, idle or not, so it is already full when traffic
@@ -448,7 +450,7 @@ impl LiveSampler {
 
         IfaceObs {
             name: t.name.clone(),
-            carrier: info.map(|i| i.is_up).unwrap_or(true),
+            carrier: info.map(|i| i.is_up),
             rx_errors: t.rx_errors,
             tx_errors: t.tx_errors,
             rx_dropped: t.rx_drops,
@@ -459,7 +461,7 @@ impl LiveSampler {
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
-            link_rate_bps: if wireless {
+            link_rate_bps: if wireless == Some(true) {
                 None
             } else {
                 link_rate_bps(&t.name)
@@ -886,6 +888,20 @@ mod tests {
             is_up: true,
             is_wireless,
         }
+    }
+
+    /// C04's missing-info row, through the sampler. An interface the
+    /// platform gave no info for used to read as carrier up and wired.
+    #[test]
+    fn the_sampler_reads_missing_interface_info_as_unknown() {
+        let mut sampler = LiveSampler::new();
+        let t = traffic("nwtest0", 0, None);
+        let obs = sampler.iface_obs(&t, None, Instant::now());
+        assert_eq!((obs.carrier, obs.wireless), (None, None));
+        // Info that does not say whether the link is a radio leaves only
+        // that unknown.
+        let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now());
+        assert_eq!((obs.carrier, obs.wireless), (Some(true), None));
     }
 
     #[test]

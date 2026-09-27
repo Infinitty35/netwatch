@@ -225,7 +225,10 @@ pub struct IfaceObs {
     #[serde(default)]
     pub counter_window_secs: Option<f64>,
     pub name: String,
-    pub carrier: bool,
+    /// Link up. `None` when the platform gave no info for this interface,
+    /// which is not the same as up. Older recordings' booleans read as
+    /// `Some`.
+    pub carrier: Option<bool>,
     pub rx_errors: u64,
     pub tx_errors: u64,
     pub rx_dropped: u64,
@@ -238,8 +241,9 @@ pub struct IfaceObs {
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
-    /// The kernel registered this as an 802.11 device.
-    pub wireless: bool,
+    /// The kernel registered this as an 802.11 device. `None` when the
+    /// platform did not say, which is not the same as wired.
+    pub wireless: Option<bool>,
     /// Signal level, where the platform reports one.
     pub signal_dbm: Option<i32>,
     /// Transmit retries over the last minute as a share of frames sent.
@@ -1159,7 +1163,9 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
     };
     let mut out = Vec::new();
 
-    if !iface.carrier {
+    // Only a reported down. With no interface info the carrier is unknown,
+    // and unknown is not down.
+    if iface.carrier == Some(false) {
         let mut d = Detection::new(
             "link.down",
             Subject::Iface {
@@ -1273,7 +1279,7 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         out.push(d);
     }
 
-    if iface.wireless {
+    if iface.wireless == Some(true) {
         let weak = matches!(iface.signal_dbm, Some(s) if (s as f64) <= t.wifi_rssi_dbm);
         let retrying = matches!(iface.tx_retry_pct, Some(r) if r > t.wifi_retry_pct);
         if weak || retrying {
@@ -2967,7 +2973,7 @@ mod tests {
         let iface = |wireless: bool, signal: Option<i32>, retry: Option<f64>| IfaceObs {
             counter_window_secs: None,
             name: "wlan0".into(),
-            carrier: true,
+            carrier: Some(true),
             rx_errors: 0,
             tx_errors: 0,
             rx_dropped: 0,
@@ -2975,7 +2981,7 @@ mod tests {
             errors_per_min: 0,
             drops_per_min: 0,
             link_rate_bps: None,
-            wireless,
+            wireless: Some(wireless),
             signal_dbm: signal,
             tx_retry_pct: retry,
             rx_bps: 0.0,
@@ -3093,7 +3099,7 @@ mod tests {
         Observations {
             iface: Some(IfaceObs {
                 name: "wlan0".into(),
-                wireless: true,
+                wireless: Some(true),
                 link_rate_bps: None,
                 drops_per_min,
                 ..eth0()
@@ -4056,7 +4062,7 @@ mod tests {
             iface: Some(IfaceObs {
                 counter_window_secs: None,
                 name: "eth0".into(),
-                carrier: false,
+                carrier: Some(false),
                 rx_errors: 0,
                 tx_errors: 0,
                 rx_dropped: 0,
@@ -4064,7 +4070,7 @@ mod tests {
                 errors_per_min: 40,
                 drops_per_min: 12,
                 link_rate_bps: Some(1e9),
-                wireless: false,
+                wireless: Some(false),
                 signal_dbm: None,
                 tx_retry_pct: None,
                 rx_bps: 0.0,
@@ -4077,12 +4083,34 @@ mod tests {
         assert_eq!(found[0].rule, "link.down");
     }
 
+    /// No interface info used to read as "carrier up, wired". It is neither:
+    /// no link.down, and coverage says the carrier was not measured rather
+    /// than that the rule had its input.
+    #[test]
+    fn missing_interface_info_opens_no_link_issue() {
+        use crate::diagnose::{coverage::Coverage, fixture};
+        let mut obs = fixture::observations_at(300);
+        let iface = obs.iface.as_mut().unwrap();
+        iface.carrier = None;
+        iface.wireless = None;
+        let base = fixture::baselines();
+        let found = detect(&obs, &base, &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"link.down"));
+        let coverage = Coverage::from_observations(&obs, &base);
+        let link_down = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "link.down")
+            .unwrap();
+        assert_eq!(link_down.status, Availability::NotMeasured);
+    }
+
     /// A healthy wired gigabit interface with nothing on its counters.
     fn eth0() -> IfaceObs {
         IfaceObs {
             counter_window_secs: Some(60.0),
             name: "eth0".into(),
-            carrier: true,
+            carrier: Some(true),
             rx_errors: 0,
             tx_errors: 0,
             rx_dropped: 0,
@@ -4090,7 +4118,7 @@ mod tests {
             errors_per_min: 0,
             drops_per_min: 0,
             link_rate_bps: Some(1e9),
-            wireless: false,
+            wireless: Some(false),
             signal_dbm: None,
             tx_retry_pct: None,
             rx_bps: 3.1e6,
@@ -4309,7 +4337,7 @@ mod tests {
             iface: Some(IfaceObs {
                 counter_window_secs: Some(60.0),
                 name: "wlan0".into(),
-                carrier: true,
+                carrier: Some(true),
                 rx_errors: 0,
                 tx_errors: 0,
                 rx_dropped: 0,
@@ -4319,7 +4347,7 @@ mod tests {
                 link_rate_bps: None,
                 rx_bps: 0.0,
                 tx_bps: 0.0,
-                wireless: true,
+                wireless: Some(true),
                 signal_dbm: None,
                 tx_retry_pct: Some(40.0),
             }),
@@ -4429,7 +4457,7 @@ mod tests {
         let wlan0 = |signal_dbm, tx_retry_pct| Observations {
             iface: Some(IfaceObs {
                 name: "wlan0".into(),
-                wireless: true,
+                wireless: Some(true),
                 link_rate_bps: None,
                 signal_dbm,
                 tx_retry_pct,
@@ -4523,6 +4551,20 @@ mod tests {
                 wlan0(Some(-80), None),
                 vec![Expect::NotRun("retries_high")],
             ),
+            // Errors on the same interface fire, so the row gets past the
+            // carrier test, which returns early on a link that is down.
+            row(
+                "IfaceObs.carrier",
+                Observations {
+                    iface: Some(IfaceObs {
+                        carrier: None,
+                        errors_per_min: 40,
+                        ..eth0()
+                    }),
+                    ..Default::default()
+                },
+                vec![Expect::NoRule("link.down"), Expect::Fires("iface.errors")],
+            ),
             row(
                 "GatewayObs.arp_ok",
                 Observations {
@@ -4606,10 +4648,11 @@ mod tests {
     /// this is a behaviour table: each row leaves one input unmeasured and
     /// names what must then be not run, or must not happen.
     ///
-    /// Three rows join with the item that gives them something to be absent
-    /// in: `carrier` (A05), `drops_per_min` (A06), and missing interface info
-    /// (A05), a sampler row in `live.rs`. The other sampler row, the idle
-    /// radio, is `the_sampler_gives_an_idle_radio_no_retry_share` there.
+    /// The `drops_per_min` row joins with A06, which gives it something to
+    /// be absent in. Two rows are about the sampler rather than a detector,
+    /// so they live in `live.rs`: the idle radio
+    /// (`the_sampler_gives_an_idle_radio_no_retry_share`) and missing
+    /// interface info (`the_sampler_reads_missing_interface_info_as_unknown`).
     #[test]
     fn no_detector_reads_an_absent_input_as_evidence() {
         let rows = absence_rows();
@@ -4679,6 +4722,28 @@ mod tests {
         // A recording from before a field existed still loads.
         let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
         assert_eq!(old.now, "2026-09-14 10:00:00");
+    }
+
+    #[test]
+    fn iface_obs_from_older_recordings_still_loads() {
+        // As 0.32 wrote it, with carrier and wireless as plain booleans.
+        let old: IfaceObs = serde_json::from_str(
+            r#"{"counter_window_secs":60.0,"name":"eth0","carrier":true,"rx_errors":0,
+                "tx_errors":0,"rx_dropped":0,"tx_dropped":0,"errors_per_min":0,
+                "drops_per_min":0,"link_rate_bps":1000000000.0,"rx_bps":3100000.0,
+                "tx_bps":2600000.0,"wireless":false,"signal_dbm":null,"tx_retry_pct":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old, eth0());
+        // Unknown is written as null and read back as unknown.
+        let unknown = IfaceObs {
+            carrier: None,
+            wireless: None,
+            ..eth0()
+        };
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json["carrier"].is_null() && json["wireless"].is_null());
+        assert_eq!(serde_json::from_value::<IfaceObs>(json).unwrap(), unknown);
     }
 }
 
