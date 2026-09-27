@@ -262,6 +262,19 @@ def smoke(lab, results):
     results.append({'case': 'driver refuses the real home', 'error': refused.stderr.strip()})
     print(json.dumps(results[-1]), flush=True)
 
+    # A seed it cannot apply is a refusal too: unseeded σ rules only learn, so
+    # a scenario that expects nothing to open would pass without judging.
+    ip('route', 'del', 'default')
+    try:
+        unseeded = subprocess.run([BIN, '--seconds', '1', '--seed', lab.seed, '--jsonl'], env=lab.env,
+                                  capture_output=True, text=True, timeout=30)
+    finally:
+        ip('route', 'add', 'default', 'via', GATEWAY)
+    assert unseeded.returncode != 0 and not unseeded.stdout, unseeded
+    assert 'nothing can be seeded' in unseeded.stderr, unseeded.stderr
+    results.append({'case': 'driver refuses a seed it cannot apply', 'error': unseeded.stderr.strip()})
+    print(json.dumps(results[-1]), flush=True)
+
     rows, err = lab.run(60)
     assert len(rows) == 60, len(rows)
     assert f'seeded dns.rtt_p50@{GATEWAY}, gateway.rtt@{GATEWAY}, path.rtt@internet' in err, err
@@ -277,6 +290,11 @@ def smoke(lab, results):
         assert seen == {GATEWAY}, (probe, seen)
     opened = sorted({i['key'] for r in rows for i in r['issues']})
     assert not opened, opened
+    # Seeded before the first tick, so no line, the first included, judges
+    # against a baseline still learning.
+    learning = [(r['t'], c['rule']) for r in rows for c in r['coverage']
+                if c['rule'] in ('gateway.rtt_spike', 'path.rtt_spike') and c['status'] == 'learning']
+    assert not learning, learning
     # Seeded σ rules are judging, not learning.
     last = {c['rule']: c['status'] for c in rows[-1]['coverage']}
     for rule in ['gateway.rtt_spike', 'dns.slow_resolver', 'dns.failing', 'gateway.unreachable']:

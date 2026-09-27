@@ -10,7 +10,7 @@ use anyhow::{bail, ensure, Context, Result};
 use netwatch::{
     app::App,
     config::NetwatchConfig,
-    diagnose::lab,
+    diagnose::{lab, live::LiveSampler},
     runtime::bootstrap::{self, SessionKind},
 };
 use std::{
@@ -84,25 +84,32 @@ fn main() -> Result<()> {
     bootstrap::start(&mut app, SessionKind::Daemon, mode)?;
     bootstrap::prime_collectors(&mut app);
 
+    // Before the first tick, not after it: tick 1's episode frame holds the
+    // only baseline snapshot a recording keeps for this network, and replay
+    // restores baselines from that alone. The gateway and resolver are read
+    // as the App is built, and tick 1 computes this same fingerprint, so its
+    // `set_network` changes nothing.
+    if let Some(seed) = &seed {
+        let network = &app.config_collector.config;
+        let (Some(gateway), Some(resolver)) = (network.gateway.clone(), network.primary_dns())
+        else {
+            // Unseeded σ rules stay in Learning, and a scenario that expects
+            // nothing to open would pass without judging anything.
+            bail!("--seed: the gateway or resolver is not known, so nothing can be seeded");
+        };
+        app.diagnose
+            .baselines
+            .set_network(LiveSampler::fingerprint(&app));
+        let seeded = seed.apply(&mut app.diagnose.baselines, &gateway, &resolver);
+        eprintln!("seeded {}", seeded.join(", "));
+    }
+
     let started = Instant::now();
-    let mut pending_seed = seed;
     for t in 1..=opts.seconds {
         std::thread::sleep(
             (started + Duration::from_secs(t)).saturating_duration_since(Instant::now()),
         );
         app.tick();
-        // The subjects are the gateway and resolver this network has, so the
-        // seed waits for the first tick that knows both.
-        if let Some(seed) = &pending_seed {
-            let network = &app.config_collector.config;
-            if let (Some(gateway), Some(resolver)) =
-                (network.gateway.clone(), network.primary_dns())
-            {
-                let seeded = seed.apply(&mut app.diagnose.baselines, &gateway, &resolver);
-                eprintln!("seeded {}", seeded.join(", "));
-                pending_seed = None;
-            }
-        }
         let snap = lab::snapshot(
             &app.diagnose.engine,
             &app.diagnose.baselines,
@@ -130,9 +137,6 @@ fn main() -> Result<()> {
                 }
             );
         }
-    }
-    if pending_seed.is_some() {
-        eprintln!("not seeded: the gateway or resolver was never known");
     }
     // As the daemon stops: the recorder writes an episode still in progress.
     app.packet_collector.stop_capture();
