@@ -2206,6 +2206,35 @@ fn draw_frame(f: &mut Frame, app: &mut App) {
     ui::sanitize::scrub_buffer(f.buffer_mut());
 }
 
+static TUI_PANIC_HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Install a panic hook (idempotently) that sends a panic on any thread but
+/// the calling one, which draws the TUI, to the log instead of stderr. The
+/// default hook writes the report onto the alternate screen, over the frame,
+/// where it stays until each cell happens to redraw and is lost on exit. It
+/// can also quote a peer's bytes, as a capture-thread panic caught by
+/// `run_capture_step` might. A panic on the TUI thread goes to the previous
+/// hook as before.
+fn install_tui_panic_hook() {
+    TUI_PANIC_HOOK_INIT.call_once(|| {
+        let tui = std::thread::current().id();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            if thread.id() == tui {
+                prev(info);
+                return;
+            }
+            tracing::error!(
+                target: "netwatch::panic",
+                thread = thread.name().unwrap_or("unnamed"),
+                panic = %ui::sanitize::display(&info.to_string()),
+                "a background thread panicked"
+            );
+        }));
+    });
+}
+
 pub async fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     remote: Option<&crate::remote::RemotePublisher>,
@@ -2213,6 +2242,8 @@ pub async fn run<B: Backend>(
     view: Option<ViewMode>,
     demo: bool,
 ) -> Result<()> {
+    // `main` has handed the terminal to the TUI.
+    install_tui_panic_hook();
     let mut app = App::prepare();
     crate::runtime::bootstrap::start(
         &mut app,
@@ -5469,6 +5500,40 @@ mod render_safety_tests {
                 "{view:?}"
             );
         }
+    }
+
+    /// A capture-thread panic is caught and capture stops, but the default
+    /// hook had already written its report, peer bytes and all, over the TUI.
+    #[test]
+    fn a_background_panic_is_not_written_to_the_terminal() {
+        const CHILD: &str = "NETWATCH_TUI_PANIC_HOOK_TEST";
+        // The hook is process-wide, and would hide other tests' panics, so
+        // install it in a child.
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::render_safety_tests::a_background_panic_is_not_written_to_the_terminal",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(result.status.success(), "{stderr}");
+            assert!(!stderr.contains("capture-sentinel"), "{stderr}");
+            assert!(!stderr.contains('\x1b'), "{stderr}");
+            // The TUI thread's own panics still reach the previous hook.
+            assert!(stderr.contains("tui-sentinel"), "{stderr}");
+            return;
+        }
+        install_tui_panic_hook();
+        let capture = std::thread::Builder::new()
+            .name("packet-capture".into())
+            .spawn(|| panic!("bad SNI \x1b]52;c;AAAA\x07 capture-sentinel"))
+            .unwrap();
+        assert!(capture.join().is_err());
+        assert!(std::panic::catch_unwind(|| panic!("tui-sentinel")).is_err());
     }
 }
 

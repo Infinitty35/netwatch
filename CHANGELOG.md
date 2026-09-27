@@ -24,7 +24,8 @@ All notable changes to NetWatch will be documented in this file.
   if it died holding the stream table, the connection list stopped updating
   and opening a stream crashed netwatch. Capture now stops with `Capture
   stopped: internal error: …` in the Packets header, and the rest of the app
-  carries on.
+  carries on. The panic report goes to the log file. Rust used to print it
+  over the screen, along with any packet bytes it quoted.
 - Traffic someone else sends can no longer make netwatch's memory grow
   without limit. Every spoofed source address queued a reverse-DNS lookup, a
   small compressed HTTP/3 body could inflate to gigabytes, captured streams
