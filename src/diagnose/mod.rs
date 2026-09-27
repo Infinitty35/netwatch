@@ -33,6 +33,7 @@ pub mod features;
 pub mod fixture;
 pub mod issue;
 pub mod kernel;
+pub mod lab;
 pub mod live;
 pub mod next_test;
 pub mod probe_io;
