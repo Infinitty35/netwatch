@@ -26,13 +26,15 @@ pub struct Run {
     pub sandbox: Option<Mode>,
     pub remote: Option<String>,
     pub api_key: Option<String>,
+    pub insecure_remote: bool,
     pub metrics: bool,
     pub metrics_addr: Option<String>,
 }
 // One option catalogue supplies both accepted spellings and help text.
 const OPTIONS: &[(&str, bool, &str)] = &[
-    ("--remote", true, "Remote URL (requires API key)"),
+    ("--remote", true, "Remote https:// URL (requires API key)"),
     ("--api-key", true, "Remote API key"),
+    ("--insecure-remote", false, "Allow an http:// remote URL"),
     ("--view", true, "full, lite, or dense"),
     ("--lite", false, "Start in Lite view"),
     ("--demo", false, "Replay the Diagnose demo"),
@@ -114,6 +116,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
             "--demo" => run.demo = true,
             "--remote" => run.remote = Some(value(&mut rest, arg)?),
             "--api-key" => run.api_key = Some(value(&mut rest, arg)?),
+            "--insecure-remote" => run.insecure_remote = true,
             "--view" | "--lite" => {
                 if run.view.is_some() {
                     anyhow::bail!("choose only one view option");
@@ -213,6 +216,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn insecure_remote_is_off_unless_given() {
+        assert!(matches!(
+            command("--remote http://10.0.0.1 --api-key k --insecure-remote").unwrap(),
+            Command::Run(Run {
+                insecure_remote: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            command("--remote https://cloud.example.com --api-key k").unwrap(),
+            Command::Run(Run {
+                insecure_remote: false,
+                ..
+            })
+        ));
+        assert!(command("--insecure-remote --insecure-remote").is_err());
     }
 
     /// Shipped completions and the man page must cover every option the

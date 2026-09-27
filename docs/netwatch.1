@@ -39,12 +39,24 @@ below).
 .BI \-\-remote " URL"
 Remote URL for the fleet backend. Requires
 .BR \-\-api\-key .
+It must be
+.B https://
+unless
+.B \-\-insecure\-remote
+is given.
 .TP
 .BI \-\-api\-key " KEY"
 Remote API key. Prefer the
 .B NETWATCH_API_KEY
 environment variable, so the key does not appear in
 .BR ps (1).
+.TP
+.B \-\-insecure\-remote
+Allow an
+.B http://
+remote URL. The API key and every snapshot then cross the network in
+cleartext, readable by anyone on the path. Without this flag netwatch
+refuses such a URL and exits.
 .TP
 .BI \-\-view " MODE"
 Start in

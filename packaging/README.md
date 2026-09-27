@@ -17,6 +17,10 @@ never appears in `ps`. The equivalent manual invocation is:
 netwatch daemon --remote https://cloud.example.com --api-key <key>
 ```
 
+The URL must be `https://`. netwatch refuses an `http://` URL, which would
+send the API key in cleartext, unless `--insecure-remote` is also given; for
+a unit, that means adding the flag to `ExecStart` or `ProgramArguments`.
+
 ## Linux (systemd)
 
 ```sh

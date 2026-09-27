@@ -13,9 +13,9 @@ _netwatch() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     local subcommands="daemon doctor diagnose resolver"
-    local options="--remote --api-key --view --lite --demo --no-sandbox \
-        --sandbox-strict --metrics --metrics-addr --daemon --headless \
-        --generate-config --help -h --version -V"
+    local options="--remote --api-key --insecure-remote --view --lite --demo \
+        --no-sandbox --sandbox-strict --metrics --metrics-addr --daemon \
+        --headless --generate-config --help -h --version -V"
 
     # Options that take a value: complete the value, not another flag.
     case "${prev}" in

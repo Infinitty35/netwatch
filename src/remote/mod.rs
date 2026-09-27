@@ -70,6 +70,26 @@ fn jitter_entropy() -> u64 {
         .unwrap_or(0)
 }
 
+/// Refuse a remote URL before anything is sent to it. Every POST carries the
+/// API key in its Authorization header, so over http:// anyone on the path
+/// can copy the key along with the snapshots. That needs
+/// `--insecure-remote`. A scheme that is neither is refused outright, rather
+/// than failing every POST later. The URL itself is left out of the errors,
+/// since it can carry credentials of its own.
+pub fn check_url(url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    // Parsed the way ureq will parse it, so `HTTP://` is http too.
+    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid remote URL: {e}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure => Ok(()),
+        "http" => anyhow::bail!(
+            "remote URL is http://, which sends the API key in cleartext; \
+             use https://, or pass --insecure-remote to allow it"
+        ),
+        other => anyhow::bail!("remote URL must be https://, not {other}://"),
+    }
+}
+
 pub struct RemoteConfig {
     pub url: String,
     pub api_key: String,
@@ -685,6 +705,40 @@ mod tests {
         // Server errors recover.
         assert_eq!(outcome_for_status(500), SendOutcome::Retry);
         assert_eq!(outcome_for_status(503), SendOutcome::Retry);
+    }
+
+    #[test]
+    fn remote_url_must_be_https_unless_cleartext_is_asked_for() {
+        for url in ["https://cloud.example.com", "HTTPS://cloud.example.com/"] {
+            assert!(check_url(url, false).is_ok(), "{url}");
+            assert!(check_url(url, true).is_ok(), "{url}");
+        }
+        // The scheme is case-insensitive to ureq, so it must be here too.
+        for url in ["http://cloud.example.com", "HTTP://10.0.0.1:8080/"] {
+            let err = check_url(url, false).unwrap_err().to_string();
+            assert!(err.contains("--insecure-remote"), "{url}: {err}");
+            assert!(check_url(url, true).is_ok(), "{url}");
+        }
+        // Neither https nor http, or no URL at all: no flag makes these work.
+        for url in [
+            "ftp://cloud.example.com",
+            "cloud.example.com",
+            "https://",
+            "",
+        ] {
+            assert!(check_url(url, true).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_refused_remote_url_is_not_echoed() {
+        for url in [
+            "http://agent:s3cret@cloud.example.com",
+            "ftp://agent:s3cret@cloud.example.com",
+        ] {
+            let err = check_url(url, false).unwrap_err().to_string();
+            assert!(!err.contains("s3cret"), "{err}");
+        }
     }
 
     /// A backend that accepts the POST and never answers. The shared agent's

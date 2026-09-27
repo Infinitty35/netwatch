@@ -64,6 +64,9 @@ fn main() -> Result<()> {
     if remote_url.is_some() != api_key.is_some() {
         anyhow::bail!("remote streaming requires both URL and API key");
     }
+    if let Some(url) = &remote_url {
+        netwatch::remote::check_url(url, options.insecure_remote)?;
+    }
     let view = options.view;
     let demo = options.demo;
     let sandbox_mode = options
