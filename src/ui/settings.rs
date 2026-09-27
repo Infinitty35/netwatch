@@ -113,14 +113,17 @@ fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
         },
         SettingRow {
             label: "GeoIP DB Path",
-            // Without a database, `geoip_online` sends lookups to ip-api.com,
-            // which has no HTTPS on its free tier. Say so where geo is set.
-            value: if cfg.geoip_db.is_empty() && cfg.geoip_online {
-                "ip-api.com (cleartext)".into()
-            } else if cfg.geoip_db.is_empty() {
-                "(none)".into()
-            } else {
-                cfg.geoip_db.clone()
+            // With `geoip_online` on, lookups go to ip-api.com, which has no
+            // HTTPS on its free tier, whenever no database answers: none is
+            // set, or the one set fails to open. Say so where geo is set, and
+            // before the path, so a long path cannot push it out of view.
+            value: match (cfg.geoip_db.is_empty(), cfg.geoip_online) {
+                (true, true) => "ip-api.com (cleartext)".into(),
+                (true, false) => "(none)".into(),
+                (false, true) => {
+                    format!("ip-api.com (cleartext) if unreadable: {}", cfg.geoip_db)
+                }
+                (false, false) => cfg.geoip_db.clone(),
             },
         },
         SettingRow {
@@ -577,7 +580,14 @@ mod tests {
             build_rows(&cfg)[cursor::GEOIP_DB].value,
             "ip-api.com (cleartext)"
         );
+        // A database that fails to open sends every lookup to ip-api.com too,
+        // so a set path is no reason to drop the label.
         cfg.geoip_db = "/usr/share/GeoIP/GeoLite2-City.mmdb".into();
+        assert_eq!(
+            build_rows(&cfg)[cursor::GEOIP_DB].value,
+            "ip-api.com (cleartext) if unreadable: /usr/share/GeoIP/GeoLite2-City.mmdb"
+        );
+        cfg.geoip_online = false;
         assert_eq!(build_rows(&cfg)[cursor::GEOIP_DB].value, cfg.geoip_db);
     }
 

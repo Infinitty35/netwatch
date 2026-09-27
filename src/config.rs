@@ -38,11 +38,12 @@ pub struct NetwatchConfig {
     pub geoip_asn_db: String,
 
     /// Allow falling back to ip-api.com when no local `geoip_db` is
-    /// configured. Off by default: without an mmdb, enabling this sends
-    /// every public peer IP a connection or packet touches to a third
-    /// party, in cleartext HTTP, with no per-host opt-out. ip-api.com has
-    /// no HTTPS on its free tier, so this cannot be made private. Install a
-    /// MaxMind database for offline lookups, or opt into this explicitly.
+    /// configured, or the one configured fails to open. Off by default:
+    /// without an mmdb, enabling this sends every public peer IP a
+    /// connection or packet touches to a third party, in cleartext HTTP,
+    /// with no per-host opt-out. ip-api.com has no HTTPS on its free tier,
+    /// so this cannot be made private. Install a MaxMind database for
+    /// offline lookups, or opt into this explicitly.
     pub geoip_online: bool,
 
     /// Network intelligence alert settings
