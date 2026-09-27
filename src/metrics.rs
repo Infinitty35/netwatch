@@ -668,9 +668,9 @@ mod tests {
     /// whatever arrived before it.
     fn exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        // macOS refuses setsockopt with EINVAL once the peer has closed,
+        // which the server may already have done to a refused connection.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let _ = stream.write_all(request);
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
@@ -706,8 +706,16 @@ mod tests {
     fn slow_clients_are_cut_off_at_the_deadline_and_capped() {
         let (exporter, addr) = serve_ephemeral();
         let started = Instant::now();
+        // The read timeout is set before the server can hang up: macOS
+        // refuses setsockopt with EINVAL on a socket whose peer has closed.
         let slow: Vec<TcpStream> = (0..MAX_CONNECTIONS)
-            .map(|_| TcpStream::connect(addr).unwrap())
+            .map(|_| {
+                let client = TcpStream::connect(addr).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                client
+            })
             .collect();
         wait_for_active(&exporter, MAX_CONNECTIONS);
 
@@ -726,9 +734,6 @@ mod tests {
             }
         });
         for mut client in slow {
-            client
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
             // End of stream or a reset: either way the server hung up.
             let read = client.read(&mut [0u8; 64]);
             assert!(!matches!(read, Ok(n) if n > 0), "{read:?}");
