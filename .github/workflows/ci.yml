@@ -142,3 +142,28 @@ jobs:
         run: |
           unshare --user --map-root-user --net --mount \
             sh -c 'mount -t sysfs sysfs /sys && ls /sys/class/net'
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 util-linux
+
+      - name: Build the examples
+        run: cargo build --examples
+
+      # `shell: bash` runs with pipefail. Without it a pipeline reports tee's
+      # status, and a lab that never started would pass.
+      - name: Run the health lab smoke
+        shell: bash
+        run: unshare --user --map-root-user --net --mount python3 tests/diagnose/health_lab.py --smoke | tee health-lab.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-health-lab
+          path: health-lab.json
+          if-no-files-found: warn

@@ -348,6 +348,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo build --examples
 unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py
+unshare --user --map-root-user --net --mount python3 tests/diagnose/health_lab.py --smoke
 cargo run --example diagnose_live_check -- /tmp/netwatch-live-new
 cargo run --example diagnose_active_live -- /tmp/netwatch-active-new
 cargo run --example diagnose_soak -- /tmp/netwatch-soak-new 600
@@ -362,6 +363,15 @@ redirects, HTTP errors/timeouts, actual dropped-large packets, lower working MTU
 ICMP filtering, endpoint failure, real TCP handshake counters and port pressure.
 Integration tests verify distinct samples, missing-data safety, recovery,
 recurrence, endpoint scope, old recordings, and full/redacted replay.
+
+The health lab needs `cargo build --example diagnose_lab` first, and a mount
+namespace as well: it remounts sysfs, bind-mounts a temp `resolv.conf` naming
+192.0.2.2, and gives a peer namespace 1.1.1.1, **only inside its throwaway
+namespaces**. It then runs `diagnose_lab`, the real `App::tick` once a second,
+which refuses to start unless its home, cache, config and state directories are
+inside the temp home the lab created. `--smoke` runs 60 seconds healthy and
+asserts that the gateway, DNS and internet probes measured the lab's addresses
+and that nothing opened.
 
 The workstation soak records actual observed seconds, stalls, worker count,
 resident memory and state size. Its duration is a bounded stability check, not a
