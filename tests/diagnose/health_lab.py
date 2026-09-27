@@ -31,6 +31,11 @@ SEED = {
     'dns.rtt_p50': {'mean': 2.0, 'sigma': 3.0},
     'path.rtt': {'mean': 2.0, 'sigma': 3.0},
 }
+# Samples the driver credits a seeded baseline (lab.rs SEED_SAMPLES).
+SEED_SAMPLES = 2400
+# lab.rs CORE_RULES: the coverage rows each line carries.
+CORE_RULES = ['link.down', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
+              'dns.failing', 'dns.slow_resolver']
 
 # A resolver that answers the two questions the prober asks: `.` NS (the RTT
 # probe) and `dns.google` A (the cross-check, with the answer set the real one
@@ -295,12 +300,20 @@ def smoke(lab, results):
     learning = [(r['t'], c['rule']) for r in rows for c in r['coverage']
                 if c['rule'] in ('gateway.rtt_spike', 'path.rtt_spike') and c['status'] == 'learning']
     assert not learning, learning
-    # Seeded σ rules are judging, not learning.
+    # Every core rule has its inputs, and the seeded σ rules are judging.
     last = {c['rule']: c['status'] for c in rows[-1]['coverage']}
-    for rule in ['gateway.rtt_spike', 'dns.slow_resolver', 'dns.failing', 'gateway.unreachable']:
-        assert last.get(rule) == 'available', (rule, last)
-    # Where the run wrote: the seeded baselines, persisted at shutdown.
-    assert (lab.home / '.cache/netwatch/baselines.json').is_file()
+    assert list(last) == CORE_RULES, list(last)
+    for rule in CORE_RULES:
+        assert last[rule] == 'available', (rule, last)
+    # Where the run wrote: the seeded baselines, persisted at shutdown, on the
+    # network the run ended on. Each seeded entry has learned past its seed,
+    # which only happens when the seed's subject is the one the sampler
+    # records under; a wrong subject would sit at exactly SEED_SAMPLES.
+    saved = json.loads((lab.home / '.cache/netwatch/baselines.json').read_text())
+    metrics = saved['networks'][saved['last_network']]['metrics']
+    for metric, subject in [('dns.rtt_p50', GATEWAY), ('gateway.rtt', GATEWAY), ('path.rtt', 'internet')]:
+        b = metrics.get(f'{subject}\x1f{metric}')
+        assert b and b['samples'] > SEED_SAMPLES, (metric, subject, b, sorted(metrics))
     results.append({'case': 'healthy 60s', 'measured_at': probes, 'issues': opened,
                     'coverage': last, 'probes': rows[-1]['probes'], 'verdict': rows[-1]['verdict']})
     print(json.dumps(results[-1]), flush=True)

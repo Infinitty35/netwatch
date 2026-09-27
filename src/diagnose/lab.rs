@@ -447,6 +447,18 @@ mod tests {
         assert_eq!(base.get("192.0.2.2", "gateway.rtt").unwrap().mean, 1.0);
         assert_eq!(base.get("192.0.2.53", "dns.rtt_p50").unwrap().mean, 2.0);
         assert_eq!(base.get("internet", "path.rtt").unwrap().mean, 4.0);
+
+        // A seedable metric the sampler never feeds would sit at its seed
+        // while the rule judged something else. The subjects need the live
+        // sampler, so the lab smoke checks those: each seeded entry must
+        // have learned past its seed by the end of the run.
+        let baselined: Vec<&str> = crate::diagnose::live::BASELINED_METRICS
+            .iter()
+            .map(|(metric, _)| *metric)
+            .collect();
+        for metric in SEED_METRICS {
+            assert!(baselined.contains(&metric), "{metric} is never sampled");
+        }
     }
 
     #[test]
@@ -490,15 +502,11 @@ mod tests {
         assert_eq!(snap.issues.len(), engine.issues().len());
         assert_eq!(snap.verdict.chip, engine.verdict(&base).chip());
 
-        // Coverage is the core rules only, in their order.
+        // Coverage is every core rule and nothing else, in their order. The
+        // engine rates the whole catalogue, so a core rule missing here is a
+        // misspelt id that `snapshot` would otherwise drop without a word.
         let rules: Vec<&str> = snap.coverage.iter().map(|r| r.rule.as_str()).collect();
-        assert!(!rules.is_empty());
-        assert!(rules.iter().all(|r| CORE_RULES.contains(r)), "{rules:?}");
-        let order: Vec<usize> = rules
-            .iter()
-            .map(|r| CORE_RULES.iter().position(|c| c == r).unwrap())
-            .collect();
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "{rules:?}");
+        assert_eq!(rules, CORE_RULES);
 
         // A script reads these names; pin the spelling.
         let line = serde_json::to_value(&snap).unwrap();
