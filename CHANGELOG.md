@@ -4,14 +4,14 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+A security release. Text a peer chose could drive your terminal, traffic a
+peer sent could grow netwatch's memory without limit or stop capture, and
+other users on the machine could read what netwatch saved. One change needs
+action before you upgrade: netwatch now refuses to start with an `http://`
+remote URL. Point it at `https://`, or add `--insecure-remote` to the command
+line or service unit.
+
 ### Fixed
-- A release no longer goes out from a commit whose CI failed. 0.32.2 and
-  0.32.3 both reached every channel from red commits, because the release
-  workflow started on the tag push and never asked CI. It now waits for CI on
-  the tagged commit and builds nothing unless CI passed. It also refuses a tag
-  that differs from Cargo.toml's version or has no section in this file.
-  `scripts/release.sh X.Y.Z` makes the release commit and tag locally, with
-  the version bumped in Cargo.toml, Cargo.lock, the RPM spec and this file.
 - Text that someone else chose can no longer drive your terminal. An SNI,
   HTTP Host, DNS name, SSH banner, PTR record, whois or geo reply, process
   name or interface name reached the screen raw, so a ClientHello with SNI
@@ -51,6 +51,13 @@ All notable changes to NetWatch will be documented in this file.
   `NETWATCH_API_KEY` instead. Online geo lookups (`geoip_online`) stay
   cleartext, because ip-api.com has no HTTPS on its free tier, and `doctor`,
   Settings and the config reference now say so.
+- A release no longer goes out from a commit whose CI failed. 0.32.2 and
+  0.32.3 both reached every channel from red commits, because the release
+  workflow started on the tag push and never asked CI. It now waits for CI on
+  the tagged commit and builds nothing unless CI passed. It also refuses a tag
+  that differs from Cargo.toml's version or has no section in this file.
+  `scripts/release.sh X.Y.Z` makes the release commit and tag locally, with
+  the version bumped in Cargo.toml, Cargo.lock, the RPM spec and this file.
 
 ## [0.32.3] - 2026-09-20
 
