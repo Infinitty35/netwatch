@@ -59,7 +59,7 @@ fn parse_link_speed(text: &str) -> Option<f64> {
 /// Frames a radio has to send in the retry window before its retry share
 /// says anything. An idle link sends a few management frames a minute, and
 /// no retries out of no frames is not 0%.
-const WIFI_MIN_FRAMES: u64 = 1_000;
+pub(super) const WIFI_MIN_FRAMES: u64 = 1_000;
 
 /// Retries as a percentage of the frames sent over the same window, or
 /// `None` under [`WIFI_MIN_FRAMES`].

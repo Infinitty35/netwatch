@@ -1354,11 +1354,17 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
                                 "retries high",
                                 format!("{r:.0}% of frames retried"),
                             ),
+                            // The sampler gives no share for a radio
+                            // that sent too little to judge, as well as
+                            // for one with no counter.
                             None => CheckResult::not_run(
                                 "retries_high",
                                 "retries high",
                                 Availability::NotMeasured,
-                                "no retry counter",
+                                format!(
+                                    "no retry counter, or under {} frames sent in the last minute",
+                                    super::live::WIFI_MIN_FRAMES
+                                ),
                             ),
                         },
                         match iface.signal_dbm {
@@ -3028,6 +3034,35 @@ mod tests {
         assert!(!fires(iface(true, Some(-50), Some(2.0))), "healthy");
         assert!(!fires(iface(true, None, None)), "no wireless statistics");
         assert!(!fires(iface(false, Some(-90), Some(90.0))), "not wireless");
+    }
+
+    /// A weak signal on a radio that sent too little for a retry share. The
+    /// retry counter exists, so the not-run reason must not deny it.
+    #[test]
+    fn an_idle_radio_is_not_read_as_having_no_retry_counter() {
+        let obs = Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                link_rate_bps: None,
+                wireless: Some(true),
+                signal_dbm: Some(-80),
+                tx_retry_pct: None,
+                ..eth0()
+            }),
+            ..Default::default()
+        };
+        let d = detect(&obs, &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "wifi.weak_signal")
+            .expect("a weak signal fires");
+        let retries = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|c| c.id == "retries_high")
+            .unwrap();
+        assert_eq!(retries.why_not, Some(Availability::NotMeasured));
+        assert!(retries.detail.contains("frames sent"), "{}", retries.detail);
     }
 
     #[test]
