@@ -340,12 +340,22 @@ pub fn episode() -> crate::diagnose::episode::Episode {
             s.process = Some("firefox".into());
         }
         let now = start + std::time::Duration::from_secs(t);
-        let times = ObservationTimes {
+        let mut times = ObservationTimes {
             interface: Some(now),
             sockets: Some(now),
             path: Some(now),
             ..Default::default()
         };
+        // Without health times the live engine drops the DNS and gateway
+        // observations as stale, so the corpus could not see a regression in
+        // either. The prober completes on its own 5s grid, not every tick;
+        // stamping every frame would count each second as a new sample.
+        let probed = start + std::time::Duration::from_secs(t - t % 5);
+        times.health.dns = Some(probed);
+        times.health.gateway = Some(probed);
+        times.health.internet = Some(probed);
+        times.health.dns_target = obs.dns.as_ref().map(|d| d.resolver.clone());
+        times.health.gateway_target = obs.gateway.as_ref().and_then(|g| g.addr.clone());
         engine.observe_live_at(&obs, &base, &times, now);
         let _ = rec.record(episode::Tick {
             at: 1.789e9 + t as f64,
@@ -542,6 +552,31 @@ mod tests {
             closed.state,
             crate::diagnose::issue::IssueState::AutoClosed { .. }
         ));
+    }
+
+    /// The pinned corpus replays this episode through `observe_live_at`,
+    /// which drops DNS and gateway observations with no completion time.
+    /// Without health ages the corpus could not see either regress.
+    #[test]
+    fn fixture_episode_carries_health_ages() {
+        let ep = episode();
+        assert_eq!(ep.frames.len() as u64, SCENARIO_SECS + 1);
+        for f in &ep.frames {
+            for (probe, age) in [
+                ("dns", f.ages.dns),
+                ("gateway", f.ages.gateway),
+                ("internet", f.ages.internet),
+            ] {
+                let age = age.unwrap_or_else(|| panic!("{}: no {probe} age", f.ts));
+                assert!(
+                    (0.0..5.0).contains(&age),
+                    "{}: {probe} age {age}s is off the prober's 5s grid",
+                    f.ts
+                );
+            }
+            assert_eq!(f.ages.dns_target.as_deref(), Some(RESOLVER), "{}", f.ts);
+            assert_eq!(f.ages.gateway_target.as_deref(), Some(GATEWAY), "{}", f.ts);
+        }
     }
 
     #[test]
