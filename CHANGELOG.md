@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.32.4] - 2026-09-27
 
 A security release. Text a peer chose could drive your terminal, traffic a
 peer sent could grow netwatch's memory without limit or stop capture, and
