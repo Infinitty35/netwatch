@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 
 const DNS_CACHE_MAX: usize = 4096; // max entries kept in memory, pending ones included
 
-/// Lookups queued for the resolver thread at most. `host -W 1` can take a
-/// second each, so a request far back in a longer queue would outlive
-/// `DNS_PENDING_TIMEOUT` before it ran. A request that finds the queue full
-/// is dropped and asked again on a later lookup.
+/// Lookups queued for the resolver thread at most. A request that finds the
+/// queue full is dropped and asked again on a later lookup. `host -W 1` can
+/// take a second each, so a full queue is minutes of work; a request waiting
+/// in it never expires ([`DnsEntry::Queued`]), so it is never queued twice.
 const DNS_QUEUE_MAX: usize = 256;
 
 #[derive(Clone)]
@@ -44,6 +44,21 @@ struct Slot {
 }
 
 impl Entries {
+    /// The resolver thread taking `ip` off the queue: `Queued` becomes
+    /// `Pending`. False when there is nothing to look up, because the entry
+    /// was answered or evicted while it waited.
+    fn take(&mut self, ip: &str) -> bool {
+        match self.map.get_mut(ip) {
+            Some(slot) if matches!(slot.entry, DnsEntry::Queued) => {
+                slot.entry = DnsEntry::Pending {
+                    started: std::time::Instant::now(),
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn get(&mut self, ip: &str) -> Option<&DnsEntry> {
         self.clock += 1;
         let clock = self.clock;
@@ -77,20 +92,26 @@ impl Entries {
 /// Per-IP resolution state in `DnsCache`.
 ///
 /// Transitions:
-///   None → Pending   (first lookup of a peer: request queued to resolver
+///   None → Queued    (first lookup of a peer: request queued to resolver
 ///                     thread; stays None if the queue is full)
+///   Queued → Pending (resolver thread takes the request)
 ///   Pending → Resolved | Failed  (resolver thread writes result back)
 ///
-/// `Pending` entries carry the time they were inserted so stale ones can be
-/// retried after `DNS_PENDING_TIMEOUT`. Without a timeout, a stalled resolver
-/// thread would leave entries stuck as `Pending` forever.
+/// A `Queued` entry never expires. Its request is still ahead of the
+/// resolver, and asking again would queue a duplicate that takes a slot from
+/// a peer not yet asked for and runs `host` twice. `Pending` entries carry
+/// the time the resolver took them so stale ones can be retried after
+/// `DNS_PENDING_TIMEOUT`. Without a timeout, a resolver stuck on one lookup
+/// would leave its entry `Pending` forever.
 #[derive(Clone, Debug)]
 enum DnsEntry {
     Resolved(String),
     Failed,
-    /// Lookup in flight. `queued_at` is used to expire stale pending entries.
+    /// Waiting in the resolver's queue.
+    Queued,
+    /// Lookup in flight. `started` is used to expire stale pending entries.
     Pending {
-        queued_at: std::time::Instant,
+        started: std::time::Instant,
     },
 }
 
@@ -140,6 +161,9 @@ impl DnsCache {
         let resolver_cache = Arc::clone(&self.cache);
         crate::sandbox::worker::spawn("reverse-dns", move || {
             while let Some(ip) = crate::sandbox::worker::receive(&rx) {
+                if !crate::app::safe_lock(&resolver_cache, "dns_cache::take").take(&ip) {
+                    continue;
+                }
                 let hostname = resolve_ip(&ip);
                 let mut c = crate::app::safe_lock(&resolver_cache, "dns_cache::resolve");
                 match hostname {
@@ -158,10 +182,10 @@ impl DnsCache {
         let mut cache = crate::app::safe_lock(&self.cache, "dns_cache::lookup");
         match cache.get(ip) {
             Some(DnsEntry::Resolved(name)) => return Some(name.clone()),
-            Some(DnsEntry::Failed) => return None,
-            Some(DnsEntry::Pending { queued_at }) => {
-                // Still waiting — unless the entry has expired
-                if queued_at.elapsed() < DNS_PENDING_TIMEOUT {
+            Some(DnsEntry::Failed | DnsEntry::Queued) => return None,
+            Some(DnsEntry::Pending { started }) => {
+                // Still resolving — unless the lookup has stalled
+                if started.elapsed() < DNS_PENDING_TIMEOUT {
                     return None;
                 }
                 // Timed out: fall through to re-queue below
@@ -172,12 +196,7 @@ impl DnsCache {
             return None;
         }
         match self.tx.try_send(ip.to_string()) {
-            Ok(()) => cache.put(
-                ip.to_string(),
-                DnsEntry::Pending {
-                    queued_at: std::time::Instant::now(),
-                },
-            ),
+            Ok(()) => cache.put(ip.to_string(), DnsEntry::Queued),
             // Queue full: record nothing, so the next lookup asks again.
             Err(std_mpsc::TrySendError::Full(_)) => {}
             Err(e @ std_mpsc::TrySendError::Disconnected(_)) => {
@@ -336,6 +355,49 @@ mod lifecycle_tests {
         let dropped = peers.last().unwrap().trim_end_matches(":443");
         cache.lookup(dropped);
         assert_eq!(queued(&cache), [dropped]);
+    }
+
+    #[test]
+    fn a_request_waiting_in_the_queue_is_not_queued_again() {
+        let cache = DnsCache::new();
+        let ip = "198.51.100.7";
+        cache.set_peers(["198.51.100.7:443"]);
+        cache.lookup(ip);
+        // However long it waits behind other lookups, it is not asked for
+        // again, so it holds one slot and `host` runs once.
+        assert!(matches!(
+            cache.cache.lock().unwrap().map[ip].entry,
+            DnsEntry::Queued
+        ));
+        cache.lookup(ip);
+        assert_eq!(queued(&cache), [ip]);
+
+        // The timeout starts when the resolver takes it...
+        assert!(cache.cache.lock().unwrap().take(ip));
+        cache.lookup(ip);
+        assert!(queued(&cache).is_empty());
+        // ...and a lookup stuck past it is asked for again.
+        let started = std::time::Instant::now()
+            .checked_sub(DNS_PENDING_TIMEOUT * 2)
+            .unwrap();
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .put(ip.into(), DnsEntry::Pending { started });
+        cache.lookup(ip);
+        assert_eq!(queued(&cache), [ip]);
+
+        // If the stuck one answers first, the resolver skips the repeat.
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .put(ip.into(), DnsEntry::Resolved("peer.example".into()));
+        assert!(!cache.cache.lock().unwrap().take(ip));
+        // As it does one evicted while it waited.
+        cache.cache.lock().unwrap().map.clear();
+        assert!(!cache.cache.lock().unwrap().take(ip));
     }
 
     #[test]
