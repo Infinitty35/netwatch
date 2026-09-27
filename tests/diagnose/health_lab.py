@@ -153,9 +153,22 @@ class Lab:
         self.dir = pathlib.Path(self.tmp.name)
         # The resolver the App reads. realpath: on systemd hosts this is
         # stub-resolv.conf, and a bind over the symlink would not follow it.
-        conf = self.dir / 'resolv.conf'
-        conf.write_text(f'nameserver {GATEWAY}\n')
-        cmd('mount', '--bind', conf, os.path.realpath('/etc/resolv.conf'))
+        # systemd-resolved rewrites that file by renaming a new one over it,
+        # which detaches a bind of the file itself and hands the lab the
+        # host's 127.0.0.53, so its whole directory is replaced instead. A
+        # resolv.conf that lives directly in /etc is bound as a file: binding
+        # over /etc would hide the rest of it.
+        target = pathlib.Path(os.path.realpath('/etc/resolv.conf'))
+        if target.parent == pathlib.Path('/etc'):
+            conf = self.dir / 'resolv.conf'
+            conf.write_text(f'nameserver {GATEWAY}\n')
+            cmd('mount', '--bind', conf, target)
+        else:
+            resolver_dir = self.dir / 'resolver-dir'
+            resolver_dir.mkdir()
+            conf = resolver_dir / target.name
+            conf.write_text(f'nameserver {GATEWAY}\n')
+            cmd('mount', '--bind', resolver_dir, target.parent)
         assert pathlib.Path('/etc/resolv.conf').read_text() == conf.read_text(), 'resolv.conf bind did not take'
 
     def peer(self):
