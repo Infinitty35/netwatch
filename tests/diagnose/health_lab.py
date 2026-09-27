@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""Run ONLY inside fresh user, network and mount namespaces:
-unshare --user --map-root-user --net --mount python3 tests/diagnose/health_lab.py --smoke
+"""Drives examples/diagnose_lab, the real App::tick, against a namespace network
+with faults staged on purpose, and asserts what the engine opens and closes.
 
-Drives examples/diagnose_lab, the real App::tick, against a namespace network
-whose addresses are the ones the health prober uses on a real host:
+  python3 tests/diagnose/health_lab.py --quick [--out FILE] [--artifacts DIR]
+  python3 tests/diagnose/health_lab.py --long | --scenario NAME [NAME ...]
+
+run each scenario (SCENARIOS below) in its own unshare --user --map-root-user
+--net --mount, all in parallel, and write every open and close time to FILE
+(health-lab.json). --quick is the smoke and every scenario but the long
+negatives, which --long runs. --artifacts keeps each run's JSON lines and the
+episodes it recorded. The smoke alone runs inside namespaces the caller made:
+
+  unshare --user --map-root-user --net --mount python3 tests/diagnose/health_lab.py --smoke
+
+Each namespace run builds a network whose addresses are the ones the health
+prober uses on a real host:
 
   this namespace   nw0 192.0.2.1/24, default via 192.0.2.2
   gw               192.0.2.2/24 (gateway and resolver), 198.51.100.1/30, forwarding
@@ -14,11 +25,11 @@ The prober's targets are fixed: the internet probe and the DNS reference are
 both 1.1.1.1, and the resolver comes from /etc/resolv.conf. So a peer namespace
 owns 1.1.1.1, a temp resolv.conf is bind-mounted over the real one, and sysfs is
 remounted, because inside a user namespace /sys/class/net otherwise lists the
-host's interfaces. No host setting changes: the mounts, addresses and sysctls
-all live in namespaces that end with this process. Requires ip, nsenter,
-unshare and mount.
+host's interfaces. No host setting changes: the mounts, addresses, sysctls and
+qdiscs all live in namespaces that end with the run. Requires ip, tc (with
+sch_netem, sch_prio and cls_u32 loadable), nsenter, unshare and mount.
 """
-import argparse, json, os, pathlib, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import argparse, json, os, pathlib, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / 'target/debug/examples/diagnose_lab'
@@ -39,6 +50,109 @@ SEED_SAMPLES = 2400
 # lab.rs CORE_RULES: the coverage rows each line carries.
 CORE_RULES = ['link.down', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
               'dns.failing', 'dns.slow_resolver']
+# Healthy seconds on seeded baselines before a scenario's fault goes in.
+WARMUP_SECS = 15
+# Seconds a scenario keeps running after its last expected close, so an issue
+# that reopens at once is seen doing it.
+SETTLE_SECS = 15
+# lab.rs state_name: the states in which an issue is still open.
+OPEN = {'open', 'acked', 'muted'}
+# The namespace each device a fault can name lives in, as a Lab attribute.
+DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
+
+# The scenarios, as data: a B-item that moves a rule's timing changes a row,
+# not code. Opens count from the fault, closes from the clear, in seconds.
+# `*_expect_s` is what today's rules should take, worked out from them and
+# checked against runs rather than tuned to pass, and every window is at least
+# twice it (check_table):
+# - an issue opens after consecutive_n = 3 distinct samples of its probe. The
+#   health probes run every 5 s, but a cycle whose probes time out runs long
+#   and the next waits for it: about 10 s apart while the resolver drops
+#   everything, about 25 s while nothing answers at all (3 ICMP and 9 TCP
+#   connect timeouts to the gateway alone). Traces run every 30 s;
+# - the DNS p50 is a rolling median over the whole probe history
+#   (diagnose/live.rs `dns`), so a slow phase opens only once it outnumbers
+#   the healthy samples and closes only once they outnumber it again;
+# - a close waits out the rule's verify hold (rules.rs `default_verify`),
+#   counted from its first healthy sample.
+#
+#   fault, clear   what goes in after WARMUP_SECS, and what takes it out
+#   fault_secs     how long the fault holds; with clear_on_open, at most that
+#                  long, clearing once every expected open has been seen
+#   expect_open    rules that must open under the fault, each within the
+#                  row's open window or its own. With suppressed_by, the rule
+#                  must be listed under that one whenever both are open, and
+#                  must be seen so at least once
+#   expect_close   rules that must close after the clear and stay closed
+#   forbid         rules that must never be listed, in any state; '*' is all
+#   quick          in --quick; the rest are the weekly long negatives
+#   asserted       False: measured and reported, never failed on
+SCENARIOS = [
+    {'name': 'L-DNS-SLOW',
+     'fault': [('dns', 'gw', 'delay:300')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
+     # 3 healthy samples, so the 4th slow one moves the median; 3 to confirm.
+     'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 60, 'open_expect_s': 30,
+     # 12 slow samples need 10 healthy ones to lose the median (50 s), then
+     # the 60 s hold.
+     'expect_close': ['dns.slow_resolver'], 'close_within_s': 220, 'close_expect_s': 110,
+     'forbid': ['dns.failing', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
+                'link.down']},
+    {'name': 'L-DNS-DOWN',
+     'fault': [('dns', 'gw', 'drop:100')], 'fault_secs': 60, 'clear': [('dns', 'gw', 'ok')],
+     # 3 samples about 10 s apart, the first landing mid-cycle.
+     'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 40, 'open_expect_s': 20,
+     # dns.failing holds its verify for 120 s.
+     'expect_close': ['dns.failing'], 'close_within_s': 250, 'close_expect_s': 125,
+     'forbid': ['dns.slow_resolver', 'gateway.unreachable', 'gateway.rtt_spike',
+                'path.rtt_spike', 'link.down']},
+    # Reported, not asserted, until B15; the windows are the ones B15 will be
+    # held to. A 60 s open bound would fail about 40% of runs, because B15
+    # needs 7 failures of 60 and 36 faulted queries give that only about 60%
+    # of the time. Today's rule reads one lost query in a cycle of 3 as 33%.
+    {'name': 'L-DNS-LOSSY', 'asserted': False,
+     'fault': [('dns', 'gw', 'drop:20')], 'fault_secs': 180, 'clear': [('dns', 'gw', 'ok')],
+     'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 120, 'open_expect_s': 60,
+     'expect_close': ['dns.failing'], 'close_within_s': 250, 'close_expect_s': 125,
+     'forbid': []},
+    # Total loss, per decision D2, until gateway.loss exists. Nothing answers,
+    # so samples come about 25 s apart and the first lands up to 20 s in.
+    {'name': 'L-GW-DOWN',
+     'fault': [('netem', 'nw0', 'loss 100%')], 'fault_secs': 130, 'clear_on_open': True,
+     'clear': [('netem', 'nw0', None)],
+     'expect_open': [{'rule': 'gateway.unreachable'},
+                     {'rule': 'dns.failing', 'suppressed_by': 'gateway.unreachable'}],
+     'open_within_s': 130, 'open_expect_s': 65,
+     # The cycle in flight at the clear still times out, then the 60 s hold.
+     'expect_close': ['gateway.unreachable'], 'close_within_s': 140, 'close_expect_s': 70,
+     'forbid': ['link.down', 'gateway.rtt_spike', 'path.rtt_spike']},
+    # ICMP only, so DNS stays fast and only the gateway's answers slow. The
+    # trace's answers are ICMP too, so path.rtt_spike opens as well, after 3
+    # traces, and must be listed under the gateway.
+    {'name': 'L-GW-RTT',
+     'fault': [('netem-icmp', 'gw0', 'delay 40ms')], 'fault_secs': 180, 'clear_on_open': True,
+     'clear': [('netem-icmp', 'gw0', None)],
+     'expect_open': [{'rule': 'gateway.rtt_spike', 'within_s': 30, 'expect_s': 15},
+                     {'rule': 'path.rtt_spike', 'suppressed_by': 'gateway.rtt_spike'}],
+     'open_within_s': 180, 'open_expect_s': 90,
+     'expect_close': ['gateway.rtt_spike'], 'close_within_s': 250, 'close_expect_s': 125,
+     'forbid': ['dns.slow_resolver', 'dns.failing', 'gateway.unreachable', 'link.down']},
+    # Against the seeded `internet` baseline: the trace target has none of its own.
+    {'name': 'L-PATH-SPIKE',
+     'fault': [('netem', 'gw1', 'delay 80ms')], 'fault_secs': 180, 'clear_on_open': True,
+     'clear': [('netem', 'gw1', None)],
+     'expect_open': [{'rule': 'path.rtt_spike'}], 'open_within_s': 180, 'open_expect_s': 90,
+     # 2 trace intervals plus the 120 s hold, doubled.
+     'expect_close': ['path.rtt_spike'], 'close_within_s': 360, 'close_expect_s': 180,
+     'forbid': ['dns.slow_resolver', 'dns.failing', 'gateway.unreachable', 'gateway.rtt_spike',
+                'link.down']},
+    {'name': 'L-HEALTHY',
+     'fault': [('netem', 'nw0', 'delay 1ms 0.3ms')], 'fault_secs': 300,
+     'clear': [('netem', 'nw0', None)],
+     'expect_open': [], 'expect_close': [], 'forbid': ['*']},
+    {'name': 'L-DNS-QUIET-LOSS', 'quick': False,
+     'fault': [('dns', 'gw', 'drop:1')], 'fault_secs': 1200, 'clear': [('dns', 'gw', 'ok')],
+     'expect_open': [], 'expect_close': [], 'forbid': ['dns.failing']},
+]
 
 # A resolver that answers the two questions the prober asks: `.` NS (the RTT
 # probe) and `dns.google` A (the cross-check, with the answer set the real one
@@ -218,6 +332,33 @@ class Lab:
         """Set a resolver's behaviour: ok, delay:<ms>, drop:<pct>, servfail."""
         self.modes[name].write_text(mode)
 
+    def stage(self, action):
+        """Put one scenario fault in, or take it out.
+
+        ('dns', resolver, mode)        a resolver's mode, as dns_mode
+        ('netem', dev, spec)           netem on everything dev sends
+        ('netem-icmp', dev, spec)      netem on the ICMP dev sends, the rest untouched
+        with spec None to remove the qdisc again."""
+        kind, target, spec = action
+        if kind == 'dns':
+            self.dns_mode(target, spec)
+            return
+        ns = DEVICES[target] and getattr(self, DEVICES[target])
+        if spec is None:
+            cmd('tc', 'qdisc', 'del', 'dev', target, 'root', ns=ns)
+        elif kind == 'netem':
+            cmd('tc', 'qdisc', 'replace', 'dev', target, 'root', 'netem', *spec.split(), ns=ns)
+        elif kind == 'netem-icmp':
+            # prio's default priomap never picks band 3, so only what the
+            # filter sends there, ICMP, meets the netem under it.
+            cmd('tc', 'qdisc', 'replace', 'dev', target, 'root', 'handle', '1:', 'prio', ns=ns)
+            cmd('tc', 'qdisc', 'add', 'dev', target, 'parent', '1:3', 'handle', '30:', 'netem',
+                *spec.split(), ns=ns)
+            cmd('tc', 'filter', 'add', 'dev', target, 'parent', '1:', 'protocol', 'ip', 'prio', '1',
+                'u32', 'match', 'ip', 'protocol', '1', '0xff', 'flowid', '1:3', ns=ns)
+        else:
+            raise ValueError(f'unknown fault {action}')
+
     def make_home(self):
         """The temp home the driver insists on: marked, with every XDG
         directory inside it and a config that records episodes."""
@@ -236,15 +377,17 @@ class Lab:
         self.seed = self.dir / 'seed.json'
         self.seed.write_text(json.dumps(SEED))
 
-    def run(self, seconds, env=None, on_line=None):
+    def run(self, seconds, env=None, on_line=None, stop=None):
         """Run the driver for `seconds`, returning its JSON lines and stderr.
         `on_line(row)` is called as each tick arrives, which is where a
-        scenario changes a fault."""
+        scenario changes a fault. Creating `stop` ends the run after the
+        tick that sees it, as the end of `seconds` would."""
+        extra = ['--stop-file', stop] if stop else []
         with open(self.dir / 'driver.err', 'w+') as stderr:
             # Its own process group, so a kill also reaches any child still
             # holding stdout open, which would otherwise keep the read below
             # waiting after the driver itself is gone.
-            p = subprocess.Popen([BIN, '--seconds', str(seconds), '--seed', self.seed, '--jsonl'],
+            p = subprocess.Popen([BIN, '--seconds', str(seconds), '--seed', self.seed, '--jsonl', *extra],
                                  env=env or self.env, stdout=subprocess.PIPE, stderr=stderr, text=True,
                                  start_new_session=True)
             killed = threading.Event()
@@ -344,17 +487,271 @@ def smoke(lab, results):
     print(json.dumps(results[-1]), flush=True)
 
 
+def is_open(row, rule):
+    return any(i['rule'] == rule and i['state'] in OPEN for i in row['issues'])
+
+
+def check_table(scenarios):
+    """The table's own rules, checked before anything runs: a window narrower
+    than twice what the rule should take is a flake waiting to happen, and a
+    misspelt rule would pass by never opening or never being forbidden."""
+    names = [s['name'] for s in scenarios]
+    assert len(set(names)) == len(names), names
+    for s in scenarios:
+        name, opens = s['name'], [e['rule'] for e in s['expect_open']]
+        for rule in opens + s['expect_close'] + [e['suppressed_by'] for e in s['expect_open']
+                                                 if 'suppressed_by' in e]:
+            assert rule in CORE_RULES, (name, rule)
+        assert all(r == '*' or r in CORE_RULES for r in s['forbid']), (name, s['forbid'])
+        assert not set(opens) & set(s['forbid']) and not ('*' in s['forbid'] and opens), name
+        assert set(s['expect_close']) <= set(opens), (name, 'a close needs its open')
+        for e in s['expect_open']:
+            within, expect = open_window(s, e)
+            assert within >= 2 * expect, (name, e['rule'], 'open window')
+            # The open is judged under the fault, never after it cleared.
+            assert s['fault_secs'] >= within, (name, e['rule'], 'fault shorter than its window')
+        if s['expect_close']:
+            assert s['close_within_s'] >= 2 * s['close_expect_s'], (name, 'close window')
+        assert scenario_secs(s) <= 3600, (name, 'longer than the driver runs')
+
+
+def open_window(s, e):
+    """An expected open's window and expected time: its own, or the row's."""
+    return e.get('within_s', s.get('open_within_s')), e.get('expect_s', s.get('open_expect_s'))
+
+
+def scenario_secs(s):
+    """The longest a scenario can run: the driver's --seconds."""
+    return WARMUP_SECS + s['fault_secs'] + s.get('close_within_s', 0) + SETTLE_SECS
+
+
+def run_scenario(lab, s):
+    """Run one row: warm up, stage the fault, clear it, stop once every close
+    has been seen and has held. Returns the JSON lines and the ticks the fault
+    went in and came out after."""
+    at = {'fault': None, 'clear': None}
+    seen = set()
+    closed = {}
+    stop = lab.dir / 'stop'
+
+    def on_line(r):
+        t = r['t']
+        if at['fault'] is None:
+            if t >= WARMUP_SECS:
+                for action in s['fault']:
+                    lab.stage(action)
+                at['fault'] = t
+            return
+        if at['clear'] is None:
+            for e in s['expect_open']:
+                if is_open(r, e['rule']) and ('suppressed_by' not in e or is_open(r, e['suppressed_by'])):
+                    seen.add(e['rule'])
+            done = s.get('clear_on_open') and len(seen) == len(s['expect_open'])
+            if done or t - at['fault'] >= s['fault_secs']:
+                for action in s['clear']:
+                    lab.stage(action)
+                at['clear'] = t
+            return
+        # A rule that never opened cannot close, and has failed already.
+        for rule in s['expect_close']:
+            if rule in seen and rule not in closed and not is_open(r, rule):
+                closed[rule] = t
+        waiting = [rule for rule in s['expect_close'] if rule in seen and rule not in closed]
+        if not waiting and t >= max(closed.values(), default=at['clear']) + SETTLE_SECS:
+            stop.touch()
+
+    rows, err = lab.run(scenario_secs(s), on_line=on_line, stop=stop)
+    assert at['clear'] is not None, f'the run ended before the fault cleared: {err}'
+    return rows, err, at['fault'], at['clear']
+
+
+def evaluate(s, rows, fault_at, clear_at):
+    """Every assertion the row makes, as a list of failures, and the open and
+    close times it measured."""
+    failures = []
+    listed = {}
+    for r in rows:
+        for i in r['issues']:
+            listed.setdefault(i['key'], r['t'])
+    for key, t in sorted(listed.items(), key=lambda kv: kv[1]):
+        rule = key.split('|')[0]
+        if t <= fault_at:
+            failures.append(f'{key} listed at {t}s, before the fault')
+        elif '*' in s['forbid'] or rule in s['forbid']:
+            failures.append(f'{key} listed at {t}s, {t - fault_at}s into the fault, and is forbidden')
+    faulted = [r for r in rows if r['t'] > fault_at]
+    opened = {}
+    for e in s['expect_open']:
+        rule = e['rule']
+        within, expect = open_window(s, e)
+        t = first(faulted, lambda r: is_open(r, rule))
+        got = opened[rule] = {'after_s': None if t is None else t - fault_at, 'within_s': within,
+                              'expect_s': expect}
+        if t is None:
+            failures.append(f'{rule} never opened')
+        elif t - fault_at > within:
+            failures.append(f'{rule} opened {t - fault_at}s after the fault, past {within}s')
+        root = e.get('suppressed_by')
+        if root:
+            together = [(r['t'], [i['suppressed_by'] for i in r['issues']
+                                  if i['rule'] == rule and i['state'] in OPEN])
+                        for r in rows if is_open(r, rule) and is_open(r, root)]
+            wrong = [(t, by) for t, by in together if not all(b and b.startswith(root + '|') for b in by)]
+            got.update(suppressed_by=root, together_s=len(together))
+            if not together:
+                failures.append(f'{rule} was never open while {root} was')
+            elif wrong:
+                failures.append(f'{rule} was not under {root} at {wrong[0][0]}s: {wrong[0][1]}')
+    cleared = [r for r in rows if r['t'] > clear_at]
+    closed = {}
+    for rule in s['expect_close']:
+        got = closed[rule] = {'after_s': None, 'within_s': s['close_within_s'],
+                              'expect_s': s['close_expect_s']}
+        if opened[rule]['after_s'] is None:
+            continue
+        if not any(is_open(r, rule) for r in rows if r['t'] == clear_at):
+            failures.append(f'{rule} closed while the fault held')
+            continue
+        t = first(cleared, lambda r: not is_open(r, rule))
+        if t is None:
+            failures.append(f'{rule} still open {rows[-1]["t"] - clear_at}s after the clear')
+            continue
+        got['after_s'] = t - clear_at
+        if t - clear_at > s['close_within_s']:
+            failures.append(f'{rule} closed {t - clear_at}s after the clear, past {s["close_within_s"]}s')
+        again = first([r for r in cleared if r['t'] > t], lambda r: is_open(r, rule))
+        if again is not None:
+            failures.append(f'{rule} reopened {again - clear_at}s after the clear')
+    return failures, opened, closed
+
+
+def timeline(rows):
+    """Each issue the run listed: when it opened and closed, and under what."""
+    out = {}
+    for r in rows:
+        for i in r['issues']:
+            o = out.setdefault(i['key'], {'opened': None, 'closed': None, 'suppressed_by': []})
+            if i['state'] in OPEN:
+                if o['opened'] is None:
+                    o['opened'] = r['t']
+                o['closed'] = None
+            elif o['opened'] is not None and o['closed'] is None:
+                o['closed'] = r['t']
+            if i['suppressed_by'] and i['suppressed_by'] not in o['suppressed_by']:
+                o['suppressed_by'].append(i['suppressed_by'])
+    return out
+
+
+def scenario(name, artifacts):
+    """One row, inside the namespaces this process was started in."""
+    s = next(s for s in SCENARIOS if s['name'] == name)
+    with Lab() as lab:
+        rows, err, fault_at, clear_at = run_scenario(lab, s)
+        failures, opened, closed = evaluate(s, rows, fault_at, clear_at)
+        episodes = lab.home / '.local/state/netwatch/episodes'
+        recorded = sorted(str(p.relative_to(episodes)) for p in episodes.rglob('*.json.gz')) \
+            if episodes.is_dir() else []
+        # Anything that opened is an incident the recorder keeps, written at
+        # the latest by the driver's shutdown, and only under the lab's home.
+        if any(r['issues'] for r in rows) and not recorded:
+            failures.append('issues opened but no episode was recorded under the lab home')
+        if artifacts:
+            keep = pathlib.Path(artifacts) / name
+            keep.mkdir(parents=True, exist_ok=True)
+            (keep / 'lab.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            (keep / 'driver.err').write_text(err)
+            if recorded:
+                shutil.copytree(episodes, keep / 'episodes', dirs_exist_ok=True)
+    return {'scenario': name, 'asserted': s.get('asserted', True), 'passed': not failures,
+            'failures': failures, 'fault': s['fault'], 'fault_at': fault_at, 'clear_at': clear_at,
+            'ended_at': rows[-1]['t'], 'open': opened, 'close': closed, 'issues': timeline(rows),
+            'episodes': recorded}
+
+
+def orchestrate(names, smoke, out, artifacts):
+    """Each scenario, and the smoke, in its own namespaces and all at once;
+    then one file with every result."""
+    check_table(SCENARIOS)
+    assert BIN.exists(), f'{BIN}: cargo build --example diagnose_lab'
+    base = ['unshare', '--user', '--map-root-user', '--net', '--mount', sys.executable,
+            os.path.abspath(__file__)]
+    jobs = {name: (base + ['--run', name] + (['--artifacts', artifacts] if artifacts else []),
+                   scenario_secs(next(s for s in SCENARIOS if s['name'] == name)))
+            for name in names}
+    if smoke:
+        jobs['smoke'] = (base + ['--smoke'], 60)
+    if artifacts:
+        pathlib.Path(artifacts).mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    done = {}
+
+    def run(name):
+        argv, secs = jobs[name]
+        # Past the driver's own deadline, which should always fire first.
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=secs + 2 * GRACE_SECS)
+            lines, code, stderr = p.stdout.strip().splitlines(), p.returncode, p.stderr
+        except subprocess.TimeoutExpired as e:
+            lines, code, stderr = [], None, f'killed after {e.timeout}s'
+        try:
+            result = json.loads(lines[-1])
+        except (IndexError, ValueError):
+            result = {'scenario': name, 'asserted': True, 'passed': False,
+                      'failures': [f'no result; exit {code}'], 'stderr': str(stderr)[-4000:]}
+        if name == 'smoke':
+            result = {'scenario': 'smoke', 'asserted': True, 'passed': code == 0,
+                      'failures': [] if code == 0 else [str(stderr)[-4000:]], 'results': result.get('results')}
+        elif code != 0 and result.get('passed'):
+            result.update(passed=False, failures=[f'exit {code}: {str(stderr)[-4000:]}'])
+        result['wall_s'] = round(time.monotonic() - started)
+        done[name] = result
+        verdict = 'reported' if not result['asserted'] else 'pass' if result['passed'] else 'FAIL'
+        print(json.dumps({'scenario': name, 'verdict': verdict, 'wall_s': result['wall_s'],
+                          'open': result.get('open'), 'close': result.get('close'),
+                          'failures': result['failures']}), flush=True)
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in jobs]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    results = [done[name] for name in jobs]
+    passed = all(r['passed'] for r in results if r['asserted'])
+    report = {'passed': passed, 'wall_s': round(time.monotonic() - started), 'scenarios': results}
+    pathlib.Path(out).write_text(json.dumps(report, indent=1) + '\n')
+    print(json.dumps({'passed': passed, 'wall_s': report['wall_s'], 'out': out}), flush=True)
+    return passed
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--smoke', action='store_true', help='60 s healthy: probes measured, nothing opens')
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--smoke', action='store_true',
+                      help='inside namespaces: 60 s healthy, probes measured, nothing opens')
+    mode.add_argument('--quick', action='store_true', help='the smoke and every quick scenario')
+    mode.add_argument('--long', action='store_true', help='the long negatives the weekly job runs')
+    mode.add_argument('--scenario', nargs='+', metavar='NAME', choices=[s['name'] for s in SCENARIOS])
+    mode.add_argument('--run', metavar='NAME', help=argparse.SUPPRESS)
+    ap.add_argument('--out', default='health-lab.json', help='where the results go (default %(default)s)')
+    ap.add_argument('--artifacts', metavar='DIR', help="keep each run's JSON lines and episodes here")
     args = ap.parse_args()
-    if not args.smoke:
-        ap.error('nothing to run: pass --smoke')
-    assert BIN.exists(), f'{BIN}: cargo build --example diagnose_lab'
-    results = []
-    with Lab() as lab:
-        smoke(lab, results)
-    print(json.dumps({'passed': len(results), 'results': results}), flush=True)
+    if args.smoke or args.run:
+        assert BIN.exists(), f'{BIN}: cargo build --example diagnose_lab'
+    if args.smoke:
+        results = []
+        with Lab() as lab:
+            smoke(lab, results)
+        print(json.dumps({'passed': len(results), 'results': results}), flush=True)
+    elif args.run:
+        result = scenario(args.run, args.artifacts and os.path.abspath(args.artifacts))
+        print(json.dumps(result), flush=True)
+        sys.exit(0 if result['passed'] or not result['asserted'] else 1)
+    else:
+        names = ([s['name'] for s in SCENARIOS if s.get('quick', True)] if args.quick
+                 else [s['name'] for s in SCENARIOS if not s.get('quick', True)] if args.long
+                 else args.scenario)
+        artifacts = args.artifacts and os.path.abspath(args.artifacts)
+        sys.exit(0 if orchestrate(names, args.quick, args.out, artifacts) else 1)
 
 
 if __name__ == '__main__':
