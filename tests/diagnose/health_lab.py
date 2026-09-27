@@ -705,12 +705,18 @@ def orchestrate(names, smoke, out, artifacts):
 
     def run(name):
         argv, secs = jobs[name]
-        # Past the driver's own deadline, which should always fire first.
+        # Its own session, so a timeout reaches the peer namespaces and the
+        # resolvers too, not only unshare.
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
         try:
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=secs + 2 * GRACE_SECS)
-            lines, code, stderr = p.stdout.strip().splitlines(), p.returncode, p.stderr
-        except subprocess.TimeoutExpired as e:
-            lines, code, stderr = [], None, f'killed after {e.timeout}s'
+            # Past the driver's own deadline, which should always fire first.
+            stdout, stderr = p.communicate(timeout=secs + 2 * GRACE_SECS)
+            lines, code = stdout.strip().splitlines(), p.returncode
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate()
+            lines, code, stderr = [], None, f'killed after {secs + 2 * GRACE_SECS}s'
         try:
             result = json.loads(lines[-1])
         except (IndexError, ValueError):
@@ -755,6 +761,9 @@ def main():
     args = ap.parse_args()
     if args.smoke or args.run:
         assert BIN.exists(), f'{BIN}: cargo build --example diagnose_lab'
+        # Unwind through Lab.__exit__ on a plain kill too, so the peer
+        # namespaces' sleepers and the resolvers go with this process.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if args.smoke:
         results = []
         with Lab() as lab:
