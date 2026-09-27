@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn a_qualified_cause_names_the_measurement_it_is_missing() {
-        use crate::diagnose::issue::{Cause, CheckResult};
+        use crate::diagnose::issue::{Availability, Cause, CheckResult};
         let mut report = report();
         report.issues.truncate(1);
         let issue = &mut report.issues[0];
@@ -785,9 +785,10 @@ mod tests {
             "the receiver is queueing",
             vec![
                 CheckResult::pass("symptom", "rtt tracks our own tx", "3 MB/s in flight"),
-                CheckResult::skipped(
+                CheckResult::not_run(
                     "discriminator",
                     "link-level bufferbloat test passed",
+                    Availability::AwaitingTest,
                     "no loaded-rtt test has run",
                 )
                 .weighted(2.0),

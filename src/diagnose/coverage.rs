@@ -7,44 +7,9 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Availability {
-    Available,
-    Learning,
-    NotMeasured,
-    Unsupported,
-    Stale,
-    NotConfigured,
-    NoSubjects,
-    NotApplicable,
-    AwaitingTest,
-    PermissionDenied,
-    CollectorFailed,
-    NotImplemented,
-    #[serde(other)]
-    Unknown,
-}
-
-impl Availability {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Available => "ready",
-            Self::Learning => "learning",
-            Self::NotMeasured => "not measured",
-            Self::Unsupported => "unsupported",
-            Self::Stale => "stale",
-            Self::NotConfigured => "not configured",
-            Self::NoSubjects => "no subjects",
-            Self::NotApplicable => "not applicable",
-            Self::AwaitingTest => "awaiting test",
-            Self::PermissionDenied => "permission denied",
-            Self::CollectorFailed => "collector failed",
-            Self::NotImplemented => "not implemented",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+/// Defined beside `CheckResult`, which carries it as `why_not`, so `issue.rs`
+/// still needs nothing but serde and fmt.
+pub use super::issue::Availability;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleCoverage {

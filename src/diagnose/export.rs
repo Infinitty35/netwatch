@@ -274,6 +274,7 @@ impl Redactor {
                             | "top_cause"
                             | "kind"
                             | "state"
+                            | "why_not"
                             | "reason"
                     ) {
                         self.walk(&mut v);
@@ -715,6 +716,40 @@ mod tests {
         let report = episode::replay(&redacted);
         assert!(report.matches(), "{:#?}", report.divergences.first());
         assert_eq!(report.issues.len(), episode::replay(&ep).issues.len());
+    }
+
+    #[test]
+    fn why_not_survives_redaction() {
+        use crate::diagnose::coverage::Availability;
+        // Redaction clears a check's detail as free text, which leaves
+        // `why_not` as the only reason an exported check gives for not
+        // running. It is a catalogue word, not a name, so it passes untouched.
+        let not_run = |ep: &Episode| -> Vec<(String, Option<Availability>, String)> {
+            ep.issues
+                .iter()
+                .flat_map(|s| s.issue.causes.iter())
+                .flat_map(|c| c.checks.iter())
+                .filter(|k| k.passed.is_none())
+                .map(|k| (k.id.clone(), k.why_not.clone(), k.detail.clone()))
+                .collect()
+        };
+        let ep = fixture_episode();
+        let before = not_run(&ep);
+        assert!(
+            before.iter().any(|(_, why, detail)| {
+                *why == Some(Availability::AwaitingTest) && !detail.is_empty()
+            }),
+            "the fixture should hold a check awaiting a test: {before:?}"
+        );
+        let safe = Redactor::new(b"install").episode(&ep);
+        let after = not_run(&safe);
+        assert_eq!(after.len(), before.len());
+        for ((id, why, _), (safe_id, safe_why, safe_detail)) in before.iter().zip(&after) {
+            assert_eq!((id, why), (safe_id, safe_why));
+            assert!(safe_detail.is_empty(), "{safe_detail}");
+        }
+        let text = serde_json::to_string(&safe).unwrap();
+        assert!(text.contains(r#""state":"not_run""#), "{text}");
     }
 
     #[test]
