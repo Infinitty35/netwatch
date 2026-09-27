@@ -910,36 +910,41 @@ fn target_detection(
             "the network delivered the request; the answer was an error",
         )];
     } else {
-        // Everything worked. Slower than usual?
+        // Everything worked. Slower than usual? A plain-TCP target has no tls
+        // or first-byte stage, and a plain-HTTP one no tls stage.
         let stages = [
             (
                 "dns_stage_slow",
                 "target.resolve_ms",
                 Some(&target.resolve),
                 "resolve",
+                true,
             ),
             (
                 "connect_stage_slow",
                 "target.connect_ms",
                 target.connect.as_ref(),
                 "connect",
+                true,
             ),
             (
                 "tls_stage_slow",
                 "target.tls_ms",
                 target.tls_stage.as_ref(),
                 "tls",
+                target.tls,
             ),
             (
                 "server_stage_slow",
                 "target.ttfb_ms",
                 target.http_stage.as_ref(),
                 "first byte",
+                target.http,
             ),
         ];
         let sigmas: Vec<_> = stages
             .iter()
-            .map(|(cause, metric, stage, word)| {
+            .map(|(cause, metric, stage, word, applies)| {
                 let ms = stage.and_then(|s| s.ms);
                 let b = base.get(target.baseline_subject(), metric);
                 (
@@ -948,6 +953,7 @@ fn target_detection(
                     ms,
                     b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
                     b.map(|b| b.mean),
+                    *applies,
                 )
             })
             .collect();
@@ -959,7 +965,7 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
-        let (_, word, ms, _, mean) = worst.0;
+        let (_, word, ms, _, mean, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
             ms.unwrap_or_default(),
@@ -972,11 +978,11 @@ fn target_detection(
         d.evidence
             .push(Evidence::new("target.worst_stage_sigma", worst.1, "σ"));
         let stage_check = |id: &'static str, cause: &str| {
-            let (_, word, ms, sigma, _) = sigmas
+            let (_, word, ms, sigma, _, applies) = sigmas
                 .iter()
                 .find(|s| s.0 == cause)
                 .expect("every stage is listed");
-            stage_result(id, word, *ms, *sigma, t.sigma_k)
+            stage_result(id, word, *applies, *ms, *sigma, t.sigma_k)
         };
         d.causes = vec![
             Cause::new(
@@ -1028,10 +1034,12 @@ fn target_detection(
 }
 
 /// One stage of a target against its baseline. Ids are literals at the call
-/// site, which the catalogue scan reads.
+/// site, which the catalogue scan reads. `applies` is false for a stage this
+/// kind of target never has, such as tls on a plain-HTTP target.
 fn stage_result(
     id: &'static str,
     word: &str,
+    applies: bool,
     ms: Option<f64>,
     sigma: Option<f64>,
     k: f64,
@@ -1054,12 +1062,25 @@ fn stage_result(
             detail: format!("{s:.1}σ"),
             weight: 1.0,
         },
-        None => CheckResult::not_run(
-            id,
-            name,
-            Availability::Learning,
-            "no baseline for this stage yet",
-        ),
+        None => {
+            let (why_not, detail) = if ms.is_some() {
+                (
+                    Availability::Learning,
+                    "no baseline for this stage yet".to_string(),
+                )
+            } else if !applies {
+                (
+                    Availability::NotApplicable,
+                    format!("this target has no {word} stage"),
+                )
+            } else {
+                (
+                    Availability::NotMeasured,
+                    format!("no {word} time in this probe"),
+                )
+            };
+            CheckResult::not_run(id, name, why_not, detail)
+        }
     }
 }
 
@@ -4168,5 +4189,51 @@ mod target_tests {
             })
             .unwrap();
         assert_eq!(top.id, "server_stage_slow");
+    }
+
+    #[test]
+    fn a_slow_connect_on_a_plain_http_target_says_it_has_no_tls_stage() {
+        let mut base = crate::diagnose::fixture::baselines();
+        for (metric, mean) in [("target.resolve_ms", 2.0), ("target.connect_ms", 12.0)] {
+            base.seed("api", metric, mean, mean / 10.0, 2_400);
+        }
+        let mut t = healthy();
+        t.port = 80;
+        t.tls = false;
+        t.tls_stage = None;
+        t.connect = ok(900.0);
+        let why = |t: TargetObs| {
+            let obs = Observations {
+                targets: vec![t],
+                ..Default::default()
+            };
+            let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+            assert_eq!(d.rule, "target.slow_stage");
+            d.causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .map(|k| (k.id.clone(), (k.why_not.clone(), k.detail.clone())))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let checks = why(t.clone());
+        assert_eq!(
+            checks["tls_stage_above_baseline"],
+            (
+                Some(Availability::NotApplicable),
+                "this target has no tls stage".to_string()
+            )
+        );
+        // A stage the target has, timed but with no baseline yet, is still
+        // learning.
+        assert_eq!(
+            checks["server_stage_above_baseline"].0,
+            Some(Availability::Learning)
+        );
+        // A tls target whose probe returned no tls time was not measured.
+        t.tls = true;
+        assert_eq!(
+            why(t)["tls_stage_above_baseline"].0,
+            Some(Availability::NotMeasured)
+        );
     }
 }
