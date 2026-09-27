@@ -356,6 +356,10 @@
     },
     {
       "group": "check",
+      "name": "check.dns.slow_resolver.local_udp_path.local_drop_counters"
+    },
+    {
+      "group": "check",
       "name": "check.path.rtt_spike.hop_adds_latency.one_hop_dominates"
     },
     {
@@ -1307,7 +1311,7 @@
       "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "a3141086556720b1",
+  "hash": "6fe968bd859660c8",
   "meta_columns": [
     "episode",
     "source",

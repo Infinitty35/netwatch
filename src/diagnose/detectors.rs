@@ -1974,30 +1974,50 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         Cause::new(
             "local_udp_path",
             "local: conntrack, udp buffers or nftables",
+            // Neither shared check tells this cause apart from a slow or
+            // lossy uplink, which slows the alternate too. They used to pass
+            // with no alternate probed and on a single drop, so a Wi-Fi
+            // laptop shedding one multicast frame a minute got a strong local
+            // fault from two checks that measured nothing local.
             vec![
-                if alt_fast {
-                    CheckResult::fail(
+                // "Also slow" is half this resolver's median or more. The
+                // half is a judgement, not a validated line; below it the
+                // alternate is at least twice as fast over the same path.
+                match dns.alt_rtt_ms {
+                    Some(alt) if alt >= p50 / 2.0 => CheckResult::pass(
                         "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
-                        "the alternate resolver is fast over the same path",
-                    )
-                } else {
-                    CheckResult::pass(
-                        "alt_resolver_over_the_same_path_is_also_slow",
-                        "alt resolver over the same path is also slow",
-                        "both resolvers are slow — the problem may be local",
-                    )
-                },
-                match obs.iface.as_ref().map(|i| i.drops_per_min) {
-                    Some(d) if d > 0 => CheckResult::pass(
-                        "interface_drops",
-                        "interface drops",
-                        format!("{d} drops this window"),
+                        format!(
+                            "the alternate took {alt:.1}ms against {p50:.1}ms — the problem may be local"
+                        ),
                     ),
-                    Some(_) => CheckResult::fail(
+                    Some(alt) => CheckResult::fail(
+                        "alt_resolver_over_the_same_path_is_also_slow",
+                        "alt resolver over the same path is also slow",
+                        format!("the alternate answered in {alt:.1}ms over the same path"),
+                    ),
+                    None => CheckResult::not_run(
+                        "alt_resolver_over_the_same_path_is_also_slow",
+                        "alt resolver over the same path is also slow",
+                        Availability::NotMeasured,
+                        "no alternate resolver probed",
+                    ),
+                },
+                // The same floor iface.errors uses: a wireless NIC drops
+                // multicast and management frames as a matter of course.
+                match obs.iface.as_ref().map(|i| i.drops_per_min) {
+                    Some(d) if d as f64 >= t.iface_drop_floor => CheckResult::pass(
                         "interface_drops",
                         "interface drops",
-                        "no drops on the interface",
+                        format!("{d} drops a minute"),
+                    ),
+                    Some(d) => CheckResult::fail(
+                        "interface_drops",
+                        "interface drops",
+                        format!(
+                            "{d} drops a minute, under the {:.0}/min floor",
+                            t.iface_drop_floor
+                        ),
                     ),
                     None => CheckResult::not_run(
                         "interface_drops",
@@ -2006,6 +2026,16 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "no interface counters",
                     ),
                 },
+                // The discriminator: the kernel counting UDP datagrams it
+                // threw away on this host. Until it is read the cause stops
+                // at Likely, however the shared checks come out.
+                CheckResult::not_run(
+                    "local_drop_counters",
+                    "local drop counters",
+                    Availability::NotImplemented,
+                    "UDP receive-buffer and conntrack drop counters are not read yet",
+                )
+                .weighted(2.0),
             ],
         ),
     ];
@@ -3015,6 +3045,87 @@ mod tests {
             causes[0].label.contains("local"),
             "both resolvers slow should point local, got {:?}",
             causes[0].label
+        );
+        // Pointing local is as far as it goes: no local drop counter is read.
+        assert_eq!(
+            causes[0].confidence(),
+            super::super::issue::Confidence::Likely
+        );
+    }
+
+    /// A Wi-Fi laptop behind a resolver at 33× its baseline. The report's
+    /// scenario is one drop a minute and no alternate probed, which live is
+    /// always.
+    fn laptop_with_a_slow_resolver(alt_rtt_ms: Option<f64>, drops_per_min: u64) -> Observations {
+        Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                wireless: true,
+                link_rate_bps: None,
+                drops_per_min,
+                ..eth0()
+            }),
+            ..obs_with_dns(DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            })
+        }
+    }
+
+    fn local_udp_path(obs: &Observations) -> (Cause, Vec<Cause>) {
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(obs, &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("dns.slow_resolver should fire");
+        let (mut local, others): (Vec<Cause>, _) = d
+            .causes
+            .iter()
+            .cloned()
+            .partition(|c| c.id == "local_udp_path");
+        (local.remove(0), others)
+    }
+
+    #[test]
+    fn one_dropped_multicast_frame_a_minute_is_not_a_local_udp_fault() {
+        use super::super::issue::Confidence;
+        let (local, others) = local_udp_path(&laptop_with_a_slow_resolver(None, 1));
+        assert!(
+            local.confidence() <= Confidence::Weak,
+            "{} on {}",
+            local.confidence().label(),
+            local.checks_label()
+        );
+        // The engine ranks by confidence first, so a cause above it on
+        // confidence keeps it off the top.
+        assert!(
+            others.iter().any(|c| c.confidence() > local.confidence()),
+            "local_udp_path ranks top: {:?}",
+            others
+                .iter()
+                .map(|c| (c.id.clone(), c.confidence()))
+                .collect::<Vec<_>>()
+        );
+        let check = |id| local.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            check("alt_resolver_over_the_same_path_is_also_slow").why_not,
+            Some(Availability::NotMeasured)
+        );
+        assert_eq!(check("interface_drops").passed, Some(false));
+    }
+
+    #[test]
+    fn local_udp_path_is_never_strong_without_a_local_counter() {
+        // Everything the rule can see points local: the alternate is as slow
+        // over the same path, and the interface drops twice the floor.
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(Some(38.0), 120));
+        assert_eq!(local.score(), Some(1.0), "{}", local.checks_label());
+        assert_eq!(local.confidence(), super::super::issue::Confidence::Likely);
+        assert_eq!(
+            local.missing_discriminator().map(|c| c.id.as_str()),
+            Some("local_drop_counters")
         );
     }
 
@@ -4105,11 +4216,7 @@ mod tests {
     /// is removed by the 0.33 abstain item that fixes its site, and a row
     /// listed here that starts abstaining fails the test, so the list cannot
     /// outlive the fix.
-    const EXPECTED_UNTIL_0_33_A: &[&str] = &[
-        // D33-A02: with no alternate probed, "the alternate is also slow"
-        // passes, and local_udp_path claims a check it never made.
-        "DnsObs.alt_rtt_ms",
-    ];
+    const EXPECTED_UNTIL_0_33_A: &[&str] = &[];
 
     /// What one absence row demands of the detectors.
     enum Expect {

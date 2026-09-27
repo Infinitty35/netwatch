@@ -167,6 +167,7 @@ pub const CAUSES: &[CauseSpec] = &[
         checks: &[
             "alt_resolver_over_the_same_path_is_also_slow",
             "interface_drops",
+            "local_drop_counters",
         ],
     },
     CauseSpec {
