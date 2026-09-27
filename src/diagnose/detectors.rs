@@ -1282,6 +1282,12 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
                 }],
             ),
         ];
+        // Neither cause can be tested here, so they rank in the order
+        // written. A ring that is too small overflows as drops, and this
+        // link shows only errors, so the wire goes first.
+        if iface.drops_per_min.is_none() {
+            d.causes.reverse();
+        }
         d.remediation = vec![
             Step::instruct(
                 "grow the rx ring",
@@ -4256,9 +4262,11 @@ mod tests {
     }
 
     /// Both causes weigh drops against errors, so neither can be judged
-    /// without drops. The ring buffer cause has no other check.
+    /// without drops. The ring buffer cause has no other check, and with
+    /// only errors to go on it must not be the probable cause.
     #[test]
     fn ring_buffer_cause_is_not_run_without_drop_counters() {
+        use crate::diagnose::engine::{Engine, FixedClock};
         let d = iface_errors(uncounted_drops(3));
         let cause = |id| d.causes.iter().find(|c| c.id == id).unwrap();
         let ring = cause("ring_buffer_small");
@@ -4270,6 +4278,23 @@ mod tests {
         {
             assert_eq!(c.why_not, Some(Availability::Unsupported), "{}", c.id);
         }
+
+        let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:48:10"));
+        let mut engine = Engine::new(Box::new(clock.clone()));
+        let obs = Observations {
+            iface: Some(uncounted_drops(40)),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            engine.observe(&obs, &store());
+            clock.advance_secs(10);
+        }
+        let issue = engine
+            .primary()
+            .into_iter()
+            .find(|i| i.rule == "iface.errors")
+            .expect("iface.errors opens");
+        assert_eq!(issue.top_cause().unwrap().id, "bad_cable_or_duplex");
     }
 
     #[test]
