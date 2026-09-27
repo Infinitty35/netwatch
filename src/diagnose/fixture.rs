@@ -561,15 +561,16 @@ mod tests {
     fn fixture_episode_carries_health_ages() {
         let ep = episode();
         assert_eq!(ep.frames.len() as u64, SCENARIO_SECS + 1);
-        for f in &ep.frames {
+        for (t, f) in ep.frames.iter().enumerate() {
             for (probe, age) in [
                 ("dns", f.ages.dns),
                 ("gateway", f.ages.gateway),
                 ("internet", f.ages.internet),
             ] {
                 let age = age.unwrap_or_else(|| panic!("{}: no {probe} age", f.ts));
-                assert!(
-                    (0.0..5.0).contains(&age),
+                assert_eq!(
+                    age,
+                    (t % 5) as f64,
                     "{}: {probe} age {age}s is off the prober's 5s grid",
                     f.ts
                 );
