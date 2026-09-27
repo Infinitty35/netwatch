@@ -243,6 +243,8 @@ pub struct IfaceObs {
     /// Signal level, where the platform reports one.
     pub signal_dbm: Option<i32>,
     /// Transmit retries over the last minute as a share of frames sent.
+    /// `None` when the radio sent too few frames for a share to mean
+    /// anything, so an idle link does not read as 0%.
     pub tx_retry_pct: Option<f64>,
 }
 
@@ -4604,9 +4606,10 @@ mod tests {
     /// this is a behaviour table: each row leaves one input unmeasured and
     /// names what must then be not run, or must not happen.
     ///
-    /// Four rows join with the item that gives them something to be absent
-    /// in: `carrier` (A05), `drops_per_min` (A06), and two sampler rows in
-    /// `live.rs`, the idle radio (A04) and missing interface info (A05).
+    /// Three rows join with the item that gives them something to be absent
+    /// in: `carrier` (A05), `drops_per_min` (A06), and missing interface info
+    /// (A05), a sampler row in `live.rs`. The other sampler row, the idle
+    /// radio, is `the_sampler_gives_an_idle_radio_no_retry_share` there.
     #[test]
     fn no_detector_reads_an_absent_input_as_evidence() {
         let rows = absence_rows();
