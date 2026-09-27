@@ -1,10 +1,11 @@
 //! Reverse-DNS cache: asynchronous PTR resolution on a background worker
 //! thread, with bounded eviction and pending-entry expiry.
 //!
-//! Only the far ends of this host's own connections are looked up (see
-//! [`DnsCache::set_peers`]). Every captured packet asks for both of its
-//! addresses, and anyone can send a packet from any address, so looking up
-//! every source let a flood of spoofed sources fill the queue and the cache.
+//! Only addresses in this host's own connections, at either end, are looked
+//! up (see [`DnsCache::set_peers`]). Every captured packet asks for both of
+//! its addresses, and anyone can send a packet from any address, so looking
+//! up every source let a flood of spoofed sources fill the queue and the
+//! cache.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, ToSocketAddrs};
@@ -129,16 +130,18 @@ impl DnsCache {
         }
     }
 
-    /// Replace the set of addresses PTR lookups may be queued for with the
-    /// remote ends of `remote_addrs`, the connection table's `ip:port` (or
-    /// `[ip]:port`) strings. Wildcards and unspecified addresses are skipped.
+    /// Replace the set of addresses PTR lookups may be queued for with
+    /// `addrs`: both ends of each row in the connection table, as `ip:port`
+    /// (or `[ip]:port`) strings. Wildcards and unspecified addresses are
+    /// skipped.
     ///
     /// A connection in the table has one end on this host, so the rule is:
-    /// resolve a peer this host is talking to, never an address merely seen
-    /// on the wire. A spoofed source gets a row only as a half-open
-    /// connection, and the kernel bounds how many of those it keeps.
-    pub fn set_peers<'a>(&self, remote_addrs: impl IntoIterator<Item = &'a str>) {
-        let peers: HashSet<IpAddr> = remote_addrs
+    /// resolve this host's own addresses and the peers it is talking to,
+    /// never an address merely seen on the wire. A spoofed source gets a row
+    /// only as a half-open connection, and the kernel bounds how many of
+    /// those it keeps.
+    pub fn set_peers<'a>(&self, addrs: impl IntoIterator<Item = &'a str>) {
+        let peers: HashSet<IpAddr> = addrs
             .into_iter()
             .filter_map(|addr| crate::app::parse_addr_parts(addr).0)
             .filter_map(|ip| parse_ip(&ip))
@@ -307,9 +310,11 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn only_peers_of_this_hosts_connections_are_looked_up() {
+    fn only_addresses_in_this_hosts_connections_are_looked_up() {
         let cache = DnsCache::new();
         cache.set_peers([
+            // A row's local end: this host's own address, resolved too.
+            "192.0.2.10:50514",
             "198.51.100.7:443",
             "[2001:db8::7]:443",
             "[::ffff:198.51.100.8]:22",
@@ -322,13 +327,14 @@ mod lifecycle_tests {
         assert!(queued(&cache).is_empty());
         assert!(cache.cache.lock().unwrap().map.is_empty());
 
+        cache.lookup("192.0.2.10");
         cache.lookup("198.51.100.7");
         cache.lookup("2001:db8::7");
         // The v4-mapped row and the plain v4 packet address are one peer.
         cache.lookup("198.51.100.8");
         assert_eq!(
             queued(&cache),
-            ["198.51.100.7", "2001:db8::7", "198.51.100.8"]
+            ["192.0.2.10", "198.51.100.7", "2001:db8::7", "198.51.100.8"]
         );
 
         // The next refresh replaces the set: a closed connection's peer is

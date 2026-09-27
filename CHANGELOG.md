@@ -30,7 +30,7 @@ All notable changes to NetWatch will be documented in this file.
   small compressed HTTP/3 body could inflate to gigabytes, captured streams
   could hold 2.5 GB between them, and a `--metrics` client that sent its
   request a byte at a time kept a thread for as long as it liked. Reverse DNS
-  now resolves only the far ends of this host's own connections, from a
+  now resolves only the addresses in this host's own connections, from a
   bounded queue and cache. HTTP/3 bodies stop at 4 MiB and are marked
   truncated, and brotli is tried only when the response says
   `content-encoding: br`. Streams share a 256 MiB budget and the least
