@@ -130,6 +130,9 @@ jobs:
   # remount sysfs and bind resolv.conf there.
   diagnose-health-lab:
     runs-on: ubuntu-latest
+    # A hung App::tick would otherwise hold the runner for GitHub's six-hour
+    # default; the lab's own deadline should fire long before this.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

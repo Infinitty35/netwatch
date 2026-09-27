@@ -18,10 +18,13 @@ host's interfaces. No host setting changes: the mounts, addresses and sysctls
 all live in namespaces that end with this process. Requires ip, nsenter,
 unshare and mount.
 """
-import argparse, json, os, pathlib, socket, struct, subprocess, sys, tempfile, time
+import argparse, json, os, pathlib, signal, socket, struct, subprocess, sys, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / 'target/debug/examples/diagnose_lab'
+# Past a run's own length. A tick that hangs would otherwise hold the lab,
+# and the CI runner under it, until something outside gives up.
+GRACE_SECS = 60
 GATEWAY = '192.0.2.2'
 INTERNET = '1.1.1.1'
 # Wide enough that a busy CI runner's jitter stays under 3σ, narrow enough
@@ -238,16 +241,37 @@ class Lab:
         `on_line(row)` is called as each tick arrives, which is where a
         scenario changes a fault."""
         with open(self.dir / 'driver.err', 'w+') as stderr:
+            # Its own process group, so a kill also reaches any child still
+            # holding stdout open, which would otherwise keep the read below
+            # waiting after the driver itself is gone.
             p = subprocess.Popen([BIN, '--seconds', str(seconds), '--seed', self.seed, '--jsonl'],
-                                 env=env or self.env, stdout=subprocess.PIPE, stderr=stderr, text=True)
-            rows = []
-            for line in p.stdout:
-                rows.append(json.loads(line))
-                if on_line:
-                    on_line(rows[-1])
-            p.wait()
+                                 env=env or self.env, stdout=subprocess.PIPE, stderr=stderr, text=True,
+                                 start_new_session=True)
+            killed = threading.Event()
+
+            def kill():
+                killed.set()
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            deadline = threading.Timer(seconds + GRACE_SECS, kill)
+            deadline.start()
+            try:
+                rows = []
+                for line in p.stdout:
+                    rows.append(json.loads(line))
+                    if on_line:
+                        on_line(rows[-1])
+                p.wait()
+            finally:
+                deadline.cancel()
+                if p.poll() is None:
+                    os.killpg(p.pid, signal.SIGKILL)
+                    p.wait()
             stderr.seek(0)
             err = stderr.read()
+        assert not killed.is_set(), f'driver still running {seconds + GRACE_SECS}s after it started: {err}'
         assert p.returncode == 0, f'driver exited {p.returncode}: {err}'
         return rows, err
 
@@ -262,7 +286,8 @@ def smoke(lab, results):
     real = dict(lab.env, HOME=os.environ.get('HOME', '/root'))
     for var in ['XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_DATA_HOME']:
         real.pop(var)
-    refused = subprocess.run([BIN, '--seconds', '1', '--jsonl'], env=real, capture_output=True, text=True)
+    refused = subprocess.run([BIN, '--seconds', '1', '--jsonl'], env=real, capture_output=True, text=True,
+                             timeout=30)
     assert refused.returncode != 0 and not refused.stdout, refused
     results.append({'case': 'driver refuses the real home', 'error': refused.stderr.strip()})
     print(json.dumps(results[-1]), flush=True)
