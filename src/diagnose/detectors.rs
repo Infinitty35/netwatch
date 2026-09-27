@@ -3859,6 +3859,271 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------ absence
+
+    /// Rows whose detectors still read the missing input as evidence. Each
+    /// is removed by the 0.33 abstain item that fixes its site, and a row
+    /// listed here that starts abstaining fails the test, so the list cannot
+    /// outlive the fix.
+    const EXPECTED_UNTIL_0_33_A: &[&str] = &[
+        // D33-A02: with no alternate probed, "the alternate is also slow"
+        // passes, and local_udp_path claims a check it never made.
+        "DnsObs.alt_rtt_ms",
+    ];
+
+    /// What one absence row demands of the detectors.
+    enum Expect {
+        /// The check is present, and neither passed nor failed.
+        NotRun(&'static str),
+        /// The rule does not fire.
+        NoRule(&'static str),
+        /// No evidence on this metric carries this value.
+        NoEvidence(&'static str, f64),
+        /// The rule fires, so the row reached the code that reads the input.
+        Fires(&'static str),
+    }
+
+    struct AbsenceRow {
+        /// The input left unmeasured.
+        input: &'static str,
+        obs: Observations,
+        base: BaselineStore,
+        expect: Vec<Expect>,
+    }
+
+    /// One row per input the live path can leave unmeasured. Everything else
+    /// in the row is set so the rules that read the input fire.
+    fn absence_rows() -> Vec<AbsenceRow> {
+        let mut dns_base = store();
+        dns_base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let dns_row = |input, dns: DnsObs, expect| AbsenceRow {
+            input,
+            obs: obs_with_dns(dns),
+            base: dns_base.clone(),
+            expect,
+        };
+        let row = |input, obs, expect| AbsenceRow {
+            input,
+            obs,
+            base: store(),
+            expect,
+        };
+        let wlan0 = |signal_dbm, tx_retry_pct| Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                wireless: true,
+                link_rate_bps: None,
+                signal_dbm,
+                tx_retry_pct,
+                ..eth0()
+            }),
+            ..Default::default()
+        };
+        // A target whose connect timed out: its firewall_or_route cause asks
+        // whether the internet answers.
+        let mut timed_out = super::target_tests::healthy();
+        timed_out.connect = Some(crate::diagnose::targets::Stage {
+            ms: Some(3000.0),
+            error: Some(crate::diagnose::targets::StageError::Timeout),
+        });
+        timed_out.connect_v4 = timed_out.connect.clone();
+        let no_rtt = |local: &str, retrans| SocketObs {
+            local: local.into(),
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(retrans),
+            ..bloated_socket()
+        };
+
+        vec![
+            dns_row(
+                "DnsObs.alt_rtt_ms",
+                DnsObs {
+                    alt_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("alt_resolver_is_fast"),
+                    Expect::NotRun("alt_resolver_over_the_same_path_is_also_slow"),
+                ],
+            ),
+            dns_row(
+                "DnsObs.icmp_rtt_ms",
+                DnsObs {
+                    icmp_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("icmp_rtt_raised"),
+                    Expect::NotRun("resolver_itself_is_reachable"),
+                ],
+            ),
+            // The same probe, read by the failing-resolver causes.
+            dns_row(
+                "DnsObs.icmp_rtt_ms, failing resolver",
+                DnsObs {
+                    icmp_rtt_ms: None,
+                    failure_rate_pct: 40.0,
+                    failed: 15,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("resolver_unreachable"),
+                    Expect::NotRun("resolver_reachable"),
+                ],
+            ),
+            dns_row(
+                "DnsObs.cached_rtt_ms",
+                DnsObs {
+                    cached_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![Expect::NotRun("cached_names_still_fast")],
+            ),
+            // Both sockets send. One retransmits, so it is classified; the
+            // other reaches the bufferbloat test with no rtt to judge.
+            row(
+                "SocketObs.rtt_ms",
+                Observations {
+                    sockets: vec![no_rtt("10.88.0.2:52344", 12), no_rtt("10.88.0.2:52346", 0)],
+                    ..Default::default()
+                },
+                vec![
+                    Expect::Fires("tcp.retrans_burst"),
+                    Expect::NoRule("tcp.bufferbloat_remote"),
+                    Expect::NoEvidence("tcp.socket_rtt", 0.0),
+                ],
+            ),
+            row(
+                "IfaceObs.signal_dbm",
+                wlan0(None, Some(35.0)),
+                vec![Expect::NotRun("signal_weak"), Expect::NotRun("signal_fine")],
+            ),
+            row(
+                "IfaceObs.tx_retry_pct",
+                wlan0(Some(-80), None),
+                vec![Expect::NotRun("retries_high")],
+            ),
+            row(
+                "GatewayObs.arp_ok",
+                Observations {
+                    gateway: Some(GatewayObs {
+                        arp_ok: None,
+                        ..dead_gateway()
+                    }),
+                    ..Default::default()
+                },
+                vec![Expect::NotRun("arp_resolves"), Expect::NotRun("arp_fails")],
+            ),
+            row(
+                "GatewayObs.internet_reachable",
+                Observations {
+                    gateway: Some(GatewayObs {
+                        internet_reachable: None,
+                        ..dead_gateway()
+                    }),
+                    targets: vec![timed_out],
+                    ..Default::default()
+                },
+                vec![
+                    Expect::NotRun("nothing_beyond_the_gateway_answers_either"),
+                    Expect::NotRun("internet_reachable"),
+                ],
+            ),
+        ]
+    }
+
+    /// What the row got wrong: absent input read as evidence, and anything
+    /// that makes the row prove nothing (a check or rule that never came up).
+    fn judge(row: &AbsenceRow) -> (Vec<String>, Vec<String>) {
+        let found = detect(&row.obs, &row.base, &Thresholds::default());
+        let (mut read, mut vacuous) = (vec![], vec![]);
+        for expect in &row.expect {
+            match *expect {
+                Expect::NotRun(id) => {
+                    let checks: Vec<&CheckResult> = found
+                        .iter()
+                        .flat_map(|d| &d.causes)
+                        .flat_map(|c| &c.checks)
+                        .filter(|c| c.id == id)
+                        .collect();
+                    if checks.is_empty() {
+                        vacuous.push(format!("no detection carries {id}"));
+                    }
+                    for c in checks {
+                        if let Some(passed) = c.passed {
+                            let verb = if passed { "passed" } else { "failed" };
+                            read.push(format!("{id} {verb}: {}", c.detail));
+                        }
+                    }
+                }
+                Expect::NoRule(rule) => {
+                    if found.iter().any(|d| d.rule == rule) {
+                        read.push(format!("{rule} fired"));
+                    }
+                }
+                Expect::NoEvidence(metric, value) => {
+                    if found
+                        .iter()
+                        .flat_map(|d| &d.evidence)
+                        .any(|e| e.metric == metric && e.value == value)
+                    {
+                        read.push(format!("{metric} evidence of {value}"));
+                    }
+                }
+                Expect::Fires(rule) => {
+                    if !found.iter().any(|d| d.rule == rule) {
+                        vacuous.push(format!("{rule} did not fire"));
+                    }
+                }
+            }
+        }
+        (read, vacuous)
+    }
+
+    /// REVIEW §2 exit clause 3: no detector reads a hard-coded `None` as
+    /// evidence. A source scan cannot see the sites that invent a value
+    /// rather than unwrap one, and flags dozens of lines that are fine, so
+    /// this is a behaviour table: each row leaves one input unmeasured and
+    /// names what must then be not run, or must not happen.
+    ///
+    /// Four rows join with the item that gives them something to be absent
+    /// in: `carrier` (A05), `drops_per_min` (A06), and two sampler rows in
+    /// `live.rs`, the idle radio (A04) and missing interface info (A05).
+    #[test]
+    fn no_detector_reads_an_absent_input_as_evidence() {
+        let rows = absence_rows();
+        let mut problems = vec![];
+        for input in EXPECTED_UNTIL_0_33_A {
+            if !rows.iter().any(|r| r.input == *input) {
+                problems.push(format!("{input} is expected to fail but has no row"));
+            }
+        }
+        for row in &rows {
+            let (read, vacuous) = judge(row);
+            if !vacuous.is_empty() {
+                problems.push(format!(
+                    "{} proves nothing: {}",
+                    row.input,
+                    vacuous.join("; ")
+                ));
+            }
+            match (read.is_empty(), EXPECTED_UNTIL_0_33_A.contains(&row.input)) {
+                (false, false) => problems.push(format!(
+                    "{} read as evidence: {}",
+                    row.input,
+                    read.join("; ")
+                )),
+                (true, true) => problems.push(format!(
+                    "{} now abstains; remove it from EXPECTED_UNTIL_0_33_A",
+                    row.input
+                )),
+                _ => {}
+            }
+        }
+        assert!(problems.is_empty(), "\n{}", problems.join("\n"));
+    }
+
     #[test]
     fn observations_round_trip_through_json() {
         let obs = Observations {
@@ -3917,7 +4182,7 @@ mod target_tests {
         })
     }
 
-    fn healthy() -> TargetObs {
+    pub(super) fn healthy() -> TargetObs {
         TargetObs {
             stale_after_secs: None,
             attempts: vec![],
