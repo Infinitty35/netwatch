@@ -581,7 +581,7 @@ full resolution.
 | `show_geo` | `true` | `true` `false` | Show the GeoIP column in Connections. |
 | `geoip_db` | `""` | file path | MaxMind GeoLite2-City or GeoLite2-Country `.mmdb`. Empty means no offline lookups; see `geoip_online` for the fallback. |
 | `geoip_asn_db` | `""` | file path | MaxMind GeoLite2-ASN `.mmdb`, for AS numbers. Optional. |
-| `geoip_online` | `false` | `true` `false` | Fall back to `http://ip-api.com` when `geoip_db` is empty. Off by default: enabling it sends every public peer IP to a third party over cleartext HTTP, with no per-host opt-out. |
+| `geoip_online` | `false` | `true` `false` | Fall back to `http://ip-api.com` when `geoip_db` is empty. Off by default: enabling it sends every public peer IP to a third party over cleartext HTTP, with no per-host opt-out, and anyone on the path can read the lookups and change the answers. ip-api.com offers HTTPS only on its paid tier, so there is no encrypted option. With this on and no `geoip_db`, Settings shows the GeoIP DB Path as `ip-api.com (cleartext)`. |
 
 ### Security
 

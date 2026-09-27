@@ -300,6 +300,10 @@ pub fn is_private_ip(ip: &str) -> bool {
         || ip.starts_with("239.") // multicast v4
 }
 
+/// Cleartext because it has to be: ip-api.com serves HTTPS only on its paid
+/// tier. Anyone on the path sees which peers are looked up and can rewrite
+/// the answer. That is why `geoip_online` is off by default, and why doctor,
+/// Settings and the config reference call it cleartext.
 fn lookup_geo_online(ip: &str) -> Option<GeoInfo> {
     let url = format!(
         "http://ip-api.com/json/{}?fields=status,country,countryCode,city,org,as",

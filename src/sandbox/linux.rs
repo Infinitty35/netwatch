@@ -2,8 +2,8 @@
 //! restrictions.
 //!
 //! Phase 1 does *not* enable Landlock's network-block (ABI V4) rule. The
-//! TUI makes legitimate outbound HTTPS calls for ip-api.com GeoIP
-//! fallback, `--remote` metric streaming, and inline WHOIS lookups; a
+//! TUI makes legitimate outbound calls for the ip-api.com GeoIP fallback
+//! (cleartext HTTP), `--remote` metric streaming, and inline WHOIS lookups; a
 //! blanket TCP-block would silently break working features. A later
 //! phase can add port-allow-listing once those endpoints are known at
 //! startup.

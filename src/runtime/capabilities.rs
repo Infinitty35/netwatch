@@ -184,7 +184,7 @@ impl CapabilitySnapshot {
             (
                 "online_geo",
                 config.geoip_online,
-                "Online GeoIP configured; endpoint not contacted",
+                "Online GeoIP configured (ip-api.com, cleartext HTTP); endpoint not contacted",
             ),
             (
                 "insights",
@@ -444,7 +444,7 @@ impl CapabilitySnapshot {
                 State::Disabled
             },
             "live_configuration",
-            "Live online lookup setting; per-request outcomes not tracked here",
+            "Live online lookup setting (ip-api.com, cleartext HTTP); per-request outcomes not tracked here",
             None,
         );
         for id in ["whois", "reverse_dns"] {
@@ -908,6 +908,16 @@ mod tests {
         let restored: CapabilitySnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.get("capture").reason, "open_not_attempted");
+    }
+    #[test]
+    fn online_geo_is_labelled_cleartext() {
+        let config = NetwatchConfig {
+            geoip_online: true,
+            ..Default::default()
+        };
+        let snapshot = CapabilitySnapshot::configured(&config);
+        assert_eq!(snapshot.get("online_geo").state, State::NotChecked);
+        assert!(snapshot.get("online_geo").detail.contains("cleartext"));
     }
     #[test]
     fn doctor_text_fits_an_80_column_terminal_and_sanitizes_controls() {

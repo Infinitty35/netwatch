@@ -47,7 +47,9 @@ All notable changes to NetWatch will be documented in this file.
   and every snapshot in cleartext; netwatch now refuses one and exits unless
   `--insecure-remote` is given. `--help` now marks `--api-key` as
   discouraged, since any user on the host can read it in `ps`; set
-  `NETWATCH_API_KEY` instead.
+  `NETWATCH_API_KEY` instead. Online geo lookups (`geoip_online`) stay
+  cleartext, because ip-api.com has no HTTPS on its free tier, and `doctor`,
+  Settings and the config reference now say so.
 
 ## [0.32.3] - 2026-09-20
 

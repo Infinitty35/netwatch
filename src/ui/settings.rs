@@ -113,7 +113,11 @@ fn build_rows(cfg: &NetwatchConfig) -> Vec<SettingRow> {
         },
         SettingRow {
             label: "GeoIP DB Path",
-            value: if cfg.geoip_db.is_empty() {
+            // Without a database, `geoip_online` sends lookups to ip-api.com,
+            // which has no HTTPS on its free tier. Say so where geo is set.
+            value: if cfg.geoip_db.is_empty() && cfg.geoip_online {
+                "ip-api.com (cleartext)".into()
+            } else if cfg.geoip_db.is_empty() {
                 "(none)".into()
             } else {
                 cfg.geoip_db.clone()
@@ -562,6 +566,19 @@ mod tests {
         let cfg = NetwatchConfig::default();
         let rows = build_rows(&cfg);
         assert_eq!(rows.len(), SETTINGS_COUNT);
+    }
+
+    #[test]
+    fn geoip_db_row_says_when_lookups_go_out_in_cleartext() {
+        let mut cfg = NetwatchConfig::default();
+        assert_eq!(build_rows(&cfg)[cursor::GEOIP_DB].value, "(none)");
+        cfg.geoip_online = true;
+        assert_eq!(
+            build_rows(&cfg)[cursor::GEOIP_DB].value,
+            "ip-api.com (cleartext)"
+        );
+        cfg.geoip_db = "/usr/share/GeoIP/GeoLite2-City.mmdb".into();
+        assert_eq!(build_rows(&cfg)[cursor::GEOIP_DB].value, cfg.geoip_db);
     }
 
     #[test]
