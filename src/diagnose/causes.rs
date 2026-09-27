@@ -413,7 +413,7 @@ mod tests {
         for n in [
             "CheckResult::pass(",
             "CheckResult::fail(",
-            "CheckResult::skipped(",
+            "CheckResult::not_run(",
             "stage_check(",
         ] {
             source_checks.extend(literal_ids(n));

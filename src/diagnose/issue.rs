@@ -242,23 +242,139 @@ pub fn round_for_display(v: f64) -> String {
     }
 }
 
+/// Why a rule input, or a single check, has nothing to say. Coverage uses it
+/// per rule; a check that did not run carries one as its `why_not`, so the
+/// reason is one of these words rather than whatever a call site wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Available,
+    Learning,
+    NotMeasured,
+    Unsupported,
+    Stale,
+    NotConfigured,
+    NoSubjects,
+    NotApplicable,
+    AwaitingTest,
+    PermissionDenied,
+    CollectorFailed,
+    NotImplemented,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Availability {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Available => "ready",
+            Self::Learning => "learning",
+            Self::NotMeasured => "not measured",
+            Self::Unsupported => "unsupported",
+            Self::Stale => "stale",
+            Self::NotConfigured => "not configured",
+            Self::NoSubjects => "no subjects",
+            Self::NotApplicable => "not applicable",
+            Self::AwaitingTest => "awaiting test",
+            Self::PermissionDenied => "permission denied",
+            Self::CollectorFailed => "collector failed",
+            Self::NotImplemented => "not implemented",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What became of one check: `passed` as a word, which the JSON carries as
+/// `state`. Schema 1 still writes `passed` beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Passed,
+    Failed,
+    NotRun,
+}
+
+impl CheckState {
+    fn passed(self) -> Option<bool> {
+        match self {
+            CheckState::Passed => Some(true),
+            CheckState::Failed => Some(false),
+            CheckState::NotRun => None,
+        }
+    }
+}
+
 /// One discriminating test that ranks a cause. `passed: None` means the check
 /// could not be run (no data, no capability) — which is different from failing
-/// and must not count against the cause.
+/// and must not count against the cause — and `why_not` then says which.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(into = "CheckWire", from = "CheckWire")]
 pub struct CheckResult {
     /// Stable snake_case identity, unique within its cause. Labels, features
     /// and recorded episodes key on this, never on `name`, so rewording a
     /// check for the screen doesn't orphan the data collected under it.
-    #[serde(default)]
     pub id: String,
     pub name: String,
     pub passed: Option<bool>,
+    /// Set exactly when `passed` is `None`. [`CheckResult::not_run`] is the
+    /// one constructor for such a check, so a call site cannot leave it out,
+    /// and `detect` asserts it in debug builds.
+    pub why_not: Option<Availability>,
     /// Short factual detail, e.g. "alt resolver 1.1.1.1 answered in 1.4ms".
     pub detail: String,
     /// Relative importance within the cause. Defaults to 1.0.
-    #[serde(default = "one")]
     pub weight: f64,
+}
+
+/// A check as it is written and read. Schema 1 writes `state` next to
+/// `passed`; reading takes either, so records made before `state` and
+/// `why_not` existed still load.
+#[derive(Serialize, Deserialize)]
+struct CheckWire {
+    #[serde(default)]
+    id: String,
+    name: String,
+    #[serde(default)]
+    passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<CheckState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    why_not: Option<Availability>,
+    detail: String,
+    #[serde(default = "one")]
+    weight: f64,
+}
+
+impl From<CheckResult> for CheckWire {
+    fn from(c: CheckResult) -> Self {
+        Self {
+            state: Some(c.state()),
+            id: c.id,
+            name: c.name,
+            passed: c.passed,
+            why_not: c.why_not,
+            detail: c.detail,
+            weight: c.weight,
+        }
+    }
+}
+
+impl From<CheckWire> for CheckResult {
+    fn from(w: CheckWire) -> Self {
+        let passed = w.state.map_or(w.passed, CheckState::passed);
+        Self {
+            id: w.id,
+            name: w.name,
+            passed,
+            // A check recorded before `why_not` existed kept its reason in
+            // `detail` only, so the word for it is Unknown.
+            why_not: passed
+                .is_none()
+                .then(|| w.why_not.unwrap_or(Availability::Unknown)),
+            detail: w.detail,
+            weight: w.weight,
+        }
+    }
 }
 
 fn one() -> f64 {
@@ -271,6 +387,7 @@ impl CheckResult {
             id: id.to_string(),
             name: name.into(),
             passed: Some(true),
+            why_not: None,
             detail: detail.into(),
             weight: 1.0,
         }
@@ -281,19 +398,36 @@ impl CheckResult {
             id: id.to_string(),
             name: name.into(),
             passed: Some(false),
+            why_not: None,
             detail: detail.into(),
             weight: 1.0,
         }
     }
 
-    /// Check couldn't run. Neither evidence for nor against.
-    pub fn skipped(id: &str, name: impl Into<String>, why: impl Into<String>) -> Self {
+    /// Check couldn't run. Neither evidence for nor against, and `why_not`
+    /// says whether that is a missing probe, a missing sample, a test the
+    /// user has not run, or a check that does not apply here.
+    pub fn not_run(
+        id: &str,
+        name: impl Into<String>,
+        why_not: Availability,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             name: name.into(),
             passed: None,
-            detail: why.into(),
+            why_not: Some(why_not),
+            detail: detail.into(),
             weight: 1.0,
+        }
+    }
+
+    pub fn state(&self) -> CheckState {
+        match self.passed {
+            Some(true) => CheckState::Passed,
+            Some(false) => CheckState::Failed,
+            None => CheckState::NotRun,
         }
     }
 
@@ -1018,6 +1152,54 @@ mod tests {
     }
 
     #[test]
+    fn a_check_writes_its_state_beside_passed() {
+        let json = |c: &CheckResult| serde_json::to_value(c).unwrap();
+        let not_run = json(&CheckResult::not_run(
+            "alt_resolver_is_fast",
+            "alt resolver is fast",
+            Availability::NotMeasured,
+            "no alternate resolver probed",
+        ));
+        assert_eq!(not_run["passed"], serde_json::Value::Null);
+        assert_eq!(not_run["state"], "not_run");
+        assert_eq!(not_run["why_not"], "not_measured");
+        // Schema 1 only gains fields: a check that ran carries no `why_not`.
+        let passed = json(&CheckResult::pass("a", "a", "fine"));
+        assert_eq!(passed["passed"], true);
+        assert_eq!(passed["state"], "passed");
+        assert!(passed.get("why_not").is_none(), "{passed}");
+        assert_eq!(json(&CheckResult::fail("a", "a", ""))["state"], "failed");
+
+        let c = CheckResult::not_run("a", "a", Availability::AwaitingTest, "press t").weighted(2.0);
+        let back: CheckResult = serde_json::from_value(json(&c)).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn a_check_recorded_before_why_not_still_loads() {
+        let load = |s: &str| serde_json::from_str::<CheckResult>(s).unwrap();
+        let old =
+            load(r#"{"id":"a","name":"a","passed":null,"detail":"no icmp probe","weight":1.0}"#);
+        assert_eq!(old.state(), CheckState::NotRun);
+        assert_eq!(old.detail, "no icmp probe");
+        // The reason was free text then; the word for it is Unknown, so
+        // every check that did not run still says why.
+        assert_eq!(old.why_not, Some(Availability::Unknown));
+        let ran = load(r#"{"name":"a","passed":false,"detail":""}"#);
+        assert_eq!(ran.state(), CheckState::Failed);
+        assert_eq!(ran.why_not, None);
+        assert_eq!(ran.weight, 1.0);
+        // A record that carries `state` alone, as schema 2 will, loads too.
+        let new = load(r#"{"id":"a","name":"a","state":"passed","detail":""}"#);
+        assert_eq!(new.passed, Some(true));
+        let new = load(
+            r#"{"id":"a","name":"a","state":"not_run","why_not":"awaiting_test","detail":""}"#,
+        );
+        assert_eq!(new.passed, None);
+        assert_eq!(new.why_not, Some(Availability::AwaitingTest));
+    }
+
+    #[test]
     fn a_skipped_shared_symptom_does_not_count_against_a_cause() {
         // Skipping a check that several causes share is not evidence against
         // this one, so the pass fraction still reads 1.0 — but with a check
@@ -1029,7 +1211,7 @@ mod tests {
             vec![
                 CheckResult::pass("a", "a", ""),
                 CheckResult::pass("b", "b", ""),
-                CheckResult::skipped("c", "c", "no data"),
+                CheckResult::not_run("c", "c", Availability::NotMeasured, "no data"),
             ],
         );
         assert_eq!(all_pass.score(), Some(1.0));
@@ -1048,8 +1230,13 @@ mod tests {
             "c",
             vec![
                 CheckResult::pass("symptom", "symptom", ""),
-                CheckResult::skipped("discriminator", "discriminator", "no test has run")
-                    .weighted(2.0),
+                CheckResult::not_run(
+                    "discriminator",
+                    "discriminator",
+                    Availability::AwaitingTest,
+                    "no test has run",
+                )
+                .weighted(2.0),
             ],
         );
         assert_eq!(c.score(), Some(1.0), "a skipped check is not a failure");
@@ -1093,7 +1280,7 @@ mod tests {
             "c",
             vec![
                 CheckResult::pass("a", "a", ""),
-                CheckResult::skipped("b", "b", "no data"),
+                CheckResult::not_run("b", "b", Availability::NotMeasured, "no data"),
             ],
         );
         assert_eq!(partial.confidence(), Confidence::Likely);
@@ -1109,7 +1296,7 @@ mod tests {
                 "unmeasured",
                 vec![
                     CheckResult::pass("symptom", "symptom", ""),
-                    CheckResult::skipped("d", "d", "").weighted(2.0),
+                    CheckResult::not_run("d", "d", Availability::NotMeasured, "").weighted(2.0),
                 ],
             ),
             Cause::new(
@@ -1144,7 +1331,16 @@ mod tests {
 
     #[test]
     fn a_cause_with_no_runnable_checks_is_untested_not_certain() {
-        let c = Cause::new("c", "c", vec![CheckResult::skipped("a", "a", "no data")]);
+        let c = Cause::new(
+            "c",
+            "c",
+            vec![CheckResult::not_run(
+                "a",
+                "a",
+                Availability::NotMeasured,
+                "no data",
+            )],
+        );
         assert_eq!(c.score(), None);
         assert_eq!(c.confidence(), Confidence::Untested);
     }
@@ -1156,7 +1352,12 @@ mod tests {
             Cause::new(
                 "untested",
                 "untested",
-                vec![CheckResult::skipped("a", "a", "")],
+                vec![CheckResult::not_run(
+                    "a",
+                    "a",
+                    Availability::NotMeasured,
+                    "",
+                )],
             ),
             Cause::new(
                 "half",

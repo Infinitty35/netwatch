@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::baseline::BaselineStore;
 use super::issue::{
-    Action, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject, Verify,
+    Action, Availability, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject,
+    Verify,
 };
 use super::rules;
 
@@ -402,11 +403,12 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out.extend(detect_nat(obs));
     out.extend(super::egress::detect(obs.egress.as_ref()));
     out.extend(detect_targets(obs, base, t));
+    let valid = |d: &Detection| ids_are_valid(d).and_then(|()| not_run_checks_say_why(d));
     debug_assert!(
-        out.iter().all(|d| ids_are_valid(d).is_ok()),
+        out.iter().all(|d| valid(d).is_ok()),
         "{:?}",
         out.iter()
-            .filter_map(|d| ids_are_valid(d).err())
+            .filter_map(|d| valid(d).err())
             .collect::<Vec<_>>()
     );
     out
@@ -504,9 +506,10 @@ fn target_detection(
             .count();
         let asked = target.lookups.len();
         let other_answers = if asked == 0 {
-            CheckResult::skipped(
+            CheckResult::not_run(
                 "another_resolver_answers",
                 "another resolver knows the name",
+                Availability::NotMeasured,
                 "no resolvers to ask directly",
             )
         } else if answered > 0 {
@@ -556,9 +559,10 @@ fn target_detection(
                             "public names are failing too",
                             "the resolver answers other names",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "public_names_failing_too",
                             "public names are failing too",
+                            Availability::NotMeasured,
                             "no resolver probe",
                         ),
                     },
@@ -576,9 +580,10 @@ fn target_detection(
                         )
                         .weighted(2.0)
                     } else if asked == 0 {
-                        CheckResult::skipped(
+                        CheckResult::not_run(
                             "every_resolver_says_nxdomain",
                             "every resolver says it doesn't exist",
+                            Availability::NotMeasured,
                             "no resolvers to ask directly",
                         )
                     } else {
@@ -685,9 +690,10 @@ fn target_detection(
                             "the internet is reachable",
                             "nothing beyond the gateway answers",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "internet_reachable",
                             "the internet is reachable",
+                            Availability::NotMeasured,
                             "no internet probe",
                         ),
                     },
@@ -702,9 +708,10 @@ fn target_detection(
                             "the other address family fails too",
                             "ipv4 and ipv6 both fail",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "other_address_family_also_fails",
                             "the other address family fails too",
+                            Availability::NotApplicable,
                             "the name has only one address family",
                         ),
                     },
@@ -726,9 +733,10 @@ fn target_detection(
                         "both families behave the same",
                     )
                     .weighted(2.0),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "ipv6_fails_ipv4_works",
                         "ipv6 fails but ipv4 works",
+                        Availability::NotApplicable,
                         "the name has only one address family",
                     ),
                 }],
@@ -831,10 +839,19 @@ fn target_detection(
                             "our clock is more than 5 minutes off",
                             format!("{o:+.0}s"),
                         ),
-                        None => CheckResult::skipped(
+                        // Only Linux reads the local NTP status; elsewhere
+                        // the offset is a platform gap, not a missed sample.
+                        None if cfg!(target_os = "linux") => CheckResult::not_run(
                             "clock_offset_large",
                             "our clock is more than 5 minutes off",
+                            Availability::NotMeasured,
                             "no synchronised local NTP status available",
+                        ),
+                        None => CheckResult::not_run(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            Availability::Unsupported,
+                            "the local NTP status is read only on Linux",
                         ),
                     },
                 ],
@@ -901,36 +918,41 @@ fn target_detection(
             "the network delivered the request; the answer was an error",
         )];
     } else {
-        // Everything worked. Slower than usual?
+        // Everything worked. Slower than usual? A plain-TCP target has no tls
+        // or first-byte stage, and a plain-HTTP one no tls stage.
         let stages = [
             (
                 "dns_stage_slow",
                 "target.resolve_ms",
                 Some(&target.resolve),
                 "resolve",
+                true,
             ),
             (
                 "connect_stage_slow",
                 "target.connect_ms",
                 target.connect.as_ref(),
                 "connect",
+                true,
             ),
             (
                 "tls_stage_slow",
                 "target.tls_ms",
                 target.tls_stage.as_ref(),
                 "tls",
+                target.tls,
             ),
             (
                 "server_stage_slow",
                 "target.ttfb_ms",
                 target.http_stage.as_ref(),
                 "first byte",
+                target.http,
             ),
         ];
         let sigmas: Vec<_> = stages
             .iter()
-            .map(|(cause, metric, stage, word)| {
+            .map(|(cause, metric, stage, word, applies)| {
                 let ms = stage.and_then(|s| s.ms);
                 let b = base.get(target.baseline_subject(), metric);
                 (
@@ -939,6 +961,7 @@ fn target_detection(
                     ms,
                     b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
                     b.map(|b| b.mean),
+                    *applies,
                 )
             })
             .collect();
@@ -950,7 +973,7 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
-        let (_, word, ms, _, mean) = worst.0;
+        let (_, word, ms, _, mean, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
             ms.unwrap_or_default(),
@@ -963,11 +986,11 @@ fn target_detection(
         d.evidence
             .push(Evidence::new("target.worst_stage_sigma", worst.1, "σ"));
         let stage_check = |id: &'static str, cause: &str| {
-            let (_, word, ms, sigma, _) = sigmas
+            let (_, word, ms, sigma, _, applies) = sigmas
                 .iter()
                 .find(|s| s.0 == cause)
                 .expect("every stage is listed");
-            stage_result(id, word, *ms, *sigma, t.sigma_k)
+            stage_result(id, word, *applies, *ms, *sigma, t.sigma_k)
         };
         d.causes = vec![
             Cause::new(
@@ -1019,10 +1042,12 @@ fn target_detection(
 }
 
 /// One stage of a target against its baseline. Ids are literals at the call
-/// site, which the catalogue scan reads.
+/// site, which the catalogue scan reads. `applies` is false for a stage this
+/// kind of target never has, such as tls on a plain-HTTP target.
 fn stage_result(
     id: &'static str,
     word: &str,
+    applies: bool,
     ms: Option<f64>,
     sigma: Option<f64>,
     k: f64,
@@ -1033,6 +1058,7 @@ fn stage_result(
             id: id.into(),
             name,
             passed: Some(true),
+            why_not: None,
             detail: format!("{:.0}ms, {s:.1}σ above baseline", ms.unwrap_or_default()),
             weight: 1.0,
         },
@@ -1040,16 +1066,29 @@ fn stage_result(
             id: id.into(),
             name,
             passed: Some(false),
+            why_not: None,
             detail: format!("{s:.1}σ"),
             weight: 1.0,
         },
-        None => CheckResult {
-            id: id.into(),
-            name,
-            passed: None,
-            detail: "no baseline for this stage yet".into(),
-            weight: 1.0,
-        },
+        None => {
+            let (why_not, detail) = if ms.is_some() {
+                (
+                    Availability::Learning,
+                    "no baseline for this stage yet".to_string(),
+                )
+            } else if !applies {
+                (
+                    Availability::NotApplicable,
+                    format!("this target has no {word} stage"),
+                )
+            } else {
+                (
+                    Availability::NotMeasured,
+                    format!("no {word} time in this probe"),
+                )
+            };
+            CheckResult::not_run(id, name, why_not, detail)
+        }
     }
 }
 
@@ -1075,6 +1114,33 @@ fn ids_are_valid(d: &Detection) -> Result<(), String> {
                     "{}: bad or duplicate check id {:?}",
                     c.key(d.rule),
                     k.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A check that did not run names an [`Availability`] and one that ran does
+/// not. Checked beside the ids on every `detect` in debug builds, so every
+/// detector test also checks the reasons its branches give. `Available` would
+/// print "ready" on a check that did not run, and `Unknown` is only for
+/// records made before `why_not`, so a detector may give neither.
+fn not_run_checks_say_why(d: &Detection) -> Result<(), String> {
+    for c in &d.causes {
+        for k in &c.checks {
+            if k.passed.is_none() != k.why_not.is_some()
+                || matches!(
+                    k.why_not,
+                    Some(Availability::Available | Availability::Unknown)
+                )
+            {
+                return Err(format!(
+                    "{}/{}: passed {:?} with why_not {:?}",
+                    c.key(d.rule),
+                    k.id,
+                    k.passed,
+                    k.why_not
                 ));
             }
         }
@@ -1112,9 +1178,10 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
             Cause::new(
                 "wifi_disassociated",
                 "wifi disassociated",
-                vec![CheckResult::skipped(
+                vec![CheckResult::not_run(
                     "wireless",
                     "wireless",
+                    Availability::NotImplemented,
                     "no wireless statistics for this interface",
                 )],
             ),
@@ -1236,9 +1303,10 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
                             "signal weak",
                             format!("{s} dBm is fine"),
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "signal_weak",
                             "signal weak",
+                            Availability::NotMeasured,
                             "no signal level reported",
                         ),
                     }],
@@ -1258,9 +1326,10 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
                                 "retries high",
                                 format!("{r:.0}% of frames retried"),
                             ),
-                            None => CheckResult::skipped(
+                            None => CheckResult::not_run(
                                 "retries_high",
                                 "retries high",
+                                Availability::NotMeasured,
                                 "no retry counter",
                             ),
                         },
@@ -1271,9 +1340,10 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
                             Some(s) => {
                                 CheckResult::fail("signal_fine", "signal fine", format!("{s} dBm"))
                             }
-                            None => CheckResult::skipped(
+                            None => CheckResult::not_run(
                                 "signal_fine",
                                 "signal fine",
+                                Availability::NotMeasured,
                                 "no signal level",
                             ),
                         },
@@ -1358,9 +1428,10 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
             "the internet is reachable through this gateway",
         )
         .weighted(3.0),
-        None => CheckResult::skipped(
+        None => CheckResult::not_run(
             "nothing_beyond_the_gateway_answers_either",
             "nothing beyond the gateway answers either",
+            Availability::NotMeasured,
             "no internet probe has completed yet",
         )
         .weighted(3.0),
@@ -1382,9 +1453,12 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                         "arp resolves",
                         "no arp reply from the gateway",
                     ),
-                    None => {
-                        CheckResult::skipped("arp_resolves", "arp resolves", "no arp probe has run")
-                    }
+                    None => CheckResult::not_run(
+                        "arp_resolves",
+                        "arp resolves",
+                        Availability::NotImplemented,
+                        "no arp probe has run",
+                    ),
                 },
                 CheckResult::fail(
                     "icmp_reaches_the_gateway",
@@ -1407,7 +1481,12 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(true) => {
                         CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
                     }
-                    None => CheckResult::skipped("arp_fails", "arp fails", "no arp probe has run"),
+                    None => CheckResult::not_run(
+                        "arp_fails",
+                        "arp fails",
+                        Availability::NotImplemented,
+                        "no arp probe has run",
+                    ),
                 }
                 .weighted(2.0),
                 corroboration,
@@ -1470,9 +1549,10 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
         Cause::new(
             "gateway_loaded",
             "the gateway itself is loaded",
-            vec![CheckResult::skipped(
+            vec![CheckResult::not_run(
                 "gateway_cpu",
                 "gateway cpu",
+                Availability::Unsupported,
                 "netwatch cannot see inside the gateway",
             )],
         ),
@@ -1518,9 +1598,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 // every failing resolver rank as down; a check that was never
                 // made is skipped, and the next-test suggester can offer it.
                 vec![match dns.icmp_rtt_ms {
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "resolver_unreachable",
                         "resolver unreachable",
+                        Availability::NotImplemented,
                         "no icmp probe of the resolver has run",
                     ),
                     Some(rtt) => CheckResult::fail(
@@ -1539,9 +1620,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver reachable",
                         format!("icmp {rtt:.1}ms but queries fail — udp/53 may be filtered"),
                     ),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "resolver_reachable",
                         "resolver reachable",
+                        Availability::NotImplemented,
                         "no icmp probe of the resolver has run",
                     ),
                 }],
@@ -1580,9 +1662,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             Cause::new(
                 "middlebox_clamps_udp",
                 "a middlebox strips EDNS or clamps UDP replies",
-                vec![CheckResult::skipped(
+                vec![CheckResult::not_run(
                     "edns_through_the_path",
                     "edns through the path",
+                    Availability::NotImplemented,
                     "not probed — compare a direct query against the resolver's",
                 )],
             ),
@@ -1676,10 +1759,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                                 format!("{} set AD on its answer", cross.reference_resolver),
                             )
                         } else {
-                            CheckResult::skipped(
+                            // The reference did answer, just without AD
+                            // (most often an unsigned zone), so this is a
+                            // fresh result with nothing to validate, not a
+                            // missing one.
+                            CheckResult::not_run(
                                 "reference_validated",
                                 "reference validated",
-                                "reference did not validate the answer",
+                                Availability::NotApplicable,
+                                format!("{} answered without AD", cross.reference_resolver),
                             )
                         },
                     ],
@@ -1704,9 +1792,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         )
                         .weighted(2.0)
                     } else {
-                        CheckResult::skipped(
+                        CheckResult::not_run(
                             "private_answer_for_a_public_name",
                             "private answer for a public name",
+                            Availability::NotApplicable,
                             "the answer is public, so an internal zone does not explain it",
                         )
                         .weighted(2.0)
@@ -1799,9 +1888,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         format!("{alt} is also slow at {rtt:.1}ms"),
                     )
                     .weighted(2.0),
-                    _ => CheckResult::skipped(
+                    _ => CheckResult::not_run(
                         "alt_resolver_is_fast",
                         "alt resolver is fast",
+                        Availability::NotMeasured,
                         "no alternate resolver probed",
                     )
                     .weighted(2.0),
@@ -1817,9 +1907,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms is slow too"),
                     ),
-                    _ => CheckResult::skipped(
+                    _ => CheckResult::not_run(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
+                        Availability::NotImplemented,
                         "no icmp probe",
                     ),
                 },
@@ -1834,9 +1925,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "cached names still fast",
                         format!("even cache hits take {c:.1}ms"),
                     ),
-                    _ => CheckResult::skipped(
+                    _ => CheckResult::not_run(
                         "cached_names_still_fast",
                         "cached names still fast",
+                        Availability::NotImplemented,
                         "no cache probe",
                     ),
                 },
@@ -1857,9 +1949,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "icmp rtt raised",
                         format!("icmp is normal at {rtt:.1}ms"),
                     ),
-                    _ => {
-                        CheckResult::skipped("icmp_rtt_raised", "icmp rtt raised", "no icmp probe")
-                    }
+                    _ => CheckResult::not_run(
+                        "icmp_rtt_raised",
+                        "icmp rtt raised",
+                        Availability::NotImplemented,
+                        "no icmp probe",
+                    ),
                 },
                 if dns.failed > 0 || dns.truncated > 0 {
                     CheckResult::pass(
@@ -1904,9 +1999,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "interface drops",
                         "no drops on the interface",
                     ),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "interface_drops",
                         "interface drops",
+                        Availability::NotMeasured,
                         "no interface counters",
                     ),
                 },
@@ -2032,9 +2128,10 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
                     "one hop dominates",
                     format!("hop {hop} adds {delta:.0}ms over its predecessor"),
                 ),
-                None => CheckResult::skipped(
+                None => CheckResult::not_run(
                     "one_hop_dominates",
                     "one hop dominates",
+                    Availability::NotMeasured,
                     "not enough per-hop timing to attribute the increase",
                 ),
             }],
@@ -2055,9 +2152,10 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
                         "the route is unchanged",
                     ),
                 },
-                None => CheckResult::skipped(
+                None => CheckResult::not_run(
                     "the_path_changed",
                     "the path changed",
+                    Availability::AwaitingTest,
                     "no previous trace to compare",
                 ),
             }],
@@ -2244,9 +2342,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             format!("{:.0}% at hop {} and beyond", hop.loss_pct, hop.number),
         )
     } else {
-        CheckResult::skipped(
+        CheckResult::not_run(
             "loss_propagates_to_later_hops",
             "loss propagates to later hops",
+            Availability::NotMeasured,
             "every hop after this one is silent, so propagation was not observed",
         )
     };
@@ -2257,9 +2356,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             "later hops lose packets too, so this is real loss",
         )
     } else {
-        CheckResult::skipped(
+        CheckResult::not_run(
             "later_hops_are_clean",
             "later hops are clean",
+            Availability::NotMeasured,
             "no hop after this one answered, so there is nothing to compare",
         )
     };
@@ -2276,9 +2376,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             format!("{} never replied to the trace", path.target),
         )
         .weighted(2.0),
-        None => CheckResult::skipped(
+        None => CheckResult::not_run(
             "destination_answered_the_trace",
             "destination answered the trace",
+            Availability::NotMeasured,
             "this trace cannot tell whether the destination answered",
         )
         .weighted(2.0),
@@ -2387,9 +2488,10 @@ fn socket_detection(
                         "our own uplink bloats under load too",
                     )
                     .weighted(2.0),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "link_level_bufferbloat_test_passed",
                         "link-level bufferbloat test passed",
+                        Availability::AwaitingTest,
                         "no loaded-rtt test has run, so the queue cannot be placed",
                     )
                     .weighted(2.0),
@@ -2594,9 +2696,10 @@ fn detect_nat(obs: &Observations) -> Vec<Detection> {
         Cause::new(
             "router_symmetric_nat",
             "the router's nat set to symmetric or 'strict'",
-            vec![CheckResult::skipped(
+            vec![CheckResult::not_run(
                 "single_nat_layer",
                 "single nat layer",
+                Availability::NotImplemented,
                 "cannot tell the router from a carrier nat behind it",
             )],
         ),
@@ -2620,9 +2723,10 @@ fn detect_nat(obs: &Observations) -> Vec<Detection> {
 fn path_loss_check(remote: &str, obs: &Observations) -> CheckResult {
     let host = remote.rsplit_once(':').map(|(h, _)| h).unwrap_or(remote);
     let Some(path) = obs.paths.iter().find(|p| p.target == host) else {
-        return CheckResult::skipped(
+        return CheckResult::not_run(
             "the_path_to_this_peer_is_losing_packets",
             "the path to this peer is losing packets",
+            Availability::AwaitingTest,
             format!("no trace to {host} — press t to run one"),
         );
     };
@@ -3318,6 +3422,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_answer_without_ad_is_not_applicable_not_unmeasured() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.cross = Some(DnsCross {
+            name: "dns.google".into(),
+            local: vec!["10.0.0.1".into()],
+            reference_resolver: "1.1.1.1".into(),
+            reference: vec!["8.8.8.8".into()],
+            validated: false,
+            private_answer: false,
+            mismatch_pct: 100.0,
+            cycles: 5,
+        });
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let check = found
+            .iter()
+            .find(|d| d.rule == "dns.hijack_suspect")
+            .expect("disagreement with history fires the rule")
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "reference_validated")
+            .expect("forged_records carries the check");
+        assert_eq!(check.passed, None);
+        assert_eq!(check.why_not, Some(Availability::NotApplicable));
+        assert_eq!(check.detail, "1.1.1.1 answered without AD");
+    }
+
+    #[test]
     fn a_private_answer_keeps_split_horizon_on_the_table() {
         // A private answer for a public name is the signature of an internal
         // zone as much as of an interceptor. The check used to be inverted,
@@ -3711,15 +3844,22 @@ mod tests {
         let src = include_str!("detectors.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
         let mut causes = 0;
+        let mut forwarded = 0;
         for (needle, is_cause) in [
             ("Cause::new(", true),
             ("CheckResult::pass(", false),
             ("CheckResult::fail(", false),
-            ("CheckResult::skipped(", false),
+            ("CheckResult::not_run(", false),
             ("stage_check(", false),
         ] {
             for (at, _) in body.match_indices(needle) {
                 let rest = body[at + needle.len()..].trim_start();
+                // `stage_result` passes on the literal its `stage_check(`
+                // caller gave it, which this scan has already read.
+                if rest.starts_with("id,") {
+                    forwarded += 1;
+                    continue;
+                }
                 let lit = rest
                     .strip_prefix('"')
                     .and_then(|r| r.split_once('"'))
@@ -3738,6 +3878,106 @@ mod tests {
             causes >= 35,
             "found only {causes} causes; did the scan break?"
         );
+        assert_eq!(forwarded, 1, "only stage_result may forward an id");
+    }
+
+    /// `detect` checks this on every call in debug builds, so each detector
+    /// test above already holds its own branches to it. This one adds the
+    /// fixture's whole timeline and a host where every optional probe is
+    /// missing, and ties `state()` to the reason as well.
+    #[test]
+    fn a_not_run_check_always_says_why() {
+        use crate::diagnose::{fixture, issue::CheckState};
+        let mut scenarios: Vec<Observations> = (0..=fixture::SCENARIO_SECS)
+            .step_by(10)
+            .map(fixture::observations_at)
+            .collect();
+        scenarios.push(Observations {
+            now: "2026-09-03 06:51:19".into(),
+            dns: Some(DnsObs {
+                alt_rtt_ms: None,
+                icmp_rtt_ms: None,
+                cached_rtt_ms: None,
+                ..slow_dns()
+            }),
+            gateway: Some(GatewayObs {
+                arp_ok: None,
+                internet_reachable: None,
+                ..dead_gateway()
+            }),
+            iface: Some(IfaceObs {
+                counter_window_secs: Some(60.0),
+                name: "wlan0".into(),
+                carrier: true,
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                errors_per_min: 0,
+                drops_per_min: 0,
+                link_rate_bps: None,
+                rx_bps: 0.0,
+                tx_bps: 0.0,
+                wireless: true,
+                signal_dbm: None,
+                tx_retry_pct: Some(40.0),
+            }),
+            sockets: vec![bloated_socket()],
+            ..Default::default()
+        });
+        let base = fixture::baselines();
+        let mut not_run = 0;
+        for obs in &scenarios {
+            for d in detect(obs, &base, &Thresholds::default()) {
+                for c in &d.causes {
+                    for k in &c.checks {
+                        let key = format!("{}/{}", c.key(d.rule), k.id);
+                        assert_eq!(k.passed.is_none(), k.why_not.is_some(), "{key}");
+                        assert!(
+                            !matches!(
+                                k.why_not,
+                                Some(Availability::Available | Availability::Unknown)
+                            ),
+                            "{key}: {:?} is not a reason a check did not run",
+                            k.why_not
+                        );
+                        assert_eq!(
+                            k.state() == CheckState::NotRun,
+                            k.why_not.is_some(),
+                            "{key}"
+                        );
+                        not_run += usize::from(k.passed.is_none());
+                    }
+                }
+            }
+        }
+        assert!(not_run >= 10, "only {not_run} checks did not run");
+    }
+
+    #[test]
+    fn a_not_run_check_cannot_claim_to_be_ready_or_unknown() {
+        let with = |why_not| {
+            let mut d = Detection::new(
+                "dns.slow_resolver",
+                Subject::Resolver {
+                    addr: "127.0.0.53".into(),
+                },
+            );
+            d.causes = vec![Cause::new(
+                "resolver_overloaded",
+                "the resolver is overloaded",
+                vec![CheckResult::not_run(
+                    "icmp_rtt_raised",
+                    "icmp rtt raised",
+                    why_not,
+                    "no icmp probe",
+                )],
+            )];
+            not_run_checks_say_why(&d)
+        };
+        assert!(with(Availability::NotImplemented).is_ok());
+        assert!(with(Availability::Available).is_err());
+        assert!(with(Availability::Unknown).is_err());
     }
 
     #[test]
@@ -3950,6 +4190,29 @@ mod target_tests {
     }
 
     #[test]
+    fn an_unread_clock_offset_is_unsupported_off_linux() {
+        let mut t = healthy();
+        t.tls_stage = err(StageError::CertExpired);
+        t.http_stage = None;
+        t.context.clock_offset_secs = None;
+        let d = detect_one(t);
+        let check = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "clock_offset_large")
+            .expect("the clock cause is listed");
+        // Linux reads chrony and only misses a sample; the other platforms
+        // never read the local NTP status at all.
+        let expected = if cfg!(target_os = "linux") {
+            Availability::NotMeasured
+        } else {
+            Availability::Unsupported
+        };
+        assert_eq!(check.why_not, Some(expected));
+    }
+
+    #[test]
     fn an_untrusted_issuer_behind_a_proxy_reads_as_interception() {
         let mut t = healthy();
         t.tls_stage = err(StageError::CertUntrusted);
@@ -4031,5 +4294,51 @@ mod target_tests {
             })
             .unwrap();
         assert_eq!(top.id, "server_stage_slow");
+    }
+
+    #[test]
+    fn a_slow_connect_on_a_plain_http_target_says_it_has_no_tls_stage() {
+        let mut base = crate::diagnose::fixture::baselines();
+        for (metric, mean) in [("target.resolve_ms", 2.0), ("target.connect_ms", 12.0)] {
+            base.seed("api", metric, mean, mean / 10.0, 2_400);
+        }
+        let mut t = healthy();
+        t.port = 80;
+        t.tls = false;
+        t.tls_stage = None;
+        t.connect = ok(900.0);
+        let why = |t: TargetObs| {
+            let obs = Observations {
+                targets: vec![t],
+                ..Default::default()
+            };
+            let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+            assert_eq!(d.rule, "target.slow_stage");
+            d.causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .map(|k| (k.id.clone(), (k.why_not.clone(), k.detail.clone())))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let checks = why(t.clone());
+        assert_eq!(
+            checks["tls_stage_above_baseline"],
+            (
+                Some(Availability::NotApplicable),
+                "this target has no tls stage".to_string()
+            )
+        );
+        // A stage the target has, timed but with no baseline yet, is still
+        // learning.
+        assert_eq!(
+            checks["server_stage_above_baseline"].0,
+            Some(Availability::Learning)
+        );
+        // A tls target whose probe returned no tls time was not measured.
+        t.tls = true;
+        assert_eq!(
+            why(t)["tls_stage_above_baseline"].0,
+            Some(Availability::NotMeasured)
+        );
     }
 }

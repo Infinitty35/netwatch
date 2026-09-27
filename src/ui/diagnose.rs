@@ -16,7 +16,9 @@ use ratatui::{
 
 use crate::diagnose::baseline::BaselineStore;
 use crate::diagnose::engine::{Engine, Verdict};
-use crate::diagnose::issue::{Applied, Capability, Issue, IssueState, Severity, Step, StepKind};
+use crate::diagnose::issue::{
+    Applied, Capability, CheckResult, Issue, IssueState, Severity, Step, StepKind,
+};
 use crate::diagnose::rules;
 use crate::theme::Theme;
 use crate::ui::widgets;
@@ -1353,21 +1355,7 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
                 ),
             ]));
             if strong {
-                for c in &cause.checks {
-                    let color = match c.passed {
-                        Some(true) => t.status_good,
-                        Some(false) => t.status_error,
-                        None => t.text_muted,
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("   {} ", c.glyph()), Style::default().fg(color)),
-                        Span::styled(c.name.clone(), Style::default().fg(t.text_secondary)),
-                        Span::styled(
-                            format!(" — {}", c.detail),
-                            Style::default().fg(t.text_muted),
-                        ),
-                    ]));
-                }
+                lines.extend(cause.checks.iter().map(|c| check_line(t, c)));
             }
         }
         lines.push(Line::from(""));
@@ -1616,6 +1604,25 @@ fn ellipsise(text: &str, max: usize) -> String {
     out
 }
 
+/// One check under the top cause. A check that did not run says why before
+/// its detail, so "not measured" and "not implemented" never read alike.
+fn check_line(t: &Theme, c: &CheckResult) -> Line<'static> {
+    let color = match c.passed {
+        Some(true) => t.status_good,
+        Some(false) => t.status_error,
+        None => t.text_muted,
+    };
+    let detail = match &c.why_not {
+        Some(why) => format!(" · {} · {}", why.label(), c.detail),
+        None => format!(" — {}", c.detail),
+    };
+    Line::from(vec![
+        Span::styled(format!("   {} ", c.glyph()), Style::default().fg(color)),
+        Span::styled(c.name.clone(), Style::default().fg(t.text_secondary)),
+        Span::styled(detail, Style::default().fg(t.text_muted)),
+    ])
+}
+
 fn section(t: &Theme, label: &str) -> Line<'static> {
     Line::from(Span::styled(
         label.to_string(),
@@ -1815,6 +1822,31 @@ mod tests {
         assert!(s.contains("probable cause"), "{s}");
         assert!(s.contains("upstream forwarder"), "{s}");
         assert!(s.contains("✓") || s.contains("✗"), "{s}");
+    }
+
+    #[test]
+    fn a_check_that_did_not_run_says_why_before_its_detail() {
+        use crate::diagnose::coverage::Availability;
+        let theme = crate::theme::by_name("default");
+        let text = |c: &CheckResult| -> String {
+            check_line(&theme, c)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let not_run = CheckResult::not_run(
+            "alt_resolver_is_fast",
+            "alt resolver is fast",
+            Availability::NotMeasured,
+            "no alternate resolver probe",
+        );
+        assert_eq!(
+            text(&not_run),
+            "   · alt resolver is fast · not measured · no alternate resolver probe"
+        );
+        let ran = CheckResult::fail("icmp_rtt_raised", "icmp rtt raised", "normal at 0.1ms");
+        assert_eq!(text(&ran), "   ✗ icmp rtt raised — normal at 0.1ms");
     }
 
     #[test]
