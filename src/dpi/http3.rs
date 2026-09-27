@@ -59,8 +59,8 @@ pub struct DecodedBody {
     /// Stream the body came from (HTTP/3 request/response stream id).
     pub stream_id: u64,
     pub bytes: Vec<u8>,
-    /// The body decompressed to more than [`MAX_H3_BODY_BYTES`] and `bytes`
-    /// holds only the first of them.
+    /// The body decompressed to more than [`MAX_H3_BODY_BYTES`], or than
+    /// its flow had room for, and `bytes` holds only the first of them.
     pub truncated: bool,
 }
 
@@ -421,30 +421,32 @@ pub const MAX_H3_BODY_BYTES: u64 = 4 * 1024 * 1024;
 /// magic bytes. brotli has none, so it's tried only when `brotli_declared`
 /// (the response's HEADERS said `content-encoding: br`): trial-decoding
 /// arbitrary bytes as brotli gives false positives. Returns the coding, the
-/// decompressed bytes (at most [`MAX_H3_BODY_BYTES`]) and whether the body
-/// was cut short there, or `None` if nothing produced sane output.
+/// decompressed bytes (at most `limit`, itself at most
+/// [`MAX_H3_BODY_BYTES`]) and whether the body was cut short there, or
+/// `None` if nothing produced sane output.
 pub fn decompress_body(
     body: &[u8],
     brotli_declared: bool,
+    limit: u64,
 ) -> Option<(BodyEncoding, Vec<u8>, bool)> {
     if body.len() < 2 {
         return None;
     }
     // gzip: 1f 8b.
     if body[0] == 0x1f && body[1] == 0x8b {
-        if let Some((out, truncated)) = inflate(flate2::read::GzDecoder::new(body)) {
+        if let Some((out, truncated)) = inflate(flate2::read::GzDecoder::new(body), limit) {
             return Some((BodyEncoding::Gzip, out, truncated));
         }
     }
     // zlib/deflate: 0x78 with a valid FCHECK (common variants 0x01/0x9c/0xda).
     if body[0] == 0x78 {
-        if let Some((out, truncated)) = inflate(flate2::read::ZlibDecoder::new(body)) {
+        if let Some((out, truncated)) = inflate(flate2::read::ZlibDecoder::new(body), limit) {
             return Some((BodyEncoding::Deflate, out, truncated));
         }
     }
     // brotli — only accept if it yields non-empty output.
     if brotli_declared {
-        if let Some((out, truncated)) = inflate(brotli::Decompressor::new(body, 4096)) {
+        if let Some((out, truncated)) = inflate(brotli::Decompressor::new(body, 4096), limit) {
             if !out.is_empty() {
                 return Some((BodyEncoding::Brotli, out, truncated));
             }
@@ -453,17 +455,12 @@ pub fn decompress_body(
     None
 }
 
-/// Read a decoder to the end or to [`MAX_H3_BODY_BYTES`], whichever comes
-/// first. The flag is true when the decoder had more to give.
-fn inflate(mut decoder: impl Read) -> Option<(Vec<u8>, bool)> {
+/// Read a decoder to the end or to `limit`, whichever comes first. The flag
+/// is true when the decoder had more to give.
+fn inflate(mut decoder: impl Read, limit: u64) -> Option<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_H3_BODY_BYTES)
-        .read_to_end(&mut out)
-        .ok()?;
-    let truncated =
-        out.len() as u64 == MAX_H3_BODY_BYTES && !matches!(decoder.read(&mut [0u8; 1]), Ok(0));
+    decoder.by_ref().take(limit).read_to_end(&mut out).ok()?;
+    let truncated = out.len() as u64 == limit && !matches!(decoder.read(&mut [0u8; 1]), Ok(0));
     Some((out, truncated))
 }
 
@@ -472,6 +469,13 @@ fn inflate(mut decoder: impl Read) -> Option<(Vec<u8>, bool)> {
 /// carries; past it we keep the decodable prefix and drop the overflow.
 const MAX_H3_STREAM_BYTES: usize = 2 * 1024 * 1024;
 const MAX_H3_STREAMS: usize = 64;
+
+/// Most bytes one flow's reassembler holds, buffers and decoded bodies
+/// together. The caps above alone allow 64 × (2 MiB + 4 MiB), 384 MiB: more
+/// than the stream tracker's whole budget, which never evicts the flow it is
+/// charging. Past this, new data is dropped, and a body decodes only as far
+/// as the room left.
+pub const MAX_H3_FLOW_BYTES: usize = 64 * 1024 * 1024;
 
 /// Cross-packet HTTP/3 stream reassembly (Phase 3b).
 ///
@@ -546,6 +550,7 @@ impl H3StreamReassembler {
     /// Cheap — memcpy + range bookkeeping only, no decompression (that happens
     /// lazily in [`decoded_bodies`]) — so it's safe on the capture hot path.
     pub fn ingest(&mut self, client_to_server: bool, frames: &[u8]) {
+        let mut held = self.held_bytes();
         for chunk in extract_stream_chunks(frames) {
             // HTTP/3 request/response data rides client-initiated bidirectional
             // streams (id % 4 == 0); skip control/QPACK/push streams.
@@ -563,6 +568,13 @@ impl H3StreamReassembler {
             if end as usize > MAX_H3_STREAM_BYTES {
                 continue;
             }
+            // Likewise past the flow's cap.
+            let grown =
+                (end as usize).saturating_sub(self.streams.get(&key).map_or(0, |st| st.data.len()));
+            if held + grown > MAX_H3_FLOW_BYTES {
+                continue;
+            }
+            held += grown;
             let st = self.streams.entry(key).or_default();
             if end as usize > st.data.len() {
                 st.data.resize(end as usize, 0);
@@ -589,20 +601,27 @@ impl H3StreamReassembler {
     /// decompressor only when the contiguous prefix has grown, so calling this
     /// every render frame is cheap once a body is decoded.
     pub fn decoded_bodies(&mut self) -> Vec<DecodedBody> {
+        let mut held = self.held_bytes();
         let mut out = Vec::new();
         for (&(stream_id, _dir), st) in self.streams.iter_mut() {
             let clen = st.contiguous_len();
-            if clen > st.decoded_len {
+            let prev_len = st.decoded.as_ref().map(|d| d.bytes.len());
+            // A body decodes only into the room the flow's cap leaves,
+            // counting what its previous decode frees.
+            let others = held.saturating_sub(prev_len.unwrap_or(0));
+            let room = MAX_H3_FLOW_BYTES.saturating_sub(others);
+            if clen > st.decoded_len && room > 0 {
                 st.decoded_len = clen;
-                let prev_len = st.decoded.as_ref().map(|d| d.bytes.len());
+                let limit = MAX_H3_BODY_BYTES.min(room as u64);
                 st.decoded = h3_data_payload(&st.data[..clen])
-                    .and_then(|p| decompress_body(&p.body, p.brotli))
+                    .and_then(|p| decompress_body(&p.body, p.brotli, limit))
                     .map(|(encoding, bytes, truncated)| DecodedBody {
                         encoding,
                         stream_id,
                         bytes,
                         truncated,
                     });
+                held = others + st.decoded.as_ref().map_or(0, |d| d.bytes.len());
                 if let Some(body) = &st.decoded {
                     if Some(body.bytes.len()) != prev_len {
                         // `prefix_bytes` is the contiguous *compressed* prefix; a
@@ -697,7 +716,8 @@ mod tests {
             (zlib(&payload), BodyEncoding::Deflate),
             (brotli(&payload), BodyEncoding::Brotli),
         ] {
-            let (enc, out, truncated) = decompress_body(&mk, true).expect("must decompress");
+            let (enc, out, truncated) =
+                decompress_body(&mk, true, MAX_H3_BODY_BYTES).expect("must decompress");
             assert_eq!(enc, want);
             assert_eq!(out, payload);
             assert!(!truncated);
@@ -707,15 +727,19 @@ mod tests {
     #[test]
     fn brotli_is_tried_only_when_the_headers_declare_it() {
         let payload = b"hello world, this is a compressible body ".repeat(8);
-        assert_eq!(decompress_body(&brotli(&payload), false), None);
+        assert_eq!(
+            decompress_body(&brotli(&payload), false, MAX_H3_BODY_BYTES),
+            None
+        );
         // The magic-number codings don't need the header.
-        assert!(decompress_body(&gzip(&payload), false).is_some());
+        assert!(decompress_body(&gzip(&payload), false, MAX_H3_BODY_BYTES).is_some());
     }
 
     #[test]
     fn decompression_stops_at_the_cap_and_says_so() {
         let cap = MAX_H3_BODY_BYTES as usize;
-        let (_, out, truncated) = decompress_body(&gzip(&vec![0; cap + 1]), false).unwrap();
+        let (_, out, truncated) =
+            decompress_body(&gzip(&vec![0; cap + 1]), false, MAX_H3_BODY_BYTES).unwrap();
         assert_eq!(out.len(), cap);
         assert!(truncated);
         let shown = DecodedBody {
@@ -726,7 +750,8 @@ mod tests {
         };
         assert_eq!(shown.size_label(), format!("first {cap} bytes"));
         // Exactly the cap is the whole body, not a truncated one.
-        let (_, out, truncated) = decompress_body(&gzip(&vec![0; cap]), false).unwrap();
+        let (_, out, truncated) =
+            decompress_body(&gzip(&vec![0; cap]), false, MAX_H3_BODY_BYTES).unwrap();
         assert_eq!(out.len(), cap);
         assert!(!truncated);
     }
@@ -937,5 +962,34 @@ mod tests {
         r.ingest(false, &stream_frame(2, 0, &h3)); // client unidirectional
         r.ingest(false, &stream_frame(3, 0, &h3)); // server unidirectional
         assert!(r.decoded_bodies().is_empty());
+    }
+
+    #[test]
+    fn one_flow_holds_at_most_its_cap() {
+        // Buffered data: 40 streams of 2 MiB each would be 80 MiB.
+        let chunk = vec![0x21; MAX_H3_STREAM_BYTES];
+        let mut r = H3StreamReassembler::new();
+        for id in 0..40 {
+            r.ingest(false, &stream_frame(id * 4, 0, &chunk));
+            assert!(r.held_bytes() <= MAX_H3_FLOW_BYTES);
+        }
+        assert_eq!(r.held_bytes(), MAX_H3_FLOW_BYTES);
+
+        // Decoded bodies count too: 20 bodies of 4 MiB would be 80 MiB. The
+        // one that meets the cap is cut short, and none decodes after it.
+        let bomb = h3_data_frame(&gzip(&vec![0; MAX_H3_BODY_BYTES as usize]));
+        let mut r = H3StreamReassembler::new();
+        for id in 0..20 {
+            r.ingest(false, &stream_frame(id * 4, 0, &bomb));
+        }
+        let bodies = r.decoded_bodies();
+        assert_eq!(r.held_bytes(), MAX_H3_FLOW_BYTES);
+        assert!(bodies.len() < 20);
+        let (last, whole) = bodies.split_last().unwrap();
+        assert!(whole.iter().all(|b| !b.truncated));
+        assert!(last.truncated);
+        assert!((last.bytes.len() as u64) < MAX_H3_BODY_BYTES);
+        // Asking again changes nothing.
+        assert_eq!(r.decoded_bodies(), bodies);
     }
 }

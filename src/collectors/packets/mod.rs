@@ -27,6 +27,9 @@ pub(crate) const STREAM_EVICT_BATCH: usize = 256;
 /// Past the budget the least recently seen streams go, down to 7/8 of it, so
 /// one sweep covers many packets.
 const MAX_ALL_STREAMS_BYTES: usize = 256 * 1024 * 1024;
+// `StreamTracker::charge` never evicts the stream it charges, so one flow's
+// HTTP/3 buffers and bodies must fit well inside the budget.
+const _: () = assert!(crate::dpi::http3::MAX_H3_FLOW_BYTES <= MAX_ALL_STREAMS_BYTES / 4);
 const CAPTURE_SNAPLEN: i32 = 65535; // capture full frames (no truncation)
 const CAPTURE_TIMEOUT_MS: i32 = 100; // pcap read timeout; controls batch latency
 const CAPTURE_BATCH_SIZE: usize = 64; // packets processed per tick before yielding
