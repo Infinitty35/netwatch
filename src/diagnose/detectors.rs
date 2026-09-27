@@ -839,11 +839,19 @@ fn target_detection(
                             "our clock is more than 5 minutes off",
                             format!("{o:+.0}s"),
                         ),
-                        None => CheckResult::not_run(
+                        // Only Linux reads the local NTP status; elsewhere
+                        // the offset is a platform gap, not a missed sample.
+                        None if cfg!(target_os = "linux") => CheckResult::not_run(
                             "clock_offset_large",
                             "our clock is more than 5 minutes off",
                             Availability::NotMeasured,
                             "no synchronised local NTP status available",
+                        ),
+                        None => CheckResult::not_run(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            Availability::Unsupported,
+                            "the local NTP status is read only on Linux",
                         ),
                     },
                 ],
@@ -4105,6 +4113,29 @@ mod target_tests {
         let d = detect_one(t);
         assert_eq!(d.rule, "target.tls_failed");
         assert_eq!(d.causes[0].id, "clock_skew");
+    }
+
+    #[test]
+    fn an_unread_clock_offset_is_unsupported_off_linux() {
+        let mut t = healthy();
+        t.tls_stage = err(StageError::CertExpired);
+        t.http_stage = None;
+        t.context.clock_offset_secs = None;
+        let d = detect_one(t);
+        let check = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "clock_offset_large")
+            .expect("the clock cause is listed");
+        // Linux reads chrony and only misses a sample; the other platforms
+        // never read the local NTP status at all.
+        let expected = if cfg!(target_os = "linux") {
+            Availability::NotMeasured
+        } else {
+            Availability::Unsupported
+        };
+        assert_eq!(check.why_not, Some(expected));
     }
 
     #[test]
