@@ -2,7 +2,7 @@
 
 One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 
-- [ ] P01 diagnose/033-why-not (A01)
+- [x] P01 diagnose/033-why-not (A01)
 - [ ] P02 diagnose/033-corpus-and-guards (C01, C03, C04)
 - [ ] P03 diagnose/033-abstain-dns-tcp (A02, A03)
 - [ ] P04 diagnose/033-lab-driver (C05, C06)
