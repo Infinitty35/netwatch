@@ -227,7 +227,7 @@ pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
         rule: "tcp.retrans_burst",
         cause: "packet_loss",
-        checks: &["retransmits_observed"],
+        checks: &["retransmits_observed", "socket_rtt_below_queueing_line"],
     },
     CauseSpec {
         rule: "tcp.zero_window",

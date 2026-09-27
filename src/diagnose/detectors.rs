@@ -150,17 +150,18 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
     if s.rwnd == Some(0) {
         return SocketVerdict::ZeroWindow;
     }
-    let rtt = s.rtt_ms.unwrap_or(0.0);
-
     // Retransmits dominate: a socket losing segments is describing the path,
     // not its own queueing, and the retrans rule carries the better causes.
-    if s.retrans.is_some_and(|n| n >= 5) && rtt < t.socket_rtt_ms {
+    // The count is measured; with no rtt only the queueing exclusion is
+    // unknown, and the finding says so rather than reading the rtt as 0.
+    if s.retrans.is_some_and(|n| n >= 5) && s.rtt_ms.is_none_or(|r| r < t.socket_rtt_ms) {
         return SocketVerdict::RetransBurst;
     }
 
     // Bufferbloat: high rtt while *this* socket is the one sending. A high rtt
-    // on an idle socket is just a distant peer.
-    if rtt >= t.socket_rtt_ms && s.tx_bps > 0.0 {
+    // on an idle socket is just a distant peer, and a socket with no rtt is
+    // not a bloated one.
+    if s.rtt_ms.is_some_and(|r| r >= t.socket_rtt_ms) && s.tx_bps > 0.0 {
         return SocketVerdict::Bufferbloat;
     }
 
@@ -2482,7 +2483,6 @@ fn socket_detection(
         local: s.local.clone(),
         remote: s.remote.clone(),
     };
-    let rtt = s.rtt_ms.unwrap_or(0.0);
     let link_test_passed = match (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
         (Some(idle), Some(loaded)) => Some(loaded - idle < t.loaded_rtt_delta_ms),
         _ => None,
@@ -2490,6 +2490,9 @@ fn socket_detection(
 
     let mut d = match verdict {
         SocketVerdict::Bufferbloat => {
+            // The verdict needs a measured rtt; with none there is no finding,
+            // and never one quoting an rtt of 0.
+            let rtt = s.rtt_ms?;
             let mut d = Detection::new("tcp.bufferbloat_remote", subject);
             d.evidence
                 .push(Evidence::new("tcp.socket_rtt", rtt, "ms").with_window(30, 30));
@@ -2613,14 +2616,42 @@ fn socket_detection(
             d.causes = vec![Cause::new(
                 "packet_loss",
                 "packet loss between here and the peer",
-                vec![CheckResult::pass(
-                    "retransmits_observed",
-                    "retransmits observed",
-                    format!(
-                        "{} retransmits in the last minute on this socket",
-                        s.retrans?
+                vec![
+                    CheckResult::pass(
+                        "retransmits_observed",
+                        "retransmits observed",
+                        format!(
+                            "{} retransmits in the last minute on this socket",
+                            s.retrans?
+                        ),
                     ),
-                )],
+                    // What keeps a queue out of it: a bloated socket
+                    // retransmits too, once its ACKs queue past the RTO.
+                    match s.rtt_ms {
+                        Some(rtt) if rtt < t.socket_rtt_ms => CheckResult::pass(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, under the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        Some(rtt) => CheckResult::fail(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, over the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        None => CheckResult::not_run(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            Availability::NotMeasured,
+                            "no rtt for this socket, so a queue is not ruled out",
+                        ),
+                    },
+                ],
             )];
             d.remediation = vec![Step::instruct(
                 "trace the peer",
@@ -3352,6 +3383,72 @@ mod tests {
             "4 retransmits a minute is under the burst line: {:?}",
             rules_of(&found)
         );
+    }
+
+    #[test]
+    fn a_socket_without_rtt_is_never_bufferbloat() {
+        // Sending hard with nothing retransmitted, so only the rtt the
+        // verdict turns on is missing.
+        let s = SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(0),
+            ..bloated_socket()
+        };
+        let t = Thresholds::default();
+        assert_ne!(classify_socket(&s, &t), SocketVerdict::Bufferbloat);
+        let obs = Observations {
+            sockets: vec![s.clone()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &t);
+        assert!(
+            !rules_of(&found).contains(&"tcp.bufferbloat_remote"),
+            "{:?}",
+            rules_of(&found)
+        );
+        // Handed the verdict anyway, the detection refuses rather than
+        // quoting an rtt of 0.
+        assert!(socket_detection(&s, SocketVerdict::Bufferbloat, &obs, &t).is_none());
+    }
+
+    #[test]
+    fn retransmits_without_rtt_say_the_rtt_was_not_measured() {
+        use super::super::issue::Confidence;
+        let finding = |rtt_ms| {
+            let obs = Observations {
+                sockets: vec![SocketObs {
+                    rtt_ms,
+                    rttvar_ms: None,
+                    ..retransmitting_socket(12)
+                }],
+                ..Default::default()
+            };
+            let mut found = detect(&obs, &store(), &Thresholds::default());
+            assert_eq!(rules_of(&found), ["tcp.retrans_burst"]);
+            found.remove(0)
+        };
+        let check = |d: &Detection| {
+            d.causes[0]
+                .checks
+                .iter()
+                .find(|c| c.id == "socket_rtt_below_queueing_line")
+                .cloned()
+                .unwrap()
+        };
+
+        // The retransmit count is measured, so the rule still fires; only
+        // the check that rules a queue out is missing.
+        let d = finding(None);
+        let k = check(&d);
+        assert_eq!(k.passed, None);
+        assert_eq!(k.why_not, Some(Availability::NotMeasured));
+        assert_eq!(d.causes[0].confidence(), Confidence::Likely);
+        assert!(!d.evidence.iter().any(|e| e.metric == "tcp.socket_rtt"));
+
+        let d = finding(Some(20.0));
+        assert_eq!(check(&d).passed, Some(true));
+        assert_eq!(d.causes[0].confidence(), Confidence::Strong);
     }
 
     #[test]

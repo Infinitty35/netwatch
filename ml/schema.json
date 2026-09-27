@@ -424,6 +424,10 @@
     },
     {
       "group": "check",
+      "name": "check.tcp.retrans_burst.packet_loss.socket_rtt_below_queueing_line"
+    },
+    {
+      "group": "check",
       "name": "check.tcp.zero_window.peer_not_reading.rwnd_is_zero"
     },
     {
@@ -1311,7 +1315,7 @@
       "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "6fe968bd859660c8",
+  "hash": "e476c3f5ae717da6",
   "meta_columns": [
     "episode",
     "source",
