@@ -3413,6 +3413,28 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_rtt_is_not_read_as_0_under_a_0_ms_line() {
+        // Under the default 100ms line an rtt read as 0 lands on the right
+        // side of both tests by luck. A 0ms line takes the luck away: 0 >= 0
+        // made the sender bloated and kept the retransmitter out of its burst.
+        let t = Thresholds {
+            socket_rtt_ms: 0.0,
+            ..Thresholds::default()
+        };
+        let no_rtt = |retrans| SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(retrans),
+            ..bloated_socket()
+        };
+        assert_ne!(classify_socket(&no_rtt(0), &t), SocketVerdict::Bufferbloat);
+        assert_eq!(
+            classify_socket(&no_rtt(12), &t),
+            SocketVerdict::RetransBurst
+        );
+    }
+
+    #[test]
     fn retransmits_without_rtt_say_the_rtt_was_not_measured() {
         use super::super::issue::Confidence;
         let finding = |rtt_ms| {
@@ -4434,6 +4456,7 @@ mod tests {
                 },
                 vec![
                     Expect::Fires("tcp.retrans_burst"),
+                    Expect::NotRun("socket_rtt_below_queueing_line"),
                     Expect::NoRule("tcp.bufferbloat_remote"),
                     Expect::NoEvidence("tcp.socket_rtt", 0.0),
                 ],
