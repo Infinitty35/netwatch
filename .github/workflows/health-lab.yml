@@ -1,0 +1,98 @@
+name: Health lab
+
+# The Diagnose health lab (tests/diagnose/health_lab.py) runs the real
+# App::tick (examples/diagnose_lab) against a peer namespace that owns 1.1.1.1
+# and a bind-mounted resolv.conf, stages faults on purpose and asserts what the
+# engine opens and closes, and when. Decision D6 scopes it: --quick on pull
+# requests that touch Diagnose, the health prober or the lab itself, and the
+# long negatives once a week. Pushes to main run --quick as well, so the commit
+# a release is tagged on has a result of its own.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/diagnose/**'
+      - 'src/collectors/health.rs'
+      - 'tests/diagnose/**'
+      - 'examples/diagnose_lab.rs'
+      - '.github/workflows/health-lab.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/diagnose/**'
+      - 'src/collectors/health.rs'
+      - 'tests/diagnose/**'
+      - 'examples/diagnose_lab.rs'
+      - '.github/workflows/health-lab.yml'
+  schedule:
+    - cron: '30 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      set:
+        description: 'quick, or the long negatives'
+        type: choice
+        options: [quick, long]
+        default: quick
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  diagnose-health-lab:
+    runs-on: ubuntu-latest
+    # A hung App::tick would otherwise hold the runner for GitHub's six-hour
+    # default; the lab's own deadlines should fire long before this.
+    timeout-minutes: 45
+    env:
+      SET: ${{ (github.event_name == 'schedule' || inputs.set == 'long') && 'long' || 'quick' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libpcap and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev iproute2 util-linux
+
+      # The faults are netem qdiscs, and the ICMP-only one sits under prio
+      # with a u32 filter. Loaded here rather than left to autoloading from
+      # inside a user namespace, and the runner's cloud kernel may ship netem
+      # only in its -extra package.
+      - name: Load the qdiscs the faults use
+        run: |
+          sudo modprobe -a sch_netem sch_prio cls_u32 || {
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a sch_netem sch_prio cls_u32
+          }
+
+      # Needs no namespace, so it runs before the check below and reports on
+      # its own when a runner refuses one.
+      - name: Build the examples
+        run: cargo build --examples
+
+      # Answers one question before the lab relies on it: will this runner
+      # give an unprivileged user a user, network and mount namespace in which
+      # sysfs can be remounted and a netem qdisc added? It fails rather than
+      # skips, so a refusal cannot pass as a lab that ran.
+      - name: Check the runner allows the lab's namespaces
+        shell: bash
+        run: |
+          unshare --user --map-root-user --net --mount sh -c \
+            'mount -t sysfs sysfs /sys && ls /sys/class/net &&
+             ip link add d0 type veth peer name d1 && tc qdisc add dev d0 root netem delay 1ms'
+
+      # Each scenario runs in its own namespaces, all at once, and the lab
+      # exits non-zero on any failed assertion.
+      - name: Run the health lab
+        run: python3 tests/diagnose/health_lab.py --$SET --out health-lab.json --artifacts health-lab
+
+      - name: Keep the results and the recorded episodes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-health-lab-${{ env.SET }}
+          path: |
+            health-lab.json
+            health-lab/
+          if-no-files-found: warn
