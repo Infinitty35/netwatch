@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.32.5] - 2026-09-27
 
 ### Fixed
 - A metrics test that failed on macOS. macOS answers `setsockopt` with
