@@ -113,7 +113,7 @@ fn healthy_iface() -> IfaceObs {
         rx_dropped: 0,
         tx_dropped: 0,
         errors_per_min: 0,
-        drops_per_min: 0,
+        drops_per_min: Some(0),
         link_rate_bps: Some(1e9),
         wireless: Some(false),
         signal_dbm: None,

@@ -457,7 +457,7 @@ impl LiveSampler {
             tx_dropped: t.tx_drops,
             counter_window_secs,
             errors_per_min,
-            drops_per_min,
+            drops_per_min: crate::platform::IFACE_DROPS_COUNTED.then_some(drops_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
@@ -902,6 +902,18 @@ mod tests {
         // that unknown.
         let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now());
         assert_eq!((obs.carrier, obs.wireless), (Some(true), None));
+    }
+
+    /// Where the platform counts no drops (macOS), the recording says so
+    /// with a null rather than a 0.
+    #[test]
+    fn the_sampler_records_no_drop_rate_where_drops_are_not_counted() {
+        let mut sampler = LiveSampler::new();
+        let obs = sampler.iface_obs(&traffic("nwtest0", 0, None), None, Instant::now());
+        let counted = crate::platform::IFACE_DROPS_COUNTED;
+        assert_eq!(obs.drops_per_min.is_some(), counted);
+        let json = serde_json::to_value(&obs).unwrap();
+        assert_eq!(json["drops_per_min"].is_null(), !counted);
     }
 
     #[test]

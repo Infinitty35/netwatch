@@ -237,7 +237,9 @@ pub struct IfaceObs {
     /// counter. A NIC that logged 40 errors during boot last month is not a
     /// live fault, and a per-tick delta reported as "/min" is off by 60.
     pub errors_per_min: u64,
-    pub drops_per_min: u64,
+    /// `None` where the platform does not count drops (macOS), which is not
+    /// the same as none dropped.
+    pub drops_per_min: Option<u64>,
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
@@ -253,6 +255,14 @@ pub struct IfaceObs {
 }
 
 impl IfaceObs {
+    /// Errors plus drops a minute, where drops are counted, and errors alone
+    /// where they are not. `iface.errors` opens and verifies on this one
+    /// statistic.
+    pub fn error_rate(&self) -> u64 {
+        self.drops_per_min
+            .map_or(self.errors_per_min, |d| self.errors_per_min + d)
+    }
+
     pub fn utilisation_pct(&self) -> Option<f64> {
         let rate = self.link_rate_bps?;
         if rate <= 0.0 {
@@ -1210,9 +1220,13 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         return out;
     }
 
-    if iface.errors_per_min as f64 >= t.iface_error_floor
-        || iface.drops_per_min as f64 >= t.iface_drop_floor
-    {
+    // Where drops are not counted the rule stands on errors alone, and
+    // neither cause can weigh one against the other.
+    let errors = iface.errors_per_min;
+    let drops_over_floor = iface
+        .drops_per_min
+        .is_some_and(|d| d as f64 >= t.iface_drop_floor);
+    if errors as f64 >= t.iface_error_floor || drops_over_floor {
         let mut d = Detection::new(
             "iface.errors",
             Subject::Iface {
@@ -1220,52 +1234,51 @@ fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
             },
         );
         d.evidence.push(
-            Evidence::new(
-                "iface.error_rate",
-                (iface.errors_per_min + iface.drops_per_min) as f64,
-                "/min",
-            )
-            .with_window(60, 1),
+            Evidence::new("iface.error_rate", iface.error_rate() as f64, "/min").with_window(60, 1),
         );
         d.causes = vec![
             Cause::new(
                 "ring_buffer_small",
                 "ring buffer too small for the offered rate",
-                vec![if iface.drops_per_min > iface.errors_per_min {
-                    CheckResult::pass(
+                vec![match iface.drops_per_min {
+                    Some(drops) if drops > errors => CheckResult::pass(
                         "drops_dominate",
                         "drops dominate",
-                        format!(
-                            "{} drops vs {} errors",
-                            iface.drops_per_min, iface.errors_per_min
-                        ),
-                    )
-                } else {
-                    CheckResult::fail(
+                        format!("{drops} drops vs {errors} errors"),
+                    ),
+                    Some(drops) => CheckResult::fail(
                         "drops_dominate",
                         "drops dominate",
-                        format!(
-                            "{} drops vs {} errors",
-                            iface.drops_per_min, iface.errors_per_min
-                        ),
-                    )
+                        format!("{drops} drops vs {errors} errors"),
+                    ),
+                    None => CheckResult::not_run(
+                        "drops_dominate",
+                        "drops dominate",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS",
+                    ),
                 }],
             ),
             Cause::new(
                 "bad_cable_or_duplex",
                 "bad cable or duplex mismatch",
-                vec![if iface.errors_per_min > iface.drops_per_min {
-                    CheckResult::pass(
+                vec![match iface.drops_per_min {
+                    Some(drops) if errors > drops => CheckResult::pass(
                         "errors_dominate",
                         "errors dominate",
-                        format!("{} errors this window", iface.errors_per_min),
-                    )
-                } else {
-                    CheckResult::fail(
+                        format!("{errors} errors this window"),
+                    ),
+                    Some(_) => CheckResult::fail(
                         "errors_dominate",
                         "errors dominate",
-                        format!("only {} errors this window", iface.errors_per_min),
-                    )
+                        format!("only {errors} errors this window"),
+                    ),
+                    None => CheckResult::not_run(
+                        "errors_dominate",
+                        "errors dominate",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS, so errors have nothing to outweigh",
+                    ),
                 }],
             ),
         ];
@@ -2015,18 +2028,24 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 // The same floor iface.errors uses: a wireless NIC drops
                 // multicast and management frames as a matter of course.
                 match obs.iface.as_ref().map(|i| i.drops_per_min) {
-                    Some(d) if d as f64 >= t.iface_drop_floor => CheckResult::pass(
+                    Some(Some(d)) if d as f64 >= t.iface_drop_floor => CheckResult::pass(
                         "interface_drops",
                         "interface drops",
                         format!("{d} drops a minute"),
                     ),
-                    Some(d) => CheckResult::fail(
+                    Some(Some(d)) => CheckResult::fail(
                         "interface_drops",
                         "interface drops",
                         format!(
                             "{d} drops a minute, under the {:.0}/min floor",
                             t.iface_drop_floor
                         ),
+                    ),
+                    Some(None) => CheckResult::not_run(
+                        "interface_drops",
+                        "interface drops",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS",
                     ),
                     None => CheckResult::not_run(
                         "interface_drops",
@@ -2979,7 +2998,7 @@ mod tests {
             rx_dropped: 0,
             tx_dropped: 0,
             errors_per_min: 0,
-            drops_per_min: 0,
+            drops_per_min: Some(0),
             link_rate_bps: None,
             wireless: Some(wireless),
             signal_dbm: signal,
@@ -3101,7 +3120,7 @@ mod tests {
                 name: "wlan0".into(),
                 wireless: Some(true),
                 link_rate_bps: None,
-                drops_per_min,
+                drops_per_min: Some(drops_per_min),
                 ..eth0()
             }),
             ..obs_with_dns(DnsObs {
@@ -3171,6 +3190,19 @@ mod tests {
     fn local_udp_check(alt_rtt_ms: Option<f64>, drops_per_min: u64, id: &str) -> CheckResult {
         let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(alt_rtt_ms, drops_per_min));
         local.checks.into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn interface_drops_is_unsupported_without_drop_counters() {
+        let mut obs = laptop_with_a_slow_resolver(None, 0);
+        obs.iface.as_mut().unwrap().drops_per_min = None;
+        let (local, _) = local_udp_path(&obs);
+        let c = local
+            .checks
+            .iter()
+            .find(|c| c.id == "interface_drops")
+            .unwrap();
+        assert_eq!(c.why_not, Some(Availability::Unsupported));
     }
 
     #[test]
@@ -4068,7 +4100,7 @@ mod tests {
                 rx_dropped: 0,
                 tx_dropped: 0,
                 errors_per_min: 40,
-                drops_per_min: 12,
+                drops_per_min: Some(12),
                 link_rate_bps: Some(1e9),
                 wireless: Some(false),
                 signal_dbm: None,
@@ -4116,7 +4148,7 @@ mod tests {
             rx_dropped: 0,
             tx_dropped: 0,
             errors_per_min: 0,
-            drops_per_min: 0,
+            drops_per_min: Some(0),
             link_rate_bps: Some(1e9),
             wireless: Some(false),
             signal_dbm: None,
@@ -4150,7 +4182,7 @@ mod tests {
     #[test]
     fn iface_errors_fires_at_the_drop_floor() {
         let found = link_rules(IfaceObs {
-            drops_per_min: 60,
+            drops_per_min: Some(60),
             ..eth0()
         });
         assert_eq!(found, ["iface.errors"]);
@@ -4162,10 +4194,82 @@ mod tests {
         // and management frames as a matter of course.
         let found = link_rules(IfaceObs {
             errors_per_min: 0,
-            drops_per_min: 59,
+            drops_per_min: Some(59),
             ..eth0()
         });
         assert!(!found.contains(&"iface.errors"), "{found:?}");
+    }
+
+    /// A link on a platform that counts no drops (macOS), with this many
+    /// errors a minute.
+    fn uncounted_drops(errors_per_min: u64) -> IfaceObs {
+        IfaceObs {
+            errors_per_min,
+            drops_per_min: None,
+            ..eth0()
+        }
+    }
+
+    fn iface_errors(iface: IfaceObs) -> Detection {
+        let obs = Observations {
+            iface: Some(iface),
+            ..Default::default()
+        };
+        detect(&obs, &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "iface.errors")
+            .expect("iface.errors fires")
+    }
+
+    /// Without drop counters iface.errors fires on errors alone, and the
+    /// rate it opens on is the one its verify reads: errors plus drops where
+    /// drops are counted, errors alone where they are not.
+    #[test]
+    fn without_drop_counters_iface_errors_judges_errors_only() {
+        assert!(link_rules(uncounted_drops(0)).is_empty());
+        let d = iface_errors(uncounted_drops(3));
+        assert_eq!(d.evidence[0].metric, "iface.error_rate");
+        assert_eq!(d.evidence[0].value, 3.0);
+        assert_eq!(uncounted_drops(3).error_rate(), 3);
+        let counted = IfaceObs {
+            drops_per_min: Some(5),
+            ..uncounted_drops(3)
+        };
+        assert_eq!(counted.error_rate(), 8);
+
+        let obs = Observations {
+            iface: Some(uncounted_drops(3)),
+            ..Default::default()
+        };
+        let coverage = crate::diagnose::coverage::Coverage::from_observations(&obs, &store());
+        let row = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "iface.errors")
+            .unwrap();
+        assert_eq!(row.status, Availability::Available);
+        assert!(
+            row.reason.contains("drops not counted on macOS"),
+            "{}",
+            row.reason
+        );
+    }
+
+    /// Both causes weigh drops against errors, so neither can be judged
+    /// without drops. The ring buffer cause has no other check.
+    #[test]
+    fn ring_buffer_cause_is_not_run_without_drop_counters() {
+        let d = iface_errors(uncounted_drops(3));
+        let cause = |id| d.causes.iter().find(|c| c.id == id).unwrap();
+        let ring = cause("ring_buffer_small");
+        assert_eq!(ring.confidence(), super::super::issue::Confidence::Untested);
+        for c in ring
+            .checks
+            .iter()
+            .chain(&cause("bad_cable_or_duplex").checks)
+        {
+            assert_eq!(c.why_not, Some(Availability::Unsupported), "{}", c.id);
+        }
     }
 
     #[test]
@@ -4343,7 +4447,7 @@ mod tests {
                 rx_dropped: 0,
                 tx_dropped: 0,
                 errors_per_min: 0,
-                drops_per_min: 0,
+                drops_per_min: Some(0),
                 link_rate_bps: None,
                 rx_bps: 0.0,
                 tx_bps: 0.0,
@@ -4565,6 +4669,25 @@ mod tests {
                 },
                 vec![Expect::NoRule("link.down"), Expect::Fires("iface.errors")],
             ),
+            // Errors fire iface.errors and the slow resolver brings in
+            // local_udp_path: every reader of the drop count.
+            AbsenceRow {
+                input: "IfaceObs.drops_per_min",
+                obs: Observations {
+                    iface: Some(IfaceObs {
+                        drops_per_min: None,
+                        errors_per_min: 40,
+                        ..eth0()
+                    }),
+                    ..obs_with_dns(slow_dns())
+                },
+                base: dns_base.clone(),
+                expect: vec![
+                    Expect::NotRun("interface_drops"),
+                    Expect::NotRun("drops_dominate"),
+                    Expect::NotRun("errors_dominate"),
+                ],
+            },
             row(
                 "GatewayObs.arp_ok",
                 Observations {
@@ -4648,9 +4771,8 @@ mod tests {
     /// this is a behaviour table: each row leaves one input unmeasured and
     /// names what must then be not run, or must not happen.
     ///
-    /// The `drops_per_min` row joins with A06, which gives it something to
-    /// be absent in. Two rows are about the sampler rather than a detector,
-    /// so they live in `live.rs`: the idle radio
+    /// Two rows are about the sampler rather than a detector, so they live
+    /// in `live.rs`: the idle radio
     /// (`the_sampler_gives_an_idle_radio_no_retry_share`) and missing
     /// interface info (`the_sampler_reads_missing_interface_info_as_unknown`).
     #[test]

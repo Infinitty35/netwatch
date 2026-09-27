@@ -1314,10 +1314,7 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         if let Some(up) = iface.carrier {
             m.insert("iface.carrier".to_string(), if up { 1.0 } else { 0.0 });
         }
-        m.insert(
-            "iface.error_rate".to_string(),
-            (iface.errors_per_min + iface.drops_per_min) as f64,
-        );
+        m.insert("iface.error_rate".to_string(), iface.error_rate() as f64);
         if let Some(u) = iface.utilisation_pct() {
             m.insert("iface.utilisation".to_string(), u);
         }

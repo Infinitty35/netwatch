@@ -180,6 +180,7 @@ impl Coverage {
                 "egress.drift" | "egress.policy_violation" => obs.egress.as_ref().map(|o| o.coverage(rule.id)).unwrap_or((NotMeasured, "no fresh egress observation")),
                 "iface.errors" if obs.iface.as_ref().and_then(|i| i.counter_window_secs).is_some_and(|s| s < 60.0) => (Learning, "collecting a full elapsed minute of interface counter changes"),
                 "link.down" if obs.iface.as_ref().is_some_and(|i| i.carrier.is_none()) => (NotMeasured, "no interface info, so carrier state is unknown"),
+                "iface.errors" if obs.iface.as_ref().is_some_and(|i| i.drops_per_min.is_none()) => (Available, "interface errors present; drops not counted on macOS"),
                 "link.down" | "iface.errors" => present(obs.iface.is_some(), "interface counters not measured"),
                 "iface.saturated" => present(obs.iface.as_ref().and_then(|i| i.utilisation_pct()).is_some(), "link rate or interface counters missing"),
                 "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| i.wireless == Some(false)) => (NotApplicable, "selected interface is not wireless"),
