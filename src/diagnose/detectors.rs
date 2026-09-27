@@ -3101,6 +3101,44 @@ mod tests {
         assert_eq!(detect(&obs, &store(), &Thresholds::default()).len(), 1);
     }
 
+    /// A socket losing segments on an ordinary path: rtt well under the
+    /// queueing line, so only the retransmit count can classify it.
+    fn retransmitting_socket(retrans: u32) -> SocketObs {
+        SocketObs {
+            rtt_ms: Some(20.0),
+            rttvar_ms: Some(4.0),
+            retrans: Some(retrans),
+            ..bloated_socket()
+        }
+    }
+
+    #[test]
+    fn retrans_burst_fires_at_five_a_minute() {
+        let obs = Observations {
+            sockets: vec![retransmitting_socket(5)],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert_eq!(rules_of(&found), ["tcp.retrans_burst"]);
+        let d = &found[0];
+        assert_eq!(d.evidence[0].metric, "tcp.retrans_rate");
+        assert_eq!(d.evidence[0].value, 5.0);
+    }
+
+    #[test]
+    fn retrans_burst_is_quiet_below_five() {
+        let obs = Observations {
+            sockets: vec![retransmitting_socket(4)],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert!(
+            !rules_of(&found).contains(&"tcp.retrans_burst"),
+            "4 retransmits a minute is under the burst line: {:?}",
+            rules_of(&found)
+        );
+    }
+
     #[test]
     fn retransmits_do_not_let_path_loss_tie_with_the_queue() {
         // 12 retransmits are consistent with both causes, so they must not
@@ -3622,6 +3660,87 @@ mod tests {
         let found = detect(&obs, &store(), &Thresholds::default());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rule, "link.down");
+    }
+
+    /// A healthy wired gigabit interface with nothing on its counters.
+    fn eth0() -> IfaceObs {
+        IfaceObs {
+            counter_window_secs: Some(60.0),
+            name: "eth0".into(),
+            carrier: true,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_dropped: 0,
+            tx_dropped: 0,
+            errors_per_min: 0,
+            drops_per_min: 0,
+            link_rate_bps: Some(1e9),
+            wireless: false,
+            signal_dbm: None,
+            tx_retry_pct: None,
+            rx_bps: 3.1e6,
+            tx_bps: 2.6e6,
+        }
+    }
+
+    fn link_rules(iface: IfaceObs) -> Vec<&'static str> {
+        let obs = Observations {
+            iface: Some(iface),
+            ..Default::default()
+        };
+        detect(&obs, &store(), &Thresholds::default())
+            .iter()
+            .map(|d| d.rule)
+            .collect()
+    }
+
+    #[test]
+    fn iface_errors_fires_at_the_error_floor() {
+        // One error a minute: errors are rare and always mean something.
+        let found = link_rules(IfaceObs {
+            errors_per_min: 1,
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.errors"]);
+    }
+
+    #[test]
+    fn iface_errors_fires_at_the_drop_floor() {
+        let found = link_rules(IfaceObs {
+            drops_per_min: 60,
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.errors"]);
+    }
+
+    #[test]
+    fn iface_errors_is_quiet_below_both_floors() {
+        // No errors, and 59 drops a minute: a wireless NIC drops multicast
+        // and management frames as a matter of course.
+        let found = link_rules(IfaceObs {
+            errors_per_min: 0,
+            drops_per_min: 59,
+            ..eth0()
+        });
+        assert!(!found.contains(&"iface.errors"), "{found:?}");
+    }
+
+    #[test]
+    fn iface_saturated_fires_at_ninety_percent() {
+        let found = link_rules(IfaceObs {
+            rx_bps: 9e8,
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.saturated"]);
+    }
+
+    #[test]
+    fn iface_saturated_is_quiet_at_eighty_nine() {
+        let found = link_rules(IfaceObs {
+            rx_bps: 8.9e8,
+            ..eth0()
+        });
+        assert!(!found.contains(&"iface.saturated"), "{found:?}");
     }
 
     #[test]
