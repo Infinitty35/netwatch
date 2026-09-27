@@ -4254,10 +4254,10 @@ mod tests {
             .find(|r| r.rule == "iface.errors")
             .unwrap();
         assert_eq!(row.status, Availability::Available);
-        assert!(
-            row.reason.contains("drops not counted on macOS"),
-            "{}",
-            row.reason
+        // A coverage row says what was measured, not what was found.
+        assert_eq!(
+            row.reason,
+            "interface error counters present; drops not counted on macOS"
         );
     }
 
