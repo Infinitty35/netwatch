@@ -132,17 +132,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Answers one question before anything is built on it: will this runner
-      # give an unprivileged user a user, network and mount namespace in which
-      # sysfs can be remounted? It fails rather than skips, so a refusal
-      # cannot pass as a lab that ran.
-      - name: Check the runner allows user, network and mount namespaces
-        shell: bash
-        run: |
-          unshare --user --map-root-user --net --mount \
-            sh -c 'mount -t sysfs sysfs /sys && ls /sys/class/net'
-
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -151,8 +140,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpcap-dev iproute2 util-linux
 
+      # Needs no namespace, so it runs before the check below and reports on
+      # its own when a runner refuses one.
       - name: Build the examples
         run: cargo build --examples
+
+      # Answers one question before the lab relies on it: will this runner
+      # give an unprivileged user a user, network and mount namespace in which
+      # sysfs can be remounted? It fails rather than skips, so a refusal
+      # cannot pass as a lab that ran.
+      - name: Check the runner allows user, network and mount namespaces
+        shell: bash
+        run: |
+          unshare --user --map-root-user --net --mount \
+            sh -c 'mount -t sysfs sysfs /sys && ls /sys/class/net'
 
       # `shell: bash` runs with pipefail. Without it a pipeline reports tee's
       # status, and a lab that never started would pass.
