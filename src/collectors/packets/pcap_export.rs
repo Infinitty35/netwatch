@@ -6,8 +6,8 @@ use super::CapturedPacket;
 pub fn export_pcap(packets: &[CapturedPacket], path: &str) -> Result<usize, String> {
     use std::io::Write;
 
-    let mut file =
-        std::fs::File::create(path).map_err(|e| format!("Failed to create {path}: {e}"))?;
+    let mut file = crate::owner_only::create(std::path::Path::new(path))
+        .map_err(|e| format!("Failed to create {path}: {e}"))?;
 
     // Global header: magic, version 2.4, thiszone=0, sigfigs=0, snaplen=65535, network=1 (Ethernet)
     let global_header: [u8; 24] = [
@@ -84,5 +84,17 @@ mod tests {
     #[test]
     fn test_pcap_timestamp_invalid() {
         assert_eq!(parse_timestamp_for_pcap("garbage"), (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("nw-pcap-mode-{}.pcap", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(export_pcap(&[], &path.to_string_lossy()), Ok(0));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

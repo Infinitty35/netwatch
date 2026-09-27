@@ -7,7 +7,7 @@ use super::traffic::InterfaceTraffic;
 use chrono::{DateTime, Duration, Local, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_WINDOW_SECS: i64 = 300;
@@ -247,7 +247,7 @@ impl IncidentRecorder {
             .format("%Y%m%d_%H%M%S")
             .to_string();
         let dir = base_dir.join(format!("netwatch_incident_{stamp}"));
-        fs::create_dir_all(&dir)
+        crate::owner_only::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create incident directory {}: {e}", dir.display()))?;
 
         let manifest = IncidentManifest {
@@ -288,7 +288,8 @@ impl IncidentRecorder {
             &dir.join("alerts.json"),
             &snapshot_values(&self.alert_events),
         )?;
-        fs::write(dir.join("summary.md"), self.build_summary())
+        crate::owner_only::create(&dir.join("summary.md"))
+            .and_then(|mut file| file.write_all(self.build_summary().as_bytes()))
             .map_err(|e| format!("Failed to write summary.md: {e}"))?;
 
         if !self.packets.is_empty() {
@@ -660,8 +661,8 @@ fn alert_severity_label(alert: &Alert) -> String {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let file =
-        fs::File::create(path).map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
+    let file = crate::owner_only::create(path)
+        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
     serde_json::to_writer_pretty(file, value)
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
@@ -670,6 +671,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::fs;
 
     fn make_packet(id: u64, protocol: &str, expert: ExpertSeverity) -> CapturedPacket {
         CapturedPacket {
@@ -883,6 +885,19 @@ mod tests {
         let summary = fs::read_to_string(bundle.join("summary.md")).unwrap();
         assert!(summary.contains("NetWatch Incident Bundle"));
         assert!(summary.contains("manual freeze"));
+
+        // Addresses, hostnames and packet bytes: only the owner may open
+        // them, whether or not the sandbox ran.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&bundle), 0o700);
+            for entry in fs::read_dir(&bundle).unwrap() {
+                let path = entry.unwrap().path();
+                assert_eq!(mode(&path), 0o600, "{}", path.display());
+            }
+        }
 
         let _ = fs::remove_dir_all(&root);
     }

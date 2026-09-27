@@ -38,6 +38,12 @@ All notable changes to NetWatch will be documented in this file.
   5 s per request, serves 16 clients at once, and warns at startup when it is
   reachable from the network. Remote, geo and whois requests now time out
   when a server stops answering.
+- Less of what netwatch saves can be read by other users. Pcaps and incident
+  bundles were written 0644, and without the sandbox the exports directory
+  was 0755 too, so anyone on the machine could read the packet bytes,
+  addresses and process names in them. The directory is now 0700 and those
+  files 0600 with or without the sandbox, and an exports directory an earlier
+  run left open is narrowed.
 
 ## [0.32.3] - 2026-09-20
 

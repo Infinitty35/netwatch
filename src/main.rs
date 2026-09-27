@@ -85,7 +85,8 @@ fn main() -> Result<()> {
     if !matches!(sandbox_mode, netwatch::sandbox::Mode::Disabled) {
         sandbox_paths.prepare()?;
     } else if let Some(exports) = &sandbox_paths.cwd {
-        std::fs::create_dir_all(exports)?;
+        // `prepare` makes it 0700 with the sandbox on; this does without it.
+        netwatch::owner_only::create_dir_all(exports)?;
     }
     netwatch::sandbox::worker::install(sandbox_mode, sandbox_paths).map_err(anyhow::Error::msg)?;
     let _worker_session = netwatch::sandbox::worker::SessionGuard;
