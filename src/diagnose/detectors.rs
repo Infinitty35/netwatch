@@ -1123,11 +1123,18 @@ fn ids_are_valid(d: &Detection) -> Result<(), String> {
 
 /// A check that did not run names an [`Availability`] and one that ran does
 /// not. Checked beside the ids on every `detect` in debug builds, so every
-/// detector test also checks the reasons its branches give.
+/// detector test also checks the reasons its branches give. `Available` would
+/// print "ready" on a check that did not run, and `Unknown` is only for
+/// records made before `why_not`, so a detector may give neither.
 fn not_run_checks_say_why(d: &Detection) -> Result<(), String> {
     for c in &d.causes {
         for k in &c.checks {
-            if k.passed.is_none() != k.why_not.is_some() {
+            if k.passed.is_none() != k.why_not.is_some()
+                || matches!(
+                    k.why_not,
+                    Some(Availability::Available | Availability::Unknown)
+                )
+            {
                 return Err(format!(
                     "{}/{}: passed {:?} with why_not {:?}",
                     c.key(d.rule),
@@ -3893,6 +3900,14 @@ mod tests {
                     for k in &c.checks {
                         let key = format!("{}/{}", c.key(d.rule), k.id);
                         assert_eq!(k.passed.is_none(), k.why_not.is_some(), "{key}");
+                        assert!(
+                            !matches!(
+                                k.why_not,
+                                Some(Availability::Available | Availability::Unknown)
+                            ),
+                            "{key}: {:?} is not a reason a check did not run",
+                            k.why_not
+                        );
                         assert_eq!(
                             k.state() == CheckState::NotRun,
                             k.why_not.is_some(),
@@ -3904,6 +3919,32 @@ mod tests {
             }
         }
         assert!(not_run >= 10, "only {not_run} checks did not run");
+    }
+
+    #[test]
+    fn a_not_run_check_cannot_claim_to_be_ready_or_unknown() {
+        let with = |why_not| {
+            let mut d = Detection::new(
+                "dns.slow_resolver",
+                Subject::Resolver {
+                    addr: "127.0.0.53".into(),
+                },
+            );
+            d.causes = vec![Cause::new(
+                "resolver_overloaded",
+                "the resolver is overloaded",
+                vec![CheckResult::not_run(
+                    "icmp_rtt_raised",
+                    "icmp rtt raised",
+                    why_not,
+                    "no icmp probe",
+                )],
+            )];
+            not_run_checks_say_why(&d)
+        };
+        assert!(with(Availability::NotImplemented).is_ok());
+        assert!(with(Availability::Available).is_err());
+        assert!(with(Availability::Unknown).is_err());
     }
 
     #[test]
