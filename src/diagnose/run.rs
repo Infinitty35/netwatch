@@ -6,7 +6,7 @@
 //! and *not enough evidence*: a run that could not gather what it needed must
 //! never be read as a healthy host, which is why those are different exits.
 
-use crate::diagnose::issue::Issue;
+use crate::diagnose::issue::{Availability, CheckResult, Issue};
 use std::time::{Duration, Instant};
 
 /// What a run concluded, and the exit status it reports.
@@ -256,7 +256,7 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
                     cause.checks_label()
                 );
                 if let Some(missing) = cause.missing_discriminator() {
-                    println!("    not measured: {} — {}", missing.name, missing.detail);
+                    println!("    {}", missing_line(missing));
                 }
             }
         }
@@ -265,6 +265,17 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         }
     }
     Ok(outcome)
+}
+
+/// The check a qualified cause is still missing, led by why it did not run
+/// in the words the Diagnose tab uses, so the text agrees with the JSON's
+/// `why_not`.
+fn missing_line(missing: &CheckResult) -> String {
+    let why = missing
+        .why_not
+        .as_ref()
+        .map_or("not measured", Availability::label);
+    format!("{why}: {} — {}", missing.name, missing.detail)
 }
 
 #[cfg(test)]
@@ -297,6 +308,30 @@ mod tests {
         assert_eq!(outcome(&[&issue], true), Outcome::Finding);
         assert_eq!(outcome(&[&issue], false), Outcome::Finding);
         assert_eq!(Outcome::Finding as i32, 1);
+    }
+
+    #[test]
+    fn the_missing_check_line_gives_the_reason_the_json_gives() {
+        let awaiting = CheckResult::not_run(
+            "link_level_bufferbloat_test_passed",
+            "link-level bufferbloat test passed",
+            Availability::AwaitingTest,
+            "no loaded-rtt test has run",
+        );
+        assert_eq!(
+            missing_line(&awaiting),
+            "awaiting test: link-level bufferbloat test passed — no loaded-rtt test has run"
+        );
+        let never_built = CheckResult::not_run(
+            "icmp_rtt_raised",
+            "icmp rtt raised",
+            Availability::NotImplemented,
+            "no icmp probe",
+        );
+        assert_eq!(
+            missing_line(&never_built),
+            "not implemented: icmp rtt raised — no icmp probe"
+        );
     }
 
     #[test]

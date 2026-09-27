@@ -360,9 +360,18 @@ impl Report {
                     ));
                 }
                 (_, _, Some(missing)) => {
+                    // Why it is missing, in the words of its `why_not`: a
+                    // test nobody has run is not a probe that failed to report.
+                    let why = missing
+                        .why_not
+                        .as_ref()
+                        .map_or("not measured", super::issue::Availability::label);
                     m.push_str(&format!(
-                        "Not measured: {} — {}.\n\n",
-                        missing.name, missing.detail
+                        "{}{}: {} — {}.\n\n",
+                        why[..1].to_uppercase(),
+                        &why[1..],
+                        missing.name,
+                        missing.detail
                     ));
                 }
                 _ => {}
@@ -796,8 +805,12 @@ mod tests {
         )];
         let md = report.to_markdown();
         assert!(
-            md.contains("Not measured: link-level bufferbloat test passed"),
+            md.contains("Awaiting test: link-level bufferbloat test passed"),
             "{md}"
+        );
+        assert!(
+            !md.contains("Not measured:"),
+            "a test nobody has run is not a measurement that failed: {md}"
         );
         assert!(
             !md.contains("Sufficient evidence: link-level bufferbloat test passed"),
