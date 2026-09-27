@@ -404,19 +404,21 @@ impl LiveSampler {
             .iter()
             .find(|i| i.name == app.capture_interface)?;
         let info = app.interface_info.iter().find(|i| i.name == t.name);
-        let observed = self.iface_obs(t, info, completed);
+        let observed = self.iface_obs(t, info, completed, crate::platform::IFACE_DROPS_COUNTED);
         self.interface_sample = Some((completed, observed.clone()));
         Some(observed)
     }
 
     /// One interface's observation from its counters and whatever the
     /// platform said about it, with the per-minute windows moved on to
-    /// `completed`.
+    /// `completed`. `drops_counted` is [`crate::platform::IFACE_DROPS_COUNTED`]
+    /// in the app, and a parameter so tests can run the macOS case anywhere.
     fn iface_obs(
         &mut self,
         t: &InterfaceTraffic,
         info: Option<&InterfaceInfo>,
         completed: Instant,
+        drops_counted: bool,
     ) -> IfaceObs {
         let errors = t.rx_errors + t.tx_errors;
         let drops = t.rx_drops + t.tx_drops;
@@ -457,7 +459,7 @@ impl LiveSampler {
             tx_dropped: t.tx_drops,
             counter_window_secs,
             errors_per_min,
-            drops_per_min: crate::platform::IFACE_DROPS_COUNTED.then_some(drops_per_min),
+            drops_per_min: drops_counted.then_some(drops_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
@@ -896,24 +898,25 @@ mod tests {
     fn the_sampler_reads_missing_interface_info_as_unknown() {
         let mut sampler = LiveSampler::new();
         let t = traffic("nwtest0", 0, None);
-        let obs = sampler.iface_obs(&t, None, Instant::now());
+        let obs = sampler.iface_obs(&t, None, Instant::now(), true);
         assert_eq!((obs.carrier, obs.wireless), (None, None));
         // Info that does not say whether the link is a radio leaves only
         // that unknown.
-        let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now());
+        let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now(), true);
         assert_eq!((obs.carrier, obs.wireless), (Some(true), None));
     }
 
     /// Where the platform counts no drops (macOS), the recording says so
-    /// with a null rather than a 0.
+    /// with a null rather than a 0. Both cases run on every platform.
     #[test]
     fn the_sampler_records_no_drop_rate_where_drops_are_not_counted() {
-        let mut sampler = LiveSampler::new();
-        let obs = sampler.iface_obs(&traffic("nwtest0", 0, None), None, Instant::now());
-        let counted = crate::platform::IFACE_DROPS_COUNTED;
-        assert_eq!(obs.drops_per_min.is_some(), counted);
-        let json = serde_json::to_value(&obs).unwrap();
-        assert_eq!(json["drops_per_min"].is_null(), !counted);
+        let t = traffic("nwtest0", 0, None);
+        for counted in [true, false] {
+            let obs = LiveSampler::new().iface_obs(&t, None, Instant::now(), counted);
+            assert_eq!(obs.drops_per_min.is_some(), counted);
+            let json = serde_json::to_value(&obs).unwrap();
+            assert_eq!(json["drops_per_min"].is_null(), !counted, "{json}");
+        }
     }
 
     #[test]
@@ -942,7 +945,7 @@ mod tests {
         let mut idle_minute = None;
         for s in 0..=60 {
             let idle = traffic("wlan0", 5_000, Some(300));
-            let obs = sampler.iface_obs(&idle, Some(&wlan0), at(s));
+            let obs = sampler.iface_obs(&idle, Some(&wlan0), at(s), true);
             assert_eq!(obs.tx_retry_pct, None, "idle, second {s}");
             idle_minute = Some(obs);
         }
@@ -964,7 +967,7 @@ mod tests {
         // 50 frames a second, 5 of them retried: 1,000 frames by second 20.
         for s in 1..=20 {
             let busy = traffic("wlan0", 5_000 + 50 * s, Some(300 + 5 * s));
-            let obs = sampler.iface_obs(&busy, Some(&wlan0), at(60 + s));
+            let obs = sampler.iface_obs(&busy, Some(&wlan0), at(60 + s), true);
             let want = (s >= 20).then_some(10.0);
             assert_eq!(obs.tx_retry_pct, want, "busy, second {s}");
         }
