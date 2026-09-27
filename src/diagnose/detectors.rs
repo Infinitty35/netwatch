@@ -1759,11 +1759,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                                 format!("{} set AD on its answer", cross.reference_resolver),
                             )
                         } else {
+                            // The reference did answer, just without AD
+                            // (most often an unsigned zone), so this is a
+                            // fresh result with nothing to validate, not a
+                            // missing one.
                             CheckResult::not_run(
                                 "reference_validated",
                                 "reference validated",
-                                Availability::NotMeasured,
-                                "reference did not validate the answer",
+                                Availability::NotApplicable,
+                                format!("{} answered without AD", cross.reference_resolver),
                             )
                         },
                     ],
@@ -3415,6 +3419,35 @@ mod tests {
             .expect("cause present");
         assert!(vlan.checks.iter().any(|k| k.passed.is_none()));
         assert_ne!(vlan.confidence(), super::super::issue::Confidence::Strong);
+    }
+
+    #[test]
+    fn a_reference_answer_without_ad_is_not_applicable_not_unmeasured() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.cross = Some(DnsCross {
+            name: "dns.google".into(),
+            local: vec!["10.0.0.1".into()],
+            reference_resolver: "1.1.1.1".into(),
+            reference: vec!["8.8.8.8".into()],
+            validated: false,
+            private_answer: false,
+            mismatch_pct: 100.0,
+            cycles: 5,
+        });
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let check = found
+            .iter()
+            .find(|d| d.rule == "dns.hijack_suspect")
+            .expect("disagreement with history fires the rule")
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "reference_validated")
+            .expect("forged_records carries the check");
+        assert_eq!(check.passed, None);
+        assert_eq!(check.why_not, Some(Availability::NotApplicable));
+        assert_eq!(check.detail, "1.1.1.1 answered without AD");
     }
 
     #[test]
