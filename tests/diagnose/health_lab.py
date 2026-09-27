@@ -23,11 +23,12 @@ prober uses on a real host:
 
 The prober's targets are fixed: the internet probe and the DNS reference are
 both 1.1.1.1, and the resolver comes from /etc/resolv.conf. So a peer namespace
-owns 1.1.1.1, a temp resolv.conf is bind-mounted over the real one, and sysfs is
-remounted, because inside a user namespace /sys/class/net otherwise lists the
-host's interfaces. No host setting changes: the mounts, addresses, sysctls and
-qdiscs all live in namespaces that end with the run. Requires ip, tc (with
-sch_netem, sch_prio and cls_u32 loadable), nsenter, unshare and mount.
+owns 1.1.1.1, a resolv.conf naming 192.0.2.2 is mounted in place of the real
+one, and sysfs is remounted, because inside a user namespace /sys/class/net
+otherwise lists the host's interfaces. No host setting changes: the mounts,
+addresses, sysctls and qdiscs all live in namespaces that end with the run.
+Requires ip, tc (with sch_netem, sch_prio and cls_u32 loadable), nsenter,
+unshare and mount.
 """
 import argparse, json, os, pathlib, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
 
@@ -266,11 +267,23 @@ class Lab:
         self.tmp = tempfile.TemporaryDirectory(prefix='nw-health-')
         self.dir = pathlib.Path(self.tmp.name)
         # The resolver the App reads. realpath: on systemd hosts this is
-        # stub-resolv.conf, and a bind over the symlink would not follow it.
-        conf = self.dir / 'resolv.conf'
-        conf.write_text(f'nameserver {GATEWAY}\n')
-        cmd('mount', '--bind', conf, os.path.realpath('/etc/resolv.conf'))
-        assert pathlib.Path('/etc/resolv.conf').read_text() == conf.read_text(), 'resolv.conf bind did not take'
+        # stub-resolv.conf, which systemd-resolved replaces by rename whenever
+        # the host's DNS settings change, and a rename over a mount point in
+        # another mount namespace unmounts it there. A bind over the file
+        # lasted until the host's next rewrite, 13 minutes into one run, and
+        # the App then read 127.0.0.53. So the file's directory gets a tmpfs
+        # of its own, which also hides resolved's socket from the lab's NSS
+        # lookups. Only a resolv.conf directly in /etc is bound as a file.
+        real = pathlib.Path(os.path.realpath('/etc/resolv.conf'))
+        text = f'nameserver {GATEWAY}\n'
+        if real.parent != pathlib.Path('/etc'):
+            cmd('mount', '-t', 'tmpfs', 'tmpfs', real.parent)
+            real.write_text(text)
+        else:
+            conf = self.dir / 'resolv.conf'
+            conf.write_text(text)
+            cmd('mount', '--bind', conf, real)
+        assert pathlib.Path('/etc/resolv.conf').read_text() == text, 'resolv.conf did not take'
 
     def peer(self):
         p = subprocess.Popen(['unshare', '--net', 'sleep', 'infinity'])
@@ -569,6 +582,11 @@ def evaluate(s, rows, fault_at, clear_at):
     """Every assertion the row makes, as a list of failures, and the open and
     close times it measured."""
     failures = []
+    # Anything else is the host's network, and every judgement after it is
+    # about the wrong resolver or gateway.
+    escaped = first(rows, lambda r: {r['probes']['gateway_target'], r['probes']['dns_target']} - {GATEWAY, None})
+    if escaped is not None:
+        failures.append(f'the probes left the lab network at {escaped}s')
     listed = {}
     for r in rows:
         for i in r['issues']:

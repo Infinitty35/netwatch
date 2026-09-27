@@ -365,8 +365,8 @@ Integration tests verify distinct samples, missing-data safety, recovery,
 recurrence, endpoint scope, old recordings, and full/redacted replay.
 
 The health lab needs `cargo build --example diagnose_lab` first, and a mount
-namespace as well: it remounts sysfs, bind-mounts a temp `resolv.conf` naming
-192.0.2.2, and gives a peer namespace 1.1.1.1, **only inside its throwaway
+namespace as well: it remounts sysfs, mounts a `resolv.conf` naming 192.0.2.2
+in place of the host's, and gives a peer namespace 1.1.1.1, **only inside its throwaway
 namespaces**. It then runs `diagnose_lab`, the real `App::tick` once a second,
 which refuses to start unless its home, cache, config and state directories are
 inside the temp home the lab created. `--smoke` runs 60 seconds healthy and
