@@ -14,8 +14,11 @@ Both units pass the backend endpoint and API key via environment variables
 never appears in `ps`. The equivalent manual invocation is:
 
 ```sh
-netwatch daemon --remote https://cloud.example.com --api-key <key>
+NETWATCH_API_KEY=<key> netwatch daemon --remote https://cloud.example.com
 ```
+
+`--api-key <key>` still works, but it puts the key where any user on the host
+can read it with `ps`.
 
 The URL must be `https://`. netwatch refuses an `http://` URL, which would
 send the API key in cleartext, unless `--insecure-remote` is also given; for

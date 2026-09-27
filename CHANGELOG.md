@@ -45,7 +45,9 @@ All notable changes to NetWatch will be documented in this file.
   those files 0600 with or without the sandbox, and an exports directory an
   earlier run left open is narrowed. An `http://` remote URL sent the API key
   and every snapshot in cleartext; netwatch now refuses one and exits unless
-  `--insecure-remote` is given.
+  `--insecure-remote` is given. `--help` now marks `--api-key` as
+  discouraged, since any user on the host can read it in `ps`; set
+  `NETWATCH_API_KEY` instead.
 
 ## [0.32.3] - 2026-09-20
 

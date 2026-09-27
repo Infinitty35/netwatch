@@ -46,10 +46,11 @@ unless
 is given.
 .TP
 .BI \-\-api\-key " KEY"
-Remote API key. Prefer the
-.B NETWATCH_API_KEY
-environment variable, so the key does not appear in
+Remote API key. Discouraged: any user on the host can read it in
 .BR ps (1).
+Set the
+.B NETWATCH_API_KEY
+environment variable instead.
 .TP
 .B \-\-insecure\-remote
 Allow an

@@ -33,7 +33,7 @@ pub struct Run {
 // One option catalogue supplies both accepted spellings and help text.
 const OPTIONS: &[(&str, bool, &str)] = &[
     ("--remote", true, "Remote https:// URL (requires API key)"),
-    ("--api-key", true, "Remote API key"),
+    ("--api-key", true, "Discouraged: use NETWATCH_API_KEY"),
     ("--insecure-remote", false, "Allow an http:// remote URL"),
     ("--view", true, "full, lite, or dense"),
     ("--lite", false, "Start in Lite view"),
@@ -235,6 +235,24 @@ mod tests {
             })
         ));
         assert!(command("--insecure-remote --insecure-remote").is_err());
+    }
+
+    #[test]
+    fn help_steers_the_api_key_to_the_environment() {
+        let help = help();
+        let line = help
+            .lines()
+            .find(|l| l.trim_start().starts_with("--api-key"))
+            .unwrap();
+        assert!(line.contains("NETWATCH_API_KEY"), "{line}");
+        // Discouraged, not removed: existing units keep working.
+        assert!(matches!(
+            command("--remote https://cloud.example.com --api-key k").unwrap(),
+            Command::Run(Run {
+                api_key: Some(_),
+                ..
+            })
+        ));
     }
 
     /// Shipped completions and the man page must cover every option the

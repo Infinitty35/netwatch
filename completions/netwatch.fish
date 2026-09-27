@@ -22,7 +22,7 @@ complete -c netwatch -n '__fish_seen_subcommand_from resolver' -a 'status set re
 
 # ── options ───────────────────────────────────────────────────────────
 complete -c netwatch -l remote -r -d 'Remote https:// URL (requires API key)'
-complete -c netwatch -l api-key -r -d 'Remote API key'
+complete -c netwatch -l api-key -r -d 'Discouraged: use NETWATCH_API_KEY'
 complete -c netwatch -l insecure-remote -d 'Allow an http:// remote URL'
 complete -c netwatch -l view -x -a 'full lite dense' -d 'full, lite, or dense'
 complete -c netwatch -l lite -d 'Start in Lite view'

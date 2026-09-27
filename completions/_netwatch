@@ -21,7 +21,7 @@ _netwatch() {
 
     _arguments -C \
         '--remote=[Remote https:// URL (requires API key)]:url:_urls' \
-        '--api-key=[Remote API key]:key:' \
+        '--api-key=[Discouraged: use NETWATCH_API_KEY]:key:' \
         '--insecure-remote[Allow an http:// remote URL]' \
         '--view=[full, lite, or dense]:view:(full lite dense)' \
         '--lite[Start in Lite view]' \
