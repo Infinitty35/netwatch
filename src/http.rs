@@ -10,7 +10,9 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// How long to wait for a TCP (and TLS) connection to be established.
+/// How long to wait for the TCP connection to be established. The TLS
+/// handshake after it is bounded by [`IO_TIMEOUT`] instead, per read and
+/// write, like the rest of the request.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long any single read or write may wait on the peer.
