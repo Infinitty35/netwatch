@@ -3160,6 +3160,56 @@ mod tests {
         );
     }
 
+    fn local_udp_check(alt_rtt_ms: Option<f64>, drops_per_min: u64, id: &str) -> CheckResult {
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(alt_rtt_ms, drops_per_min));
+        local.checks.into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn the_alternate_is_also_slow_at_half_the_median() {
+        // The median is 40ms, so the line is 20ms.
+        let c = local_udp_check(
+            Some(20.0),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_alternate_is_not_also_slow_below_half_the_median() {
+        let c = local_udp_check(
+            Some(19.9),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false), "{}", c.detail);
+        // An alternate far under the line says the path is fine.
+        let c = local_udp_check(
+            Some(1.4),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(
+            c.detail,
+            "the alternate answered in 1.4ms over the same path"
+        );
+    }
+
+    #[test]
+    fn local_udp_interface_drops_pass_at_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 60, "interface_drops");
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn local_udp_interface_drops_fail_below_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 59, "interface_drops");
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(c.detail, "59 drops a minute, under the 60/min floor");
+    }
+
     #[test]
     fn dns_does_not_fire_on_a_normal_resolver() {
         let mut base = store();
