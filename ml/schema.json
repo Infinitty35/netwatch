@@ -356,6 +356,10 @@
     },
     {
       "group": "check",
+      "name": "check.dns.slow_resolver.local_udp_path.local_drop_counters"
+    },
+    {
+      "group": "check",
       "name": "check.path.rtt_spike.hop_adds_latency.one_hop_dominates"
     },
     {
@@ -417,6 +421,10 @@
     {
       "group": "check",
       "name": "check.tcp.retrans_burst.packet_loss.retransmits_observed"
+    },
+    {
+      "group": "check",
+      "name": "check.tcp.retrans_burst.packet_loss.socket_rtt_below_queueing_line"
     },
     {
       "group": "check",
@@ -1307,7 +1315,7 @@
       "name": "open.egress.policy_violation"
     }
   ],
-  "hash": "a3141086556720b1",
+  "hash": "e476c3f5ae717da6",
   "meta_columns": [
     "episode",
     "source",

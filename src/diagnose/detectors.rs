@@ -150,17 +150,18 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
     if s.rwnd == Some(0) {
         return SocketVerdict::ZeroWindow;
     }
-    let rtt = s.rtt_ms.unwrap_or(0.0);
-
     // Retransmits dominate: a socket losing segments is describing the path,
     // not its own queueing, and the retrans rule carries the better causes.
-    if s.retrans.is_some_and(|n| n >= 5) && rtt < t.socket_rtt_ms {
+    // The count is measured; with no rtt only the queueing exclusion is
+    // unknown, and the finding says so rather than reading the rtt as 0.
+    if s.retrans.is_some_and(|n| n >= 5) && s.rtt_ms.is_none_or(|r| r < t.socket_rtt_ms) {
         return SocketVerdict::RetransBurst;
     }
 
     // Bufferbloat: high rtt while *this* socket is the one sending. A high rtt
-    // on an idle socket is just a distant peer.
-    if rtt >= t.socket_rtt_ms && s.tx_bps > 0.0 {
+    // on an idle socket is just a distant peer, and a socket with no rtt is
+    // not a bloated one.
+    if s.rtt_ms.is_some_and(|r| r >= t.socket_rtt_ms) && s.tx_bps > 0.0 {
         return SocketVerdict::Bufferbloat;
     }
 
@@ -1974,30 +1975,50 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         Cause::new(
             "local_udp_path",
             "local: conntrack, udp buffers or nftables",
+            // Neither shared check tells this cause apart from a slow or
+            // lossy uplink, which slows the alternate too. They used to pass
+            // with no alternate probed and on a single drop, so a Wi-Fi
+            // laptop shedding one multicast frame a minute got a strong local
+            // fault from two checks that measured nothing local.
             vec![
-                if alt_fast {
-                    CheckResult::fail(
+                // "Also slow" is half this resolver's median or more. The
+                // half is a judgement, not a validated line; below it the
+                // alternate is at least twice as fast over the same path.
+                match dns.alt_rtt_ms {
+                    Some(alt) if alt >= p50 / 2.0 => CheckResult::pass(
                         "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
-                        "the alternate resolver is fast over the same path",
-                    )
-                } else {
-                    CheckResult::pass(
-                        "alt_resolver_over_the_same_path_is_also_slow",
-                        "alt resolver over the same path is also slow",
-                        "both resolvers are slow — the problem may be local",
-                    )
-                },
-                match obs.iface.as_ref().map(|i| i.drops_per_min) {
-                    Some(d) if d > 0 => CheckResult::pass(
-                        "interface_drops",
-                        "interface drops",
-                        format!("{d} drops this window"),
+                        format!(
+                            "the alternate took {alt:.1}ms against {p50:.1}ms — the problem may be local"
+                        ),
                     ),
-                    Some(_) => CheckResult::fail(
+                    Some(alt) => CheckResult::fail(
+                        "alt_resolver_over_the_same_path_is_also_slow",
+                        "alt resolver over the same path is also slow",
+                        format!("the alternate answered in {alt:.1}ms over the same path"),
+                    ),
+                    None => CheckResult::not_run(
+                        "alt_resolver_over_the_same_path_is_also_slow",
+                        "alt resolver over the same path is also slow",
+                        Availability::NotMeasured,
+                        "no alternate resolver probed",
+                    ),
+                },
+                // The same floor iface.errors uses: a wireless NIC drops
+                // multicast and management frames as a matter of course.
+                match obs.iface.as_ref().map(|i| i.drops_per_min) {
+                    Some(d) if d as f64 >= t.iface_drop_floor => CheckResult::pass(
                         "interface_drops",
                         "interface drops",
-                        "no drops on the interface",
+                        format!("{d} drops a minute"),
+                    ),
+                    Some(d) => CheckResult::fail(
+                        "interface_drops",
+                        "interface drops",
+                        format!(
+                            "{d} drops a minute, under the {:.0}/min floor",
+                            t.iface_drop_floor
+                        ),
                     ),
                     None => CheckResult::not_run(
                         "interface_drops",
@@ -2006,6 +2027,16 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "no interface counters",
                     ),
                 },
+                // The discriminator: the kernel counting UDP datagrams it
+                // threw away on this host. Until it is read the cause stops
+                // at Likely, however the shared checks come out.
+                CheckResult::not_run(
+                    "local_drop_counters",
+                    "local drop counters",
+                    Availability::NotImplemented,
+                    "UDP receive-buffer and conntrack drop counters are not read yet",
+                )
+                .weighted(2.0),
             ],
         ),
     ];
@@ -2452,7 +2483,6 @@ fn socket_detection(
         local: s.local.clone(),
         remote: s.remote.clone(),
     };
-    let rtt = s.rtt_ms.unwrap_or(0.0);
     let link_test_passed = match (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
         (Some(idle), Some(loaded)) => Some(loaded - idle < t.loaded_rtt_delta_ms),
         _ => None,
@@ -2460,6 +2490,9 @@ fn socket_detection(
 
     let mut d = match verdict {
         SocketVerdict::Bufferbloat => {
+            // The verdict needs a measured rtt; with none there is no finding,
+            // and never one quoting an rtt of 0.
+            let rtt = s.rtt_ms?;
             let mut d = Detection::new("tcp.bufferbloat_remote", subject);
             d.evidence
                 .push(Evidence::new("tcp.socket_rtt", rtt, "ms").with_window(30, 30));
@@ -2583,14 +2616,42 @@ fn socket_detection(
             d.causes = vec![Cause::new(
                 "packet_loss",
                 "packet loss between here and the peer",
-                vec![CheckResult::pass(
-                    "retransmits_observed",
-                    "retransmits observed",
-                    format!(
-                        "{} retransmits in the last minute on this socket",
-                        s.retrans?
+                vec![
+                    CheckResult::pass(
+                        "retransmits_observed",
+                        "retransmits observed",
+                        format!(
+                            "{} retransmits in the last minute on this socket",
+                            s.retrans?
+                        ),
                     ),
-                )],
+                    // What keeps a queue out of it: a bloated socket
+                    // retransmits too, once its ACKs queue past the RTO.
+                    match s.rtt_ms {
+                        Some(rtt) if rtt < t.socket_rtt_ms => CheckResult::pass(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, under the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        Some(rtt) => CheckResult::fail(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, over the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        None => CheckResult::not_run(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            Availability::NotMeasured,
+                            "no rtt for this socket, so a queue is not ruled out",
+                        ),
+                    },
+                ],
             )];
             d.remediation = vec![Step::instruct(
                 "trace the peer",
@@ -3016,6 +3077,137 @@ mod tests {
             "both resolvers slow should point local, got {:?}",
             causes[0].label
         );
+        // Pointing local is as far as it goes: no local drop counter is read.
+        assert_eq!(
+            causes[0].confidence(),
+            super::super::issue::Confidence::Likely
+        );
+    }
+
+    /// A Wi-Fi laptop behind a resolver at 33× its baseline. The report's
+    /// scenario is one drop a minute and no alternate probed, which live is
+    /// always.
+    fn laptop_with_a_slow_resolver(alt_rtt_ms: Option<f64>, drops_per_min: u64) -> Observations {
+        Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                wireless: true,
+                link_rate_bps: None,
+                drops_per_min,
+                ..eth0()
+            }),
+            ..obs_with_dns(DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            })
+        }
+    }
+
+    fn local_udp_path(obs: &Observations) -> (Cause, Vec<Cause>) {
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(obs, &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("dns.slow_resolver should fire");
+        let (mut local, others): (Vec<Cause>, _) = d
+            .causes
+            .iter()
+            .cloned()
+            .partition(|c| c.id == "local_udp_path");
+        (local.remove(0), others)
+    }
+
+    #[test]
+    fn one_dropped_multicast_frame_a_minute_is_not_a_local_udp_fault() {
+        use super::super::issue::Confidence;
+        let (local, others) = local_udp_path(&laptop_with_a_slow_resolver(None, 1));
+        assert!(
+            local.confidence() <= Confidence::Weak,
+            "{} on {}",
+            local.confidence().label(),
+            local.checks_label()
+        );
+        // The engine ranks by confidence first, so a cause above it on
+        // confidence keeps it off the top.
+        assert!(
+            others.iter().any(|c| c.confidence() > local.confidence()),
+            "local_udp_path ranks top: {:?}",
+            others
+                .iter()
+                .map(|c| (c.id.clone(), c.confidence()))
+                .collect::<Vec<_>>()
+        );
+        let check = |id| local.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            check("alt_resolver_over_the_same_path_is_also_slow").why_not,
+            Some(Availability::NotMeasured)
+        );
+        assert_eq!(check("interface_drops").passed, Some(false));
+    }
+
+    #[test]
+    fn local_udp_path_is_never_strong_without_a_local_counter() {
+        // Everything the rule can see points local: the alternate is as slow
+        // over the same path, and the interface drops twice the floor.
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(Some(38.0), 120));
+        assert_eq!(local.score(), Some(1.0), "{}", local.checks_label());
+        assert_eq!(local.confidence(), super::super::issue::Confidence::Likely);
+        assert_eq!(
+            local.missing_discriminator().map(|c| c.id.as_str()),
+            Some("local_drop_counters")
+        );
+    }
+
+    fn local_udp_check(alt_rtt_ms: Option<f64>, drops_per_min: u64, id: &str) -> CheckResult {
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(alt_rtt_ms, drops_per_min));
+        local.checks.into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn the_alternate_is_also_slow_at_half_the_median() {
+        // The median is 40ms, so the line is 20ms.
+        let c = local_udp_check(
+            Some(20.0),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_alternate_is_not_also_slow_below_half_the_median() {
+        let c = local_udp_check(
+            Some(19.9),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false), "{}", c.detail);
+        // An alternate far under the line says the path is fine.
+        let c = local_udp_check(
+            Some(1.4),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(
+            c.detail,
+            "the alternate answered in 1.4ms over the same path"
+        );
+    }
+
+    #[test]
+    fn local_udp_interface_drops_pass_at_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 60, "interface_drops");
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn local_udp_interface_drops_fail_below_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 59, "interface_drops");
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(c.detail, "59 drops a minute, under the 60/min floor");
     }
 
     #[test]
@@ -3241,6 +3433,94 @@ mod tests {
             "4 retransmits a minute is under the burst line: {:?}",
             rules_of(&found)
         );
+    }
+
+    #[test]
+    fn a_socket_without_rtt_is_never_bufferbloat() {
+        // Sending hard with nothing retransmitted, so only the rtt the
+        // verdict turns on is missing.
+        let s = SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(0),
+            ..bloated_socket()
+        };
+        let t = Thresholds::default();
+        assert_ne!(classify_socket(&s, &t), SocketVerdict::Bufferbloat);
+        let obs = Observations {
+            sockets: vec![s.clone()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &t);
+        assert!(
+            !rules_of(&found).contains(&"tcp.bufferbloat_remote"),
+            "{:?}",
+            rules_of(&found)
+        );
+        // Handed the verdict anyway, the detection refuses rather than
+        // quoting an rtt of 0.
+        assert!(socket_detection(&s, SocketVerdict::Bufferbloat, &obs, &t).is_none());
+    }
+
+    #[test]
+    fn a_missing_rtt_is_not_read_as_0_under_a_0_ms_line() {
+        // Under the default 100ms line an rtt read as 0 lands on the right
+        // side of both tests by luck. A 0ms line takes the luck away: 0 >= 0
+        // made the sender bloated and kept the retransmitter out of its burst.
+        let t = Thresholds {
+            socket_rtt_ms: 0.0,
+            ..Thresholds::default()
+        };
+        let no_rtt = |retrans| SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(retrans),
+            ..bloated_socket()
+        };
+        assert_ne!(classify_socket(&no_rtt(0), &t), SocketVerdict::Bufferbloat);
+        assert_eq!(
+            classify_socket(&no_rtt(12), &t),
+            SocketVerdict::RetransBurst
+        );
+    }
+
+    #[test]
+    fn retransmits_without_rtt_say_the_rtt_was_not_measured() {
+        use super::super::issue::Confidence;
+        let finding = |rtt_ms| {
+            let obs = Observations {
+                sockets: vec![SocketObs {
+                    rtt_ms,
+                    rttvar_ms: None,
+                    ..retransmitting_socket(12)
+                }],
+                ..Default::default()
+            };
+            let mut found = detect(&obs, &store(), &Thresholds::default());
+            assert_eq!(rules_of(&found), ["tcp.retrans_burst"]);
+            found.remove(0)
+        };
+        let check = |d: &Detection| {
+            d.causes[0]
+                .checks
+                .iter()
+                .find(|c| c.id == "socket_rtt_below_queueing_line")
+                .cloned()
+                .unwrap()
+        };
+
+        // The retransmit count is measured, so the rule still fires; only
+        // the check that rules a queue out is missing.
+        let d = finding(None);
+        let k = check(&d);
+        assert_eq!(k.passed, None);
+        assert_eq!(k.why_not, Some(Availability::NotMeasured));
+        assert_eq!(d.causes[0].confidence(), Confidence::Likely);
+        assert!(!d.evidence.iter().any(|e| e.metric == "tcp.socket_rtt"));
+
+        let d = finding(Some(20.0));
+        assert_eq!(check(&d).passed, Some(true));
+        assert_eq!(d.causes[0].confidence(), Confidence::Strong);
     }
 
     #[test]
@@ -4105,11 +4385,7 @@ mod tests {
     /// is removed by the 0.33 abstain item that fixes its site, and a row
     /// listed here that starts abstaining fails the test, so the list cannot
     /// outlive the fix.
-    const EXPECTED_UNTIL_0_33_A: &[&str] = &[
-        // D33-A02: with no alternate probed, "the alternate is also slow"
-        // passes, and local_udp_path claims a check it never made.
-        "DnsObs.alt_rtt_ms",
-    ];
+    const EXPECTED_UNTIL_0_33_A: &[&str] = &[];
 
     /// What one absence row demands of the detectors.
     enum Expect {
@@ -4230,6 +4506,7 @@ mod tests {
                 },
                 vec![
                     Expect::Fires("tcp.retrans_burst"),
+                    Expect::NotRun("socket_rtt_below_queueing_line"),
                     Expect::NoRule("tcp.bufferbloat_remote"),
                     Expect::NoEvidence("tcp.socket_rtt", 0.0),
                 ],
