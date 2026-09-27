@@ -70,17 +70,26 @@ pub fn create(path: &Path) -> io::Result<File> {
 pub fn create_dir_all(dir: &Path) -> io::Result<()> {
     dir_builder().recursive(true).create(dir)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(handle) = OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-            .open(dir)
-        {
-            let _ = handle.set_permissions(std::fs::Permissions::from_mode(DIR_MODE));
-        }
-    }
+    narrow_dir(dir, unsafe { nix::libc::geteuid() });
     Ok(())
+}
+
+/// Narrow `dir` to 0700 when `uid` owns it. The chmod would fail on anyone
+/// else's directory anyway, except as root, and root (say `sudo -E` with the
+/// user's HOME) must leave a directory it does not own as the owner set it.
+#[cfg(unix)]
+fn narrow_dir(dir: &Path, uid: u32) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let Ok(handle) = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(dir)
+    else {
+        return;
+    };
+    if handle.metadata().is_ok_and(|meta| meta.uid() == uid) {
+        let _ = handle.set_permissions(std::fs::Permissions::from_mode(DIR_MODE));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -135,6 +144,22 @@ mod tests {
             b"new",
             "the file is truncated"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_someone_else_owns_is_not_narrowed() {
+        use std::os::unix::fs::MetadataExt;
+        let root = scratch("other-owner");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Only root can chmod another user's directory, so the owner check is
+        // exercised with a uid that does not own this one.
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        narrow_dir(&root, owner.wrapping_add(1));
+        assert_eq!(mode(&root), 0o755);
+        narrow_dir(&root, owner);
+        assert_eq!(mode(&root), 0o700);
         let _ = std::fs::remove_dir_all(&root);
     }
 
