@@ -1,6 +1,10 @@
 //! Headless lab driver: the real `App::tick` once a second, one line per tick.
 //!
-//! `diagnose_lab --seconds N [--seed FILE] [--jsonl]`
+//! `diagnose_lab --seconds N [--seed FILE] [--stop-file FILE] [--jsonl]`
+//!
+//! `--stop-file` ends the run early, after the tick on which FILE first
+//! exists, with the same shutdown as `--seconds`: a scenario that has seen
+//! everything it asserts stops there and still gets its episode written.
 //!
 //! Run by `tests/diagnose/health_lab.py` inside its namespaces, never by hand
 //! against a real home: it refuses to start unless every directory the App
@@ -21,6 +25,7 @@ use std::{
 struct Options {
     seconds: u64,
     seed: Option<PathBuf>,
+    stop_file: Option<PathBuf>,
     jsonl: bool,
 }
 
@@ -28,6 +33,7 @@ fn parse() -> Result<Options> {
     let mut opts = Options {
         seconds: 0,
         seed: None,
+        stop_file: None,
         jsonl: false,
     };
     let mut args = std::env::args().skip(1);
@@ -37,6 +43,9 @@ fn parse() -> Result<Options> {
                 opts.seconds = args.next().context("--seconds requires 1..3600")?.parse()?
             }
             "--seed" => opts.seed = Some(args.next().context("--seed requires a file")?.into()),
+            "--stop-file" => {
+                opts.stop_file = Some(args.next().context("--stop-file requires a file")?.into())
+            }
             "--jsonl" => opts.jsonl = true,
             other => bail!("unknown option: {other}"),
         }
@@ -136,6 +145,10 @@ fn main() -> Result<()> {
                     issues.join(", ")
                 }
             );
+        }
+        if opts.stop_file.as_ref().is_some_and(|f| f.exists()) {
+            eprintln!("stop file seen after {t}s");
+            break;
         }
     }
     // As the daemon stops: the recorder writes an episode still in progress.
