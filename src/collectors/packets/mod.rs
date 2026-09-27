@@ -1210,7 +1210,6 @@ impl StreamTracker {
                     crate::dpi::quic::QuicVersion::V1,
                     largest_pn,
                 ) {
-                    let mut grown = 0;
                     if let Some(s) = self.all_streams.get_mut(&stream_index) {
                         s.quic_decrypt.suite = Some(suite);
                         if client_to_server {
@@ -1220,14 +1219,8 @@ impl StreamTracker {
                             s.quic_decrypt.dcid_len_s2c = Some(dcid_len as u8);
                             s.quic_decrypt.largest_pn_s2c = s.quic_decrypt.largest_pn_s2c.max(pn);
                         }
-                        // Buffer the decrypted frames for cross-packet HTTP/3
-                        // reassembly (Phase 3b); decode happens lazily in the UI.
-                        let h3 = self.quic_h3.entry(stream_index).or_default();
-                        let before = h3.held_bytes();
-                        h3.ingest(client_to_server, &plain);
-                        grown = h3.held_bytes().saturating_sub(before);
                     }
-                    self.charge(stream_index, grown);
+                    self.ingest_h3(stream_index, client_to_server, &plain);
                     tracing::trace!(target: "netwatch::dpi::quic", stream_index, client_to_server, dcid_len, pn, plain_len = plain.len(), "decrypted QUIC 1-RTT packet");
                     return Some(plain);
                 }
@@ -1329,6 +1322,20 @@ impl StreamTracker {
             }
         }
         sampled.retain(|idx| self.all_streams.contains_key(idx));
+    }
+
+    /// Buffer one decrypted 1-RTT packet's frames for cross-packet HTTP/3
+    /// reassembly (Phase 3b), charging what the buffers grew by. Decoding
+    /// happens lazily in the UI.
+    fn ingest_h3(&mut self, index: u32, client_to_server: bool, frames: &[u8]) {
+        if !self.all_streams.contains_key(&index) {
+            return;
+        }
+        let h3 = self.quic_h3.entry(index).or_default();
+        let before = h3.held_bytes();
+        h3.ingest(client_to_server, frames);
+        let grown = h3.held_bytes().saturating_sub(before);
+        self.charge(index, grown);
     }
 
     /// Reassembled HTTP/3 bodies for a flow. Decoding can grow what the
@@ -3886,6 +3893,87 @@ mod tests {
         assert!(a.segments[0].decrypted.is_none());
         let c = collector.get_stream(idx).unwrap();
         assert_eq!(c.segments[0].decrypted.as_deref(), Some(&b"plain"[..]));
+    }
+
+    /// Decrypted 1-RTT frames: one STREAM frame on HTTP/3 request stream 0
+    /// carrying a DATA frame with `body` gzipped. Lengths use the two-byte
+    /// QUIC varint, so keep the compressed body under 16 KiB.
+    fn h3_gzip_response(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let varint = |n: usize| (0x4000 | n as u16).to_be_bytes();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(body).unwrap();
+        let gz = gz.finish().unwrap();
+        let mut data = vec![0x00]; // DATA
+        data.extend(varint(gz.len()));
+        data.extend(gz);
+        let mut frames = vec![0x0e, 0x00, 0x00]; // STREAM with OFF and LEN, id 0, offset 0
+        frames.extend(varint(data.len()));
+        frames.extend(data);
+        frames
+    }
+
+    #[test]
+    fn http3_buffers_and_decoded_bodies_are_charged() {
+        let mut tracker = StreamTracker::new();
+        let idx = track_on(&mut tracker, 40_000, b"x", 1);
+        let before = tracker.held_bytes;
+        let body = b"a decrypted HTTP/3 response body ".repeat(100);
+        tracker.ingest_h3(idx, false, &h3_gzip_response(&body));
+        let buffered = tracker.quic_h3[&idx].held_bytes();
+        assert!(buffered > 0);
+        assert_eq!(tracker.held_bytes, before + buffered);
+
+        // Decoding for the UI adds the body, once.
+        for _ in 0..2 {
+            assert_eq!(tracker.quic_h3_bodies(idx)[0].bytes, body);
+            assert_eq!(tracker.held_bytes, before + buffered + body.len());
+        }
+        assert_eq!(tracker.all_streams[&idx].held_bytes, tracker.held_bytes);
+
+        // Nothing is buffered for a stream the tracker doesn't hold.
+        tracker.ingest_h3(idx + 1, false, &h3_gzip_response(&body));
+        assert!(!tracker.quic_h3.contains_key(&(idx + 1)));
+    }
+
+    /// Give stream `idx` what the tracker holds beside it: TLS keys and an
+    /// HTTP/3 reassembler.
+    fn hold_keys_and_h3(tracker: &mut StreamTracker, idx: u32) {
+        use crate::dpi::tls_decrypt::{CipherSuite, DirectionKeys};
+        let keys = || DirectionKeys::from_traffic_secret(CipherSuite::Aes128GcmSha256, &[0; 32]);
+        let v13 = TlsStreamKeys::V13 {
+            client: keys(),
+            server: keys(),
+        };
+        tracker.tls_keys.insert(idx, v13);
+        tracker.ingest_h3(idx, false, &h3_gzip_response(b"body"));
+        assert!(tracker.quic_h3.contains_key(&idx));
+    }
+
+    #[test]
+    fn eviction_frees_a_streams_tls_keys_and_http3_buffers() {
+        // By the byte budget: 99 newer flows of 1000 bytes each.
+        let mut tracker = StreamTracker::new();
+        tracker.byte_budget = 64 * 1024;
+        let idx = track_on(&mut tracker, 40_000, b"x", 0);
+        hold_keys_and_h3(&mut tracker, idx);
+        for i in 1..100u16 {
+            track_on(&mut tracker, 40_000 + i, &[0x41; 1000], u64::from(i));
+        }
+        assert!(tracker.get_stream(idx).is_none());
+        assert!(!tracker.tls_keys.contains_key(&idx));
+        assert!(!tracker.quic_h3.contains_key(&idx));
+
+        // By the stream count.
+        let mut tracker = StreamTracker::new();
+        let idx = track_on(&mut tracker, 1, b"x", 0);
+        hold_keys_and_h3(&mut tracker, idx);
+        for i in 1..=(MAX_STREAMS + STREAM_EVICT_BATCH) as u16 {
+            track_on(&mut tracker, 1 + i, b"x", u64::from(i));
+        }
+        assert!(tracker.get_stream(idx).is_none());
+        assert!(!tracker.tls_keys.contains_key(&idx));
+        assert!(!tracker.quic_h3.contains_key(&idx));
     }
 
     // ── Capture-thread panics ───────────────────────────────
