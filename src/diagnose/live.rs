@@ -21,6 +21,7 @@ use super::detectors::{
     SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
+use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
 use crate::collectors::traffic::InterfaceTraffic;
 use crate::platform::InterfaceInfo;
 
@@ -478,6 +479,24 @@ impl LiveSampler {
             Ok(r) => r.clone(),
             Err(_) => return vec![],
         };
+        self.paths_from(&result)
+    }
+
+    fn paths_from(&mut self, result: &TracerouteResult) -> Vec<PathObs> {
+        // A trace in progress has cleared the previous one's hops, but that
+        // trace is still the newest measurement of its path and stands until
+        // its 120 s run out. Dropping it for the tick a re-trace takes read as
+        // the path vanishing, which reset an opening path.rtt_spike's
+        // confirmation and a closing one's verify hold on every trace: with
+        // periodic traces, the rule could neither open nor close.
+        if result.status == TracerouteStatus::Running {
+            if let Some((at, path)) = self.path_samples.get(&result.target) {
+                if crate::collectors::health::ProbeTimes::fresh(Some(*at), 120) {
+                    self.completed.path = Some(*at);
+                    return vec![path.clone()];
+                }
+            }
+        }
         self.completed.path = result.completed;
         if result.target.is_empty()
             || result.hops.is_empty()
@@ -791,6 +810,49 @@ mod tests {
         assert!(sampler
             .fresh_reading("dns", Some(now + std::time::Duration::from_nanos(1)))
             .is_some());
+    }
+
+    #[test]
+    fn a_trace_in_progress_keeps_the_last_path() {
+        use crate::collectors::traceroute::TracerouteHop;
+        let hop = |n: u8, ip: &str, rtt: f64| TracerouteHop {
+            hop_number: n,
+            host: None,
+            ip: Some(ip.into()),
+            rtt_ms: vec![Some(rtt); 3],
+        };
+        let done = Instant::now();
+        let mut result = TracerouteResult {
+            completed: Some(done),
+            completed_at: "2026-09-27 12:00:00".into(),
+            target: "1.1.1.1".into(),
+            status: TracerouteStatus::Done,
+            hops: vec![hop(1, "192.0.2.2", 0.1), hop(2, "1.1.1.1", 80.0)],
+            reached: Some(true),
+        };
+        let mut sampler = LiveSampler::new();
+        let traced = sampler.paths_from(&result);
+        assert_eq!(traced.len(), 1);
+
+        // What TracerouteRunner::run leaves while the next trace runs: the
+        // last trace stands, as the same sample rather than a new one, so it
+        // neither drops out of a confirmation nor counts toward one twice.
+        result.status = TracerouteStatus::Running;
+        result.completed = None;
+        result.hops.clear();
+        assert_eq!(sampler.paths_from(&result), traced);
+        assert_eq!(sampler.completed.path, Some(done));
+
+        // Past its 120 s it stands for nothing, running trace or not.
+        sampler.path_samples.get_mut("1.1.1.1").unwrap().0 =
+            done - std::time::Duration::from_secs(121);
+        assert!(sampler.paths_from(&result).is_empty());
+        assert_eq!(sampler.completed.path, None);
+
+        // Nor does a trace of another target.
+        sampler.path_samples.get_mut("1.1.1.1").unwrap().0 = done;
+        result.target = "9.9.9.9".into();
+        assert!(sampler.paths_from(&result).is_empty());
     }
 
     #[test]

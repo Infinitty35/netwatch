@@ -348,7 +348,7 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo build --examples
 unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py
-unshare --user --map-root-user --net --mount python3 tests/diagnose/health_lab.py --smoke
+python3 tests/diagnose/health_lab.py --quick
 cargo run --example diagnose_live_check -- /tmp/netwatch-live-new
 cargo run --example diagnose_active_live -- /tmp/netwatch-active-new
 cargo run --example diagnose_soak -- /tmp/netwatch-soak-new 600
@@ -365,13 +365,31 @@ Integration tests verify distinct samples, missing-data safety, recovery,
 recurrence, endpoint scope, old recordings, and full/redacted replay.
 
 The health lab needs `cargo build --example diagnose_lab` first, and a mount
-namespace as well: it remounts sysfs, bind-mounts a temp `resolv.conf` naming
-192.0.2.2, and gives a peer namespace 1.1.1.1, **only inside its throwaway
+namespace as well: it remounts sysfs, mounts a `resolv.conf` naming 192.0.2.2
+in place of the host's, and gives a peer namespace 1.1.1.1, **only inside its throwaway
 namespaces**. It then runs `diagnose_lab`, the real `App::tick` once a second,
 which refuses to start unless its home, cache, config and state directories are
 inside the temp home the lab created. `--smoke` runs 60 seconds healthy and
 asserts that the gateway, DNS and internet probes measured the lab's addresses
 and that nothing opened.
+
+`--quick` runs the smoke and each scenario in its own namespaces, all at once,
+in about six minutes, and writes every open and close time to
+`health-lab.json`; `--artifacts DIR` keeps each run's JSON lines and the
+episodes it recorded. A scenario stages one fault — a slow, dead or lossy
+resolver, total loss or ICMP delay toward the gateway, delay beyond it, or a
+healthy 1 ms link — and asserts which rules open within how long, which are
+listed under which, which close once it clears, and which must never appear.
+A scenario that expects nothing to open also fails if a rule it forbids lost
+its input during the fault, since a rule without input cannot open.
+The scenarios are rows of data in `health_lab.py`, each window at least twice
+what today's rules should take, so a change to a rule's timing changes a row.
+`--long` runs the negatives too slow for every change, such as 20 minutes of
+1% resolver loss that must never open `dns.failing`. CI runs `--quick` on every
+push to `main` and on pull requests that touch Diagnose, the health prober or
+the lab, as a `ci.yml` job, so the release guard holds a tag until it passes;
+`--long` runs once a week. The faults are netem qdiscs, so `tc` needs
+`sch_netem`, `sch_prio` and `cls_u32` available.
 
 The workstation soak records actual observed seconds, stalls, worker count,
 resident memory and state size. Its duration is a bounded stability check, not a

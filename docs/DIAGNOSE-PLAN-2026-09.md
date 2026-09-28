@@ -367,7 +367,7 @@ P04 is one of three PRs that reach an hour; it is the lab driver and topology, w
 
 #### D33-C07 · Lab scenarios drive the engine end to end, in CI
 - **Why.** REVIEW §2 exit clause 1: the fault lab drives the engine for at least DNS slow and failing, gateway loss and path spike. Decision D2 reads "gateway loss" as total loss until `gateway.loss` exists.
-- **Files.** The scenario table in `tests/diagnose/health_lab.py`; `.github/workflows/ci.yml:101-125` (build `--example diagnose_lab`, run `--quick`, upload `health-lab.json` and the recorded episodes).
+- **Files.** The scenario table in `tests/diagnose/health_lab.py`; `.github/workflows/health-lab.yml` (build `--example diagnose_lab`, run `--quick` or `--long`, upload `health-lab.json` and the recorded episodes), which a `.github/workflows/ci.yml` job calls for `--quick` on every push to `main` and on PRs touching the D6 paths, so the release guard's wait on `ci.yml` covers it; `health-lab.yml` runs the long negatives weekly by itself.
 - **Change.** Rows hold `{name, fault, clear, expect_open, open_within_s, expect_close, close_within_s, forbid}`. Each scenario runs in its own `unshare` process; scenarios run in parallel. Every window is at least twice the expected time. The expected times below come from today's rules: the DNS p50 is a rolling median over the whole probe history (`diagnose/live.rs:629, 673`), so a slow phase must outnumber the healthy samples before it opens, and the close waits for healthy samples to outnumber the slow ones again.
 
   | Scenario | Fault | Asserted |
