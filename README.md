@@ -119,6 +119,8 @@ netwatch --view dense # four boxes, 130x44 or larger
 | [Packaging](docs/PACKAGING.md) | Every channel, and what updates it |
 | [Changelog](CHANGELOG.md) | Every release |
 
+Diagnose misread your network? [Open an issue](https://github.com/matthart1983/netwatch/issues/new?template=bug_report.md) with what you saw and the output of `netwatch diagnose run --format json`. It names your gateway and resolver addresses, so edit those out if you'd rather.
+
 ## Related
 
 [SysWatch](https://github.com/matthart1983/syswatch) and [DiskWatch](https://github.com/matthart1983/diskwatch) share the chrome. [ESSH](https://github.com/matthart1983/essh) is a Rust SSH client with the same look. [NetWatch Cloud](https://www.netwatchlabs.com) is hosted fleet monitoring built on the MIT [agent](https://github.com/matthart1983/netwatch-agent), [SDK](https://github.com/matthart1983/netwatch-sdk) and [dashboard](https://github.com/matthart1983/netwatch-dashboard).
