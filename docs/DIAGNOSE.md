@@ -383,10 +383,11 @@ listed under which, which close once it clears, and which must never appear.
 The scenarios are rows of data in `health_lab.py`, each window at least twice
 what today's rules should take, so a change to a rule's timing changes a row.
 `--long` runs the negatives too slow for every change, such as 20 minutes of
-1% resolver loss that must never open `dns.failing`. CI runs `--quick` on pull
-requests that touch Diagnose, the health prober or the lab, and `--long` once
-a week. The faults are netem qdiscs, so `tc` needs `sch_netem`, `sch_prio` and
-`cls_u32` available.
+1% resolver loss that must never open `dns.failing`. CI runs `--quick` on every
+push to `main` and on pull requests that touch Diagnose, the health prober or
+the lab, as a `ci.yml` job, so the release guard holds a tag until it passes;
+`--long` runs once a week. The faults are netem qdiscs, so `tc` needs
+`sch_netem`, `sch_prio` and `cls_u32` available.
 
 The workstation soak records actual observed seconds, stalls, worker count,
 resident memory and state size. Its duration is a bounded stability check, not a

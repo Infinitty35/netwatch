@@ -123,3 +123,42 @@ jobs:
           name: diagnose-fault-lab
           path: fault-lab.json
           if-no-files-found: warn
+
+  # Decision D6 runs the health lab's --quick on pull requests that touch what
+  # it tests. A push to main or a manual run always runs it, so the commit a
+  # release is tagged on has a result, and the release guard, which waits on
+  # every ci.yml run on that commit, holds the tag until the lab passes. It is
+  # a job here rather than a path filter in health-lab.yml for that reason.
+  health-lab-scope:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      # A pull request checks out its merge commit, whose first parent is the
+      # base, so the diff against that parent is the pull request's change.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # The file list goes through a variable: under pipefail, grep -q
+      # closing a pipe early would fail `git diff` and read as no match.
+      - name: Decide whether the change touches the health lab
+        id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          run=true
+          if [ "${EVENT}" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            grep -qE '^(src/diagnose/|src/collectors/health\.rs$|tests/diagnose/|examples/diagnose_lab\.rs$|\.github/workflows/(ci|health-lab)\.yml$)' \
+              <<< "${changed}" || run=false
+          fi
+          echo "run=${run}" | tee -a "${GITHUB_OUTPUT}"
+
+  diagnose-health-lab:
+    needs: health-lab-scope
+    if: needs.health-lab-scope.outputs.run == 'true'
+    uses: ./.github/workflows/health-lab.yml
+    with:
+      set: quick

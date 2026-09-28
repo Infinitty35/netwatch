@@ -1,29 +1,18 @@
 name: Health lab
 
 # The Diagnose health lab (tests/diagnose/health_lab.py) runs the real
-# App::tick (examples/diagnose_lab) against a peer namespace that owns 1.1.1.1
-# and a bind-mounted resolv.conf, stages faults on purpose and asserts what the
-# engine opens and closes, and when. Decision D6 scopes it: --quick on pull
-# requests that touch Diagnose, the health prober or the lab itself, and the
-# long negatives once a week. Pushes to main run --quick as well, so the commit
-# a release is tagged on has a result of its own.
+# App::tick (examples/diagnose_lab) inside namespaces where a peer owns
+# 1.1.1.1 and resolv.conf names the lab's own resolver, stages faults on
+# purpose and asserts what the engine opens and closes, and when. ci.yml calls
+# this workflow for --quick, so the release guard, which waits on every ci.yml
+# run on the tagged commit, holds a tag until the lab passes. On its own it
+# runs the long negatives once a week (decision D6), or either set by hand.
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/diagnose/**'
-      - 'src/collectors/health.rs'
-      - 'tests/diagnose/**'
-      - 'examples/diagnose_lab.rs'
-      - '.github/workflows/health-lab.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'src/diagnose/**'
-      - 'src/collectors/health.rs'
-      - 'tests/diagnose/**'
-      - 'examples/diagnose_lab.rs'
-      - '.github/workflows/health-lab.yml'
+  workflow_call:
+    inputs:
+      set:
+        type: string
+        default: quick
   schedule:
     - cron: '30 4 * * 1'
   workflow_dispatch:
@@ -44,7 +33,8 @@ jobs:
     # default; the lab's own deadlines should fire long before this.
     timeout-minutes: 45
     env:
-      SET: ${{ (github.event_name == 'schedule' || inputs.set == 'long') && 'long' || 'quick' }}
+      # A schedule has no inputs, and it runs the long negatives.
+      SET: ${{ inputs.set || 'long' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
