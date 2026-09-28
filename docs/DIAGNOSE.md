@@ -380,6 +380,8 @@ episodes it recorded. A scenario stages one fault — a slow, dead or lossy
 resolver, total loss or ICMP delay toward the gateway, delay beyond it, or a
 healthy 1 ms link — and asserts which rules open within how long, which are
 listed under which, which close once it clears, and which must never appear.
+A scenario that expects nothing to open also fails if a rule it forbids lost
+its input during the fault, since a rule without input cannot open.
 The scenarios are rows of data in `health_lab.py`, each window at least twice
 what today's rules should take, so a change to a rule's timing changes a row.
 `--long` runs the negatives too slow for every change, such as 20 minutes of
