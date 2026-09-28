@@ -1663,7 +1663,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 }],
             ),
         ];
-        d.remediation = dns_remediation(dns);
+        d.remediation = dns_remediation(dns, None);
         out.push(d);
         // A resolver that is failing outright makes its latency uninteresting.
         return out;
@@ -2080,7 +2080,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         ),
     ];
 
-    d.remediation = dns_remediation(dns);
+    d.remediation = dns_remediation(dns, Some(p50));
     d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
     d.scope = Scope {
         configuration: None,
@@ -2096,20 +2096,29 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out
 }
 
-fn dns_remediation(dns: &DnsObs) -> Vec<Step> {
+/// Steps for a failing or slow resolver. A switch is proposed only to an
+/// alternate that was measured: for a slow resolver, one that answered in
+/// under a quarter of `slow_p50`, the line `alt_resolver_is_fast` passes on;
+/// for a failing one (`None`), answering at all is the case for it. Live, no
+/// alternate is timed until A11 keeps the reference resolver's RTT, so today
+/// the step appears only in the demo, which simulates it.
+fn dns_remediation(dns: &DnsObs, slow_p50: Option<f64>) -> Vec<Step> {
     let mut steps = Vec::new();
-    if let Some(alt) = &dns.alt_resolver {
-        let detail = match dns.alt_rtt_ms {
-            Some(rtt) => format!(
-                "writes resolv.conf, keeps a backup, and puts it back on quit \
-                 (measured {rtt:.1}ms during the check)"
-            ),
-            None => "writes resolv.conf, keeps a backup, and puts it back on quit".to_string(),
-        };
+    let measured = match (&dns.alt_resolver, dns.alt_rtt_ms) {
+        (Some(alt), Some(rtt)) if slow_p50.is_none_or(|p50| rtt < p50 / 4.0) => Some((alt, rtt)),
+        _ => None,
+    };
+    if let Some((alt, rtt)) = measured {
+        // The live `↵` writes nothing, so the text says what to run instead
+        // of promising an edit netwatch will not make.
         steps.push(Step::apply(
             '1',
             format!("switch this session's resolver to {alt}"),
-            detail,
+            format!(
+                "{alt} answered in {rtt:.1}ms during the check; netwatch does not change \
+                 resolvers from this screen; run: sudo netwatch resolver set {alt} --unmanaged \
+                 (unmanaged resolv.conf only), or resolvectl dns <iface> {alt}"
+            ),
             Action::SetResolver { addr: alt.clone() },
             Capability::Root,
         ));
@@ -4395,6 +4404,151 @@ mod tests {
             }
         }
         assert!(applies > 0, "the dns rule should offer something to apply");
+    }
+
+    /// The string literals in `src`, skipping comments and char literals, so
+    /// a word in a comment is not mistaken for text a user reads.
+    fn string_literals(src: &str) -> Vec<&str> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    out.push(&src[start..i.min(b.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// The live `↵` writes nothing, so no step may say netwatch writes, backs
+    /// up or restores anything. Read from the source, so a step on a branch
+    /// no test reaches is held to it as well, and from what the DNS rule
+    /// emits with and without a measured alternate.
+    #[test]
+    fn no_step_text_promises_a_write() {
+        const PROMISES: [&str; 3] = ["writes", "backup", "puts it back"];
+        let src = include_str!("detectors.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let literals = string_literals(body);
+        assert!(
+            literals.len() > 300,
+            "found only {} literals; did the scan break?",
+            literals.len()
+        );
+        for lit in &literals {
+            let lower = lit.to_lowercase();
+            for promise in PROMISES {
+                assert!(!lower.contains(promise), "{lit:?} promises a write");
+            }
+        }
+
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        for alt_rtt_ms in [Some(1.4), Some(38.0), None] {
+            let dns = DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            };
+            for d in detect(&obs_with_dns(dns), &base, &Thresholds::default()) {
+                for s in &d.remediation {
+                    let text = format!("{} {}", s.text, s.detail).to_lowercase();
+                    for promise in PROMISES {
+                        assert!(!text.contains(promise), "{}: {text}", d.rule);
+                    }
+                }
+            }
+        }
+    }
+
+    /// REVIEW §2.4: propose a resolver only after measuring it. Live, the
+    /// second configured resolver is never timed, so the switch used to be
+    /// offered on nothing but its presence in resolv.conf.
+    #[test]
+    fn no_switch_step_without_a_measured_alternate() {
+        use super::super::issue::StepKind;
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let steps = |dns: DnsObs| -> Vec<Step> {
+            detect(&obs_with_dns(dns), &base, &Thresholds::default())
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+                .expect("a 40ms resolver against a 1.2ms baseline is slow")
+                .remediation
+        };
+        let offers_switch = |steps: &[Step]| {
+            steps
+                .iter()
+                .any(|s| s.kind == StepKind::Apply || s.text == "make it permanent")
+        };
+
+        // Live today: configured, never timed.
+        let unmeasured = steps(DnsObs {
+            alt_rtt_ms: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&unmeasured), "{unmeasured:?}");
+        // Timed, but no faster than a quarter of the 40ms median.
+        let slow = steps(DnsObs {
+            alt_rtt_ms: Some(10.0),
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&slow), "{slow:?}");
+        let none = steps(DnsObs {
+            alt_resolver: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&none), "{none:?}");
+
+        // The demo's alternate: 1.4ms against 40ms. Offered, with the command
+        // to run and the number that justified it.
+        let fast = steps(slow_dns());
+        let switch = fast
+            .iter()
+            .find(|s| s.kind == StepKind::Apply)
+            .expect("a measured fast alternate is proposed");
+        for want in [
+            "192.168.8.1 answered in 1.4ms",
+            "netwatch does not change resolvers from this screen",
+            "sudo netwatch resolver set 192.168.8.1 --unmanaged",
+            "resolvectl dns <iface> 192.168.8.1",
+        ] {
+            assert!(switch.detail.contains(want), "{want}: {}", switch.detail);
+        }
+
+        // A failing resolver has no speed to beat: an alternate that answered
+        // at all is the case for it, and one never asked is none.
+        let failing = |alt_rtt_ms| {
+            detect(
+                &obs_with_dns(DnsObs {
+                    failure_rate_pct: 40.0,
+                    alt_rtt_ms,
+                    ..slow_dns()
+                }),
+                &base,
+                &Thresholds::default(),
+            )
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("40% of queries failing")
+            .remediation
+        };
+        assert!(!offers_switch(&failing(None)));
+        assert!(offers_switch(&failing(Some(30.0))));
     }
 
     #[test]
