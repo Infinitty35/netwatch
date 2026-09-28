@@ -30,7 +30,7 @@ addresses, sysctls and qdiscs all live in namespaces that end with the run.
 Requires ip, tc (with sch_netem, sch_prio and cls_u32 loadable), nsenter,
 unshare and mount.
 """
-import argparse, json, os, pathlib, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
+import argparse, json, os, pathlib, re, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / 'target/debug/examples/diagnose_lab'
@@ -507,18 +507,31 @@ def is_open(row, rule):
     return any(i['rule'] == rule and i['state'] in OPEN for i in row['issues'])
 
 
+def catalogue():
+    """Every rule id the engine has, from docs/diagnostic-coverage.md: the
+    catalogue as rules.rs renders it, which a test keeps in step."""
+    text = (ROOT / 'docs/diagnostic-coverage.md').read_text()
+    rules = re.findall(r'^(?:### |\| )`([a-z0-9_]+\.[a-z0-9_]+)`', text, re.M)
+    count = int(re.search(r'contains \*\*(\d+) rules\*\*', text).group(1))
+    assert len(set(rules)) == len(rules) == count, (count, rules)
+    return rules
+
+
 def check_table(scenarios):
     """The table's own rules, checked before anything runs: a window narrower
     than twice what the rule should take is a flake waiting to happen, and a
-    misspelt rule would pass by never opening or never being forbidden."""
+    misspelt rule would pass by never opening or never being forbidden. Any
+    rule in the catalogue can be named, not only the core ones."""
+    rules = catalogue()
+    assert set(CORE_RULES) <= set(rules), CORE_RULES
     names = [s['name'] for s in scenarios]
     assert len(set(names)) == len(names), names
     for s in scenarios:
         name, opens = s['name'], [e['rule'] for e in s['expect_open']]
         for rule in opens + s['expect_close'] + [e['suppressed_by'] for e in s['expect_open']
                                                  if 'suppressed_by' in e]:
-            assert rule in CORE_RULES, (name, rule)
-        assert all(r == '*' or r in CORE_RULES for r in s['forbid']), (name, s['forbid'])
+            assert rule in rules, (name, rule)
+        assert all(r == '*' or r in rules for r in s['forbid']), (name, s['forbid'])
         assert not set(opens) & set(s['forbid']) and not ('*' in s['forbid'] and opens), name
         assert set(s['expect_close']) <= set(opens), (name, 'a close needs its open')
         for e in s['expect_open']:
