@@ -94,6 +94,13 @@ readers and can be interrupted; the journal preserves recovery evidence. Unexpec
 process exit/power loss may require the explicit recover command. Hardware
 power-loss guarantees remain bounded by the [store contract](recovery-store.md).
 
+Writes stay in place (decision X02, September 2026). Writing a temporary file and
+renaming it over the target would give the target a new inode, which verification
+compares and recovery refuses as a changed identity. An interrupted in-place write
+already leaves recovery-required evidence that blocks further operations until
+`recover` runs. The TUI's older file-edit and make-permanent journal helpers had
+no caller and were deleted rather than converted.
+
 ## Validation
 
 Linux tests use disposable resolver files only. They cover temporary apply/restore,

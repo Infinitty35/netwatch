@@ -113,6 +113,13 @@ impl<'a> View<'a> {
             .get(self.selected.min(primary.len().saturating_sub(1)))
             .copied()
     }
+
+    /// Replaying the recorded scenario, where an apply step is simulated.
+    /// Live, netwatch changes nothing from this screen, so nothing offers a
+    /// key that would.
+    fn is_demo(&self) -> bool {
+        self.demo_banner.is_some()
+    }
 }
 
 /// Recent samples behind the selected issue's headline metric.
@@ -544,7 +551,7 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
     }
     if view
         .current()
-        .map(|i| has_applicable_step(i, view.capability))
+        .map(|i| has_applicable_step(i, view.capability, view.is_demo()))
         .unwrap_or(false)
     {
         hints.push(hint("↵", "apply fix"));
@@ -583,13 +590,16 @@ pub fn footer_hints(view: &View) -> Vec<crate::ui::widgets::Hint> {
 
 /// Whether `↵` would do anything on this issue.
 ///
+/// Only in the demo, which simulates the step: live, `↵` writes nothing and
+/// says so, so offering it was a key hint for a key that does nothing. The
+/// full apply handoff is C19b.
+///
 /// A step netwatch has already run is not applicable — the screen shows
 /// `applied 06:51:56 · 169.254.1.1 → 192.168.8.1` right next to a footer still
-/// offering to apply it, which is the same defect as a key hint for a key that
-/// does nothing. A step that was applied and then reverted is applicable
-/// again.
-fn has_applicable_step(issue: &Issue, cap: Capability) -> bool {
-    issue.remediation.iter().any(|s| {
+/// offering to apply it, which is the same defect. A step that was applied
+/// and then reverted is applicable again.
+fn has_applicable_step(issue: &Issue, cap: Capability, demo: bool) -> bool {
+    demo && issue.remediation.iter().any(|s| {
         s.kind == StepKind::Apply
             && s.available(cap)
             && !matches!(
@@ -649,10 +659,15 @@ fn severity_color(sev: Severity, t: &Theme) -> Color {
 }
 
 fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
-    let t = view.theme;
-    let verdict = view.engine.verdict(view.baselines);
+    let spans = verdict_spans(view.engine, view.baselines, view.theme);
+    f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
+}
 
-    let coverage = view.engine.coverage();
+/// The verdict row: a glyph, then the words.
+fn verdict_spans(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> Vec<Span<'static>> {
+    let verdict = engine.verdict(baselines);
+
+    let coverage = engine.coverage();
     // "rules", not "checks": a check is one line of evidence inside a cause,
     // and the coverage object counts catalogue rules. Two different numbers
     // under one word made the generated coverage document read as though it
@@ -666,22 +681,34 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
             .count(),
         coverage.rules.len()
     );
-    let spans: Vec<Span> = match &verdict {
+    match &verdict {
         // "Nothing found", never "healthy": the clause after it says how much
-        // of the ruleset that is based on.
-        Verdict::Clear | Verdict::Incomplete { .. } => vec![
+        // of the ruleset that is based on. The engine never returns Clear
+        // until green is earned (C14); this arm is what it will draw then.
+        Verdict::Clear => vec![
             Span::styled("● ", Style::default().fg(t.status_good)),
             Span::styled("no issues found", Style::default().fg(t.text_primary)),
             Span::styled(format!(" · {watching}"), Style::default().fg(t.text_muted)),
         ],
+        // Ready baselines and an empty list are not health: the engine
+        // returns this, never Clear, until C14 says which rules must have
+        // had input. Muted, like Learning, because the module's rule is that
+        // nothing is green unless it is healthy.
+        Verdict::Incomplete { .. } => vec![
+            Span::styled("◌ ", Style::default().fg(t.text_muted)),
+            Span::styled(
+                format!("no issues found · {watching}"),
+                Style::default().fg(t.text_muted),
+            ),
+        ],
         // A host that hasn't learned its network yet says so, rather than
         // rendering the reassuring green it hasn't earned.
         Verdict::Learning { .. } => {
-            let readiness = view.baselines.overall_readiness();
-            let learning = if view.baselines.switched_network() {
+            let readiness = baselines.overall_readiness();
+            let learning = if baselines.switched_network() {
                 format!(
                     "new network {} · baselines {}",
-                    view.baselines.fingerprint().label(),
+                    baselines.fingerprint().label(),
                     readiness.label()
                 )
             } else {
@@ -720,9 +747,20 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
                 Span::styled(headline.clone(), Style::default().fg(t.text_primary)),
             ]
         }
-    };
+    }
+}
 
-    f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
+/// The verdict row's words, without its glyph: what `y` copies, so a pasted
+/// summary says what the screen says. It used to copy `Verdict::line()`,
+/// which words the same state differently ("no visible findings").
+pub fn verdict_words(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> String {
+    verdict_spans(engine, baselines, t)
+        .iter()
+        .skip(1)
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn inset(area: Rect) -> Rect {
@@ -1418,7 +1456,9 @@ fn render_detail(f: &mut Frame, view: &View, area: Rect) {
         for step in &steps {
             let mut row = Vec::new();
             match (step.kind, step.key) {
-                (StepKind::Apply, Some(k)) => row.push(Span::styled(
+                // A key hint only where the step can run: live, the step
+                // carries the command to type instead.
+                (StepKind::Apply, Some(k)) if view.is_demo() => row.push(Span::styled(
                     format!("{k} "),
                     Style::default().fg(t.key_hint).bold(),
                 )),
@@ -1876,9 +1916,52 @@ mod tests {
 
     #[test]
     fn a_privileged_run_offers_the_key_bound_fix() {
-        let s = draw(150, 44, |v| v.capability = Capability::Root);
-        assert!(s.contains("switch this session's resolver"), "{s}");
+        // The demo, which simulates the switch; live mode offers no key.
+        let s = draw(150, 44, |v| {
+            v.capability = Capability::Root;
+            v.demo_banner = Some("DEMO".into());
+        });
+        assert!(s.contains("1 switch this session's resolver"), "{s}");
         assert!(!s.contains("hidden:"), "{s}");
+    }
+
+    /// Live, `↵` writes nothing, so neither the footer nor the step offers a
+    /// key: the step says what to run instead. Running as root with the
+    /// resolver issue open is the case the hint used to lie about.
+    #[test]
+    fn live_mode_offers_no_enter() {
+        let (engine, baselines) = fixture::run();
+        let theme = crate::theme::by_name("default");
+        let dns = engine
+            .primary()
+            .iter()
+            .position(|i| i.rule == "dns.slow_resolver")
+            .expect("the fixture opens the resolver issue");
+        let mut view = View {
+            engine: &engine,
+            baselines: &baselines,
+            theme: &theme,
+            selected: dns,
+            show_report: false,
+            capability: Capability::Root,
+            ai: None,
+            endpoint: "local".to_string(),
+            status: None,
+            demo_banner: None,
+            running_tests: vec![],
+            history: None,
+        };
+        let keys = |view: &View| -> Vec<String> {
+            footer_hints(view).into_iter().map(|(key, _)| key).collect()
+        };
+        assert!(!keys(&view).contains(&"↵".to_string()), "{:?}", keys(&view));
+        let s = draw(150, 44, |v| v.selected = dns);
+        assert!(s.contains("· switch this session's resolver"), "{s}");
+        assert!(!s.contains("1 switch this session's resolver"), "{s}");
+        assert!(s.contains("netwatch does not change resolvers"), "{s}");
+
+        view.demo_banner = Some("DEMO".into());
+        assert!(keys(&view).contains(&"↵".to_string()), "{:?}", keys(&view));
     }
 
     #[test]
@@ -1958,6 +2041,55 @@ mod tests {
         let severity = severity_color(issue.severity, &theme);
         assert_eq!(spans[0].style.fg, Some(theme.text_muted), "below threshold");
         assert_eq!(spans[3].style.fg, Some(severity), "above threshold");
+    }
+
+    /// With learned baselines and nothing open the engine says Incomplete,
+    /// never Clear, and the row drew that as the green ● of health.
+    #[test]
+    fn incomplete_never_draws_status_good_in_the_verdict_row() {
+        use crate::diagnose::engine::{Engine, SystemClock};
+
+        let engine = Engine::new(Box::new(SystemClock));
+        let baselines = fixture::baselines();
+        assert!(matches!(
+            engine.verdict(&baselines),
+            Verdict::Incomplete { .. }
+        ));
+        for name in crate::theme::THEME_NAMES {
+            let theme = crate::theme::by_name(name);
+            let view = View {
+                engine: &engine,
+                baselines: &baselines,
+                theme: &theme,
+                selected: 0,
+                show_report: false,
+                capability: Capability::Root,
+                ai: None,
+                endpoint: "local".to_string(),
+                status: None,
+                demo_banner: None,
+                running_tests: vec![],
+                history: None,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.get(x, 0).symbol())
+                .collect();
+            assert!(
+                row.contains("◌ no issues found · watching"),
+                "{name}: {row}"
+            );
+            for x in 0..buf.area.width {
+                let cell = buf.get(x, 0);
+                assert!(
+                    cell.symbol() == " " || cell.fg != theme.status_good,
+                    "{name}: green {:?} at column {x} of {row}",
+                    cell.symbol()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2210,7 +2342,7 @@ mod tests {
             .clone();
 
         assert!(
-            has_applicable_step(&issue, Capability::Root),
+            has_applicable_step(&issue, Capability::Root, true),
             "before the apply, ↵ does something"
         );
 
@@ -2225,7 +2357,7 @@ mod tests {
             }
         }
         assert!(
-            !has_applicable_step(&applied, Capability::Root),
+            !has_applicable_step(&applied, Capability::Root, true),
             "after the apply, ↵ has nothing left to do"
         );
 
@@ -2239,7 +2371,7 @@ mod tests {
                 });
             }
         }
-        assert!(has_applicable_step(&reverted, Capability::Root));
+        assert!(has_applicable_step(&reverted, Capability::Root, true));
     }
 
     #[test]
@@ -2260,7 +2392,7 @@ mod tests {
                 });
             }
         }
-        assert!(!has_applicable_step(&issue, Capability::Root));
+        assert!(!has_applicable_step(&issue, Capability::Root, true));
     }
 
     #[test]

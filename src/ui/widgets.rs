@@ -577,12 +577,16 @@ pub fn build_verdict_line(app: &App) -> Line<'static> {
     // Nothing open: a status, not a coverage breakdown. The counts live on
     // the Diagnose tab, one keypress away, and are noise on every other tab.
     match &verdict {
-        crate::diagnose::Verdict::Clear | crate::diagnose::Verdict::Incomplete { .. } => {
-            with_demo(vec![
-                Span::styled(" ● ", Style::default().fg(t.status_good)),
-                Span::styled("no issues", Style::default().fg(t.text_muted)),
-            ])
-        }
+        crate::diagnose::Verdict::Clear => with_demo(vec![
+            Span::styled(" ● ", Style::default().fg(t.status_good)),
+            Span::styled("no issues", Style::default().fg(t.text_muted)),
+        ]),
+        // What the engine returns with ready baselines and nothing open until
+        // green is earned (C14). Not green, on every tab.
+        crate::diagnose::Verdict::Incomplete { .. } => with_demo(vec![Span::styled(
+            " ◌ no issues",
+            Style::default().fg(t.text_muted),
+        )]),
         // Not green: still learning is an absence of information, not health.
         crate::diagnose::Verdict::Learning { .. } => with_demo(vec![Span::styled(
             " ◌ no issues · learning",
@@ -1508,6 +1512,38 @@ mod tests {
                 tabs[i],
                 tabs[i - 1]
             );
+        }
+    }
+
+    /// The engine never returns Clear, so a quiet host with learned
+    /// baselines is Incomplete — and the header drew that as the same green
+    /// ● it would give a healthy one, on every tab.
+    #[test]
+    fn the_header_never_draws_incomplete_green() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.diagnose.baselines = crate::diagnose::fixture::baselines();
+        assert!(matches!(
+            app.diagnose.engine.verdict(&app.diagnose.baselines),
+            crate::diagnose::Verdict::Incomplete { .. }
+        ));
+        for name in crate::theme::THEME_NAMES {
+            app.theme = crate::theme::by_name(name);
+            let mut terminal = Terminal::new(TestBackend::new(160, 3)).unwrap();
+            terminal.draw(|f| render_header(f, &app, f.size())).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.get(x, 1).symbol())
+                .collect();
+            assert!(row.contains("◌ no issues"), "{name}: {row}");
+            for x in 0..buf.area.width {
+                let cell = buf.get(x, 1);
+                assert!(
+                    cell.symbol() == " " || cell.fg != app.theme.status_good,
+                    "{name}: green {:?} at column {x} of {row}",
+                    cell.symbol()
+                );
+            }
         }
     }
 }

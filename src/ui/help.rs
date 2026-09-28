@@ -403,7 +403,7 @@ fn build_help_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines.push(key_line(
         theme,
         "↵",
-        "Apply the first remediation netwatch can perform (asks first)",
+        "--demo: simulate the first remediation (asks first); live, run the command shown",
     ));
     lines.push(key_line(
         theme,

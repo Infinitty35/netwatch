@@ -295,6 +295,18 @@ pub struct DnsObs {
     pub cross: Option<DnsCross>,
 }
 
+impl DnsObs {
+    /// The configured resolver is a stub on this host, such as
+    /// systemd-resolved's 127.0.0.53. The probe asks root NS, which the stub
+    /// answers from its cache, so what it times is the stub's round trip,
+    /// not the upstream the stub forwards to.
+    pub fn is_local_stub(&self) -> bool {
+        self.resolver
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
 /// A public name asked of the configured resolver and of a validating
 /// reference, and whether they agreed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1606,6 +1618,9 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
 
 // ----------------------------------------------------------------- dns
 
+/// Why a check about the resolver's upstream did not run behind a local stub.
+const UPSTREAM_UNKNOWN: &str = "the upstream behind the stub is not identified";
+
 fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let Some(dns) = &obs.dns else {
         return vec![];
@@ -1663,7 +1678,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                 }],
             ),
         ];
-        d.remediation = dns_remediation(dns);
+        d.remediation = dns_remediation(dns, None);
         out.push(d);
         // A resolver that is failing outright makes its latency uninteresting.
         return out;
@@ -1901,8 +1916,17 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     }
 
     let alt_fast = matches!(dns.alt_rtt_ms, Some(a) if a < p50 / 4.0);
-    let icmp_normal = dns.icmp_rtt_ms.map(|r| r < 10.0);
-    let cached_fast = matches!(dns.cached_rtt_ms, Some(c) if c < p50 / 4.0);
+    // Behind a local stub, ICMP to the resolver and its cached answers say
+    // nothing about the upstream these checks are about: loopback always
+    // answers, and the probe's own root-NS answer is a cache hit.
+    let stub = dns.is_local_stub();
+    let (icmp_rtt_ms, cached_rtt_ms) = if stub {
+        (None, None)
+    } else {
+        (dns.icmp_rtt_ms, dns.cached_rtt_ms)
+    };
+    let icmp_normal = icmp_rtt_ms.map(|r| r < 10.0);
+    let cached_fast = matches!(cached_rtt_ms, Some(c) if c < p50 / 4.0);
 
     d.causes = vec![
         Cause::new(
@@ -1930,7 +1954,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                     )
                     .weighted(2.0),
                 },
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(true), Some(rtt)) => CheckResult::pass(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
@@ -1941,6 +1965,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms is slow too"),
                     ),
+                    _ if stub => CheckResult::not_run(
+                        "resolver_itself_is_reachable",
+                        "resolver itself is reachable",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
+                    ),
                     _ => CheckResult::not_run(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
@@ -1948,7 +1978,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "no icmp probe",
                     ),
                 },
-                match (cached_fast, dns.cached_rtt_ms) {
+                match (cached_fast, cached_rtt_ms) {
                     (true, Some(c)) => CheckResult::pass(
                         "cached_names_still_fast",
                         "cached names still fast",
@@ -1958,6 +1988,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "cached_names_still_fast",
                         "cached names still fast",
                         format!("even cache hits take {c:.1}ms"),
+                    ),
+                    _ if stub => CheckResult::not_run(
+                        "cached_names_still_fast",
+                        "cached names still fast",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
                     ),
                     _ => CheckResult::not_run(
                         "cached_names_still_fast",
@@ -1972,7 +2008,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             "resolver_overloaded",
             "the resolver is overloaded",
             vec![
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(false), Some(rtt)) => CheckResult::pass(
                         "icmp_rtt_raised",
                         "icmp rtt raised",
@@ -1982,6 +2018,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "icmp_rtt_raised",
                         "icmp rtt raised",
                         format!("icmp is normal at {rtt:.1}ms"),
+                    ),
+                    _ if stub => CheckResult::not_run(
+                        "icmp_rtt_raised",
+                        "icmp rtt raised",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
                     ),
                     _ => CheckResult::not_run(
                         "icmp_rtt_raised",
@@ -2080,7 +2122,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         ),
     ];
 
-    d.remediation = dns_remediation(dns);
+    d.remediation = dns_remediation(dns, Some(p50));
     d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
     d.scope = Scope {
         configuration: None,
@@ -2090,26 +2132,43 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         via_iface: None,
         processes_measured: false,
         via_resolver: Some(dns.resolver.clone()),
-        note: Some("every new connection pays this before it can start".into()),
+        note: Some(if stub {
+            format!(
+                "every new connection pays this before it can start · the probe asks root NS; \
+                 the local stub at {} answers from cache, so this is the stub's round trip",
+                dns.resolver
+            )
+        } else {
+            "every new connection pays this before it can start".into()
+        }),
     };
     out.push(d);
     out
 }
 
-fn dns_remediation(dns: &DnsObs) -> Vec<Step> {
+/// Steps for a failing or slow resolver. A switch is proposed only to an
+/// alternate that was measured: for a slow resolver, one that answered in
+/// under a quarter of `slow_p50`, the line `alt_resolver_is_fast` passes on;
+/// for a failing one (`None`), answering at all is the case for it. Live, no
+/// alternate is timed until A11 keeps the reference resolver's RTT, so today
+/// the step appears only in the demo, which simulates it.
+fn dns_remediation(dns: &DnsObs, slow_p50: Option<f64>) -> Vec<Step> {
     let mut steps = Vec::new();
-    if let Some(alt) = &dns.alt_resolver {
-        let detail = match dns.alt_rtt_ms {
-            Some(rtt) => format!(
-                "writes resolv.conf, keeps a backup, and puts it back on quit \
-                 (measured {rtt:.1}ms during the check)"
-            ),
-            None => "writes resolv.conf, keeps a backup, and puts it back on quit".to_string(),
-        };
+    let measured = match (&dns.alt_resolver, dns.alt_rtt_ms) {
+        (Some(alt), Some(rtt)) if slow_p50.is_none_or(|p50| rtt < p50 / 4.0) => Some((alt, rtt)),
+        _ => None,
+    };
+    if let Some((alt, rtt)) = measured {
+        // The live `↵` writes nothing, so the text says what to run instead
+        // of promising an edit netwatch will not make.
         steps.push(Step::apply(
             '1',
             format!("switch this session's resolver to {alt}"),
-            detail,
+            format!(
+                "{alt} answered in {rtt:.1}ms during the check; netwatch does not change \
+                 resolvers from this screen; run: sudo netwatch resolver set {alt} --unmanaged \
+                 (unmanaged resolv.conf only), or resolvectl dns <iface> {alt}"
+            ),
             Action::SetResolver { addr: alt.clone() },
             Capability::Root,
         ));
@@ -4395,6 +4454,259 @@ mod tests {
             }
         }
         assert!(applies > 0, "the dns rule should offer something to apply");
+    }
+
+    /// The string literals in `src`, skipping comments and char literals, so
+    /// a word in a comment is not mistaken for text a user reads.
+    fn string_literals(src: &str) -> Vec<&str> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    out.push(&src[start..i.min(b.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// The live `↵` writes nothing, so no step may say netwatch writes, backs
+    /// up or restores anything. Read from the source, so a step on a branch
+    /// no test reaches is held to it as well, and from what the DNS rule
+    /// emits with and without a measured alternate.
+    #[test]
+    fn no_step_text_promises_a_write() {
+        const PROMISES: [&str; 3] = ["writes", "backup", "puts it back"];
+        let src = include_str!("detectors.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let literals = string_literals(body);
+        assert!(
+            literals.len() > 300,
+            "found only {} literals; did the scan break?",
+            literals.len()
+        );
+        for lit in &literals {
+            let lower = lit.to_lowercase();
+            for promise in PROMISES {
+                assert!(!lower.contains(promise), "{lit:?} promises a write");
+            }
+        }
+
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        for alt_rtt_ms in [Some(1.4), Some(38.0), None] {
+            let dns = DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            };
+            for d in detect(&obs_with_dns(dns), &base, &Thresholds::default()) {
+                for s in &d.remediation {
+                    let text = format!("{} {}", s.text, s.detail).to_lowercase();
+                    for promise in PROMISES {
+                        assert!(!text.contains(promise), "{}: {text}", d.rule);
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a systemd-resolved host the probe asks 127.0.0.53 for root NS, which
+    /// the stub answers from its cache in 0 ms. Coverage keeps the rule
+    /// available, since the stub's RTT is measured, and says what it times;
+    /// a finding says so in its scope; the checks about the upstream abstain
+    /// instead of reading loopback ICMP and the stub's cache as the upstream.
+    #[test]
+    fn a_loopback_resolver_says_it_measures_the_stub() {
+        use crate::diagnose::coverage::{Availability as A, Coverage};
+        for (addr, stub) in [
+            ("127.0.0.53", true),
+            ("127.0.0.54", true),
+            ("::1", true),
+            ("169.254.1.1", false),
+            ("192.168.8.1", false),
+            ("fe80::1%eth0", false),
+        ] {
+            let dns = DnsObs {
+                resolver: addr.into(),
+                ..slow_dns()
+            };
+            assert_eq!(dns.is_local_stub(), stub, "{addr}");
+        }
+
+        let coverage_of = |dns: DnsObs| {
+            Coverage::from_observations(&obs_with_dns(dns), &store())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "dns.slow_resolver")
+                .unwrap()
+        };
+        // The Fedora host: healthy, 0 ms, nothing opens.
+        let quiet = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(0.0),
+            rtt_p95_ms: Some(0.1),
+            ..slow_dns()
+        };
+        let row = coverage_of(quiet.clone());
+        assert_eq!(row.status, A::Available);
+        assert_eq!(
+            row.reason,
+            "limited: measures the local stub at 127.0.0.53, not the upstream"
+        );
+        let found = detect(&obs_with_dns(quiet), &store(), &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"dns.slow_resolver"));
+        assert_ne!(
+            coverage_of(slow_dns()).reason,
+            row.reason,
+            "a resolver off the host is not a stub"
+        );
+
+        // A stub slow enough to cross the ceiling, with loopback ICMP and a
+        // cache probe that would otherwise read as the upstream's.
+        let slow_stub = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(150.0),
+            rtt_p95_ms: Some(180.0),
+            icmp_rtt_ms: Some(0.05),
+            cached_rtt_ms: Some(0.9),
+            ..slow_dns()
+        };
+        let found = detect(&obs_with_dns(slow_stub), &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("150ms is over the 100ms ceiling");
+        let note = d.scope.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains(
+                "the probe asks root NS; the local stub at 127.0.0.53 answers from cache, \
+                 so this is the stub's round trip"
+            ),
+            "{note}"
+        );
+        for id in [
+            "resolver_itself_is_reachable",
+            "cached_names_still_fast",
+            "icmp_rtt_raised",
+        ] {
+            let check = d
+                .causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .find(|k| k.id == id)
+                .unwrap();
+            assert_eq!(check.passed, None, "{id}: {check:?}");
+            assert_eq!(check.why_not, Some(A::NotMeasured), "{id}");
+            assert_eq!(check.detail, UPSTREAM_UNKNOWN, "{id}");
+        }
+
+        // Off the host, the same readings are the resolver's own.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(&obs_with_dns(slow_dns()), &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .unwrap();
+        assert!(!d.scope.note.as_deref().unwrap_or_default().contains("stub"));
+        let icmp = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "resolver_itself_is_reachable")
+            .unwrap();
+        assert_eq!(icmp.passed, Some(true));
+    }
+
+    /// REVIEW §2.4: propose a resolver only after measuring it. Live, the
+    /// second configured resolver is never timed, so the switch used to be
+    /// offered on nothing but its presence in resolv.conf.
+    #[test]
+    fn no_switch_step_without_a_measured_alternate() {
+        use super::super::issue::StepKind;
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let steps = |dns: DnsObs| -> Vec<Step> {
+            detect(&obs_with_dns(dns), &base, &Thresholds::default())
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+                .expect("a 40ms resolver against a 1.2ms baseline is slow")
+                .remediation
+        };
+        let offers_switch = |steps: &[Step]| {
+            steps
+                .iter()
+                .any(|s| s.kind == StepKind::Apply || s.text == "make it permanent")
+        };
+
+        // Live today: configured, never timed.
+        let unmeasured = steps(DnsObs {
+            alt_rtt_ms: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&unmeasured), "{unmeasured:?}");
+        // Timed, but no faster than a quarter of the 40ms median.
+        let slow = steps(DnsObs {
+            alt_rtt_ms: Some(10.0),
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&slow), "{slow:?}");
+        let none = steps(DnsObs {
+            alt_resolver: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&none), "{none:?}");
+
+        // The demo's alternate: 1.4ms against 40ms. Offered, with the command
+        // to run and the number that justified it.
+        let fast = steps(slow_dns());
+        let switch = fast
+            .iter()
+            .find(|s| s.kind == StepKind::Apply)
+            .expect("a measured fast alternate is proposed");
+        for want in [
+            "192.168.8.1 answered in 1.4ms",
+            "netwatch does not change resolvers from this screen",
+            "sudo netwatch resolver set 192.168.8.1 --unmanaged",
+            "resolvectl dns <iface> 192.168.8.1",
+        ] {
+            assert!(switch.detail.contains(want), "{want}: {}", switch.detail);
+        }
+
+        // A failing resolver has no speed to beat: an alternate that answered
+        // at all is the case for it, and one never asked is none.
+        let failing = |alt_rtt_ms| {
+            detect(
+                &obs_with_dns(DnsObs {
+                    failure_rate_pct: 40.0,
+                    alt_rtt_ms,
+                    ..slow_dns()
+                }),
+                &base,
+                &Thresholds::default(),
+            )
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("40% of queries failing")
+            .remediation
+        };
+        assert!(!offers_switch(&failing(None)));
+        assert!(offers_switch(&failing(Some(30.0))));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! and *not enough evidence*: a run that could not gather what it needed must
 //! never be read as a healthy host, which is why those are different exits.
 
+use crate::diagnose::detectors::Observations;
 use crate::diagnose::issue::{Availability, CheckResult, Issue};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,26 @@ pub fn outcome(issues: &[&Issue], evidence: bool) -> Outcome {
         Outcome::NoFinding
     } else {
         Outcome::Incomplete
+    }
+}
+
+/// Whether one sample gave the run something to conclude from.
+///
+/// Asked about one target, only that target's own probe counts: another
+/// target completing says nothing about this one. Otherwise a gateway or
+/// resolver observation counts, or any completed target probe. The sampler
+/// gives no gateway observation until a probe cycle measured loss, so a
+/// gateway that answers neither ICMP nor any TCP port is no evidence. The
+/// prober's completion stamp, which it sets after that cycle too, used to
+/// count, and such a host exited 0.
+fn evidence(observations: &Observations, target: Option<&str>) -> bool {
+    match target {
+        Some(name) => observations.targets.iter().any(|t| t.name == name),
+        None => {
+            observations.gateway.is_some()
+                || observations.dns.is_some()
+                || !observations.targets.is_empty()
+        }
     }
 }
 
@@ -189,12 +210,7 @@ fn run(opts: Options) -> anyhow::Result<Outcome> {
         let fingerprint = LiveSampler::fingerprint(&app);
         app.diagnose.baselines.set_network(fingerprint);
         let observations = sampler.sample(&app, &app.diagnose.engine.settings().thresholds);
-        saw_evidence |= match &opts.target {
-            // Asked about one target: only that target's own probe counts.
-            // Another target completing says nothing about this one.
-            Some(name) => observations.targets.iter().any(|t| &t.name == name),
-            None => sampler.completed.health.gateway.is_some() || !observations.targets.is_empty(),
-        };
+        saw_evidence |= evidence(&observations, opts.target.as_deref());
         app.diagnose.engine.observe_live_at(
             &observations,
             &app.diagnose.baselines,
@@ -300,6 +316,151 @@ mod tests {
         assert_eq!(outcome(&[], true), Outcome::NoFinding);
         assert_eq!(Outcome::Incomplete as i32, 2);
         assert_eq!(Outcome::NoFinding as i32, 0);
+    }
+
+    const GATEWAY: &str = "192.0.2.1";
+
+    /// The prober's status after `cycles` gateway probes, each an (rtt, loss)
+    /// pair recorded the way the probe thread records it: every cycle stamps
+    /// `completed.gateway`, and only a measured one joins the history.
+    fn after_gateway_cycles(
+        cycles: &[(Option<f64>, crate::collectors::health::Loss)],
+    ) -> crate::collectors::health::HealthStatus {
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        for &(rtt, loss) in cycles {
+            let completed = Instant::now();
+            status.gateway_rtt_ms = rtt;
+            status.gateway_loss = loss;
+            if loss.is_measured() {
+                status.completed.gateway_history.push_back(completed);
+                status.gateway_rtt_history.push_back(rtt);
+            }
+            status.completed.gateway = Some(completed);
+            status.completed.gateway_target = Some(GATEWAY.into());
+        }
+        status
+    }
+
+    /// One live sample on a host whose gateway is [`GATEWAY`] and which lists
+    /// no resolver, with `status` as the prober's latest.
+    fn sample_with(
+        status: crate::collectors::health::HealthStatus,
+    ) -> (crate::diagnose::live::LiveSampler, Observations) {
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.config_collector.config.gateway = Some(GATEWAY.into());
+        app.config_collector.config.dns_servers.clear();
+        app.health_prober.publish_for_test(status);
+        let mut sampler = crate::diagnose::live::LiveSampler::new();
+        let observations = sampler.sample(&app, &app.diagnose.engine.settings().thresholds);
+        (sampler, observations)
+    }
+
+    /// REVIEW §2.1: count gateway evidence only when loss is measured. A
+    /// gateway cycle that could send nothing ("icmp is blocked here and the
+    /// gateway answers no tcp port") still stamps the prober's completion
+    /// time, which the run used to count; it yields no gateway observation,
+    /// and with no resolver either the run has nothing to conclude from.
+    #[test]
+    fn an_unmeasured_gateway_is_not_evidence() {
+        use crate::collectors::health::Loss;
+        let unmeasured = (
+            None,
+            Loss::Unmeasured("icmp is blocked here and the gateway answers no tcp port"),
+        );
+        let measured = |rtt| (Some(rtt), Loss::Measured(0.0));
+        for (case, cycles) in [
+            ("never measured", vec![unmeasured]),
+            (
+                "measured before, not now",
+                vec![measured(0.9), measured(1.1), unmeasured],
+            ),
+        ] {
+            let (sampler, observations) = sample_with(after_gateway_cycles(&cycles));
+            assert!(
+                sampler.completed.health.gateway.is_some(),
+                "{case}: the old check would have counted this cycle"
+            );
+            assert_eq!(
+                sampler.completed.health.gateway_target.as_deref(),
+                Some(GATEWAY),
+                "{case}"
+            );
+            assert!(observations.gateway.is_none(), "{case}");
+            assert!(observations.dns.is_none(), "{case}");
+            assert!(!evidence(&observations, None), "{case}");
+            assert_eq!(
+                outcome(&[], evidence(&observations, None)),
+                Outcome::Incomplete,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_measured_gateway_is_evidence() {
+        use crate::collectors::health::Loss;
+        use crate::diagnose::detectors::{DnsObs, GatewayObs};
+        // Through the sampler, on the same seam the unmeasured test uses: a
+        // measured cycle, including one that lost everything, is observed.
+        for (rtt, loss) in [
+            (Some(0.9), Loss::Measured(0.0)),
+            (None, Loss::Measured(100.0)),
+        ] {
+            let (_, observations) = sample_with(after_gateway_cycles(&[(rtt, loss)]));
+            let observed = observations.gateway.as_ref().expect("a measured gateway");
+            assert_eq!(observed.addr.as_deref(), Some(GATEWAY));
+            assert_eq!(Some(observed.loss_pct), loss.pct());
+            assert!(evidence(&observations, None));
+        }
+
+        let gateway = Observations {
+            gateway: Some(GatewayObs {
+                addr: Some("192.0.2.2".into()),
+                rtt_ms: Some(0.9),
+                loss_pct: 0.0,
+                arp_ok: None,
+                icmp_ok: true,
+                internet_reachable: Some(true),
+            }),
+            ..Default::default()
+        };
+        assert!(evidence(&gateway, None));
+        assert_eq!(outcome(&[], evidence(&gateway, None)), Outcome::NoFinding);
+        // Total loss is measured too: that is gateway.unreachable's input.
+        let dead = Observations {
+            gateway: gateway.gateway.clone().map(|g| GatewayObs {
+                rtt_ms: None,
+                loss_pct: 100.0,
+                icmp_ok: false,
+                ..g
+            }),
+            ..Default::default()
+        };
+        assert!(evidence(&dead, None));
+        // A measured resolver alone is evidence as well.
+        let resolver = Observations {
+            dns: Some(DnsObs {
+                resolver: "192.0.2.2".into(),
+                rtt_p50_ms: Some(2.0),
+                rtt_p95_ms: Some(3.0),
+                failure_rate_pct: 0.0,
+                truncation_rate_pct: 0.0,
+                queries: 6,
+                failed: 0,
+                truncated: 0,
+                alt_resolver: None,
+                alt_rtt_ms: None,
+                icmp_rtt_ms: None,
+                cached_rtt_ms: None,
+                window_secs: 30,
+                cross: None,
+            }),
+            ..Default::default()
+        };
+        assert!(evidence(&resolver, None));
+        // Asked about one target, the gateway says nothing about it.
+        assert!(!evidence(&gateway, Some("api")));
     }
 
     #[test]

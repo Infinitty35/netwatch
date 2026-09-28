@@ -5546,12 +5546,10 @@ fn selected_issue_id(app: &App) -> Option<String> {
         .map(|i| i.id.clone())
 }
 
-/// One-line summary of what is wrong, for `y` and for the export toast.
-/// Reads from the same `Issue` the screen renders, so a pasted summary always
-/// matches the screenshot next to it.
+/// One-line summary of what is wrong, for `y`: the words of the verdict row,
+/// so a pasted summary always matches the screenshot next to it.
 fn diagnose_summary(app: &App) -> String {
-    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
-    verdict.line()
+    crate::ui::diagnose::verdict_words(&app.diagnose.engine, &app.diagnose.baselines, &app.theme)
 }
 
 /// Stage the first applicable remediation for confirmation.
@@ -5559,6 +5557,11 @@ fn diagnose_summary(app: &App) -> String {
 /// Nothing is written here. Apply steps change host state — the resolver, a
 /// qdisc, a socket — and a keystroke away from an irreversible edit is not a
 /// design, so the actual work happens only after the prompt is answered.
+///
+/// Only the demo stages anything. Live, netwatch changes nothing from this
+/// screen: `↵` says so and records nothing, where it used to apply at once
+/// and record "not applied" against the step (C19a; the full handoff is
+/// C19b).
 fn stage_remediation(app: &mut App) {
     let Some(id) = selected_issue_id(app) else {
         return;
@@ -5567,6 +5570,15 @@ fn stage_remediation(app: &mut App) {
     let Some(issue) = app.diagnose.engine.get(&id) else {
         return;
     };
+    let has_any = issue
+        .remediation
+        .iter()
+        .any(|s| s.kind == crate::diagnose::issue::StepKind::Apply);
+    if has_any && !app.diagnose.is_demo() {
+        app.diagnose
+            .set_status("netwatch won't change this from here; run the command shown");
+        return;
+    }
     let step = issue
         .remediation
         .iter()
@@ -5577,18 +5589,10 @@ fn stage_remediation(app: &mut App) {
             let key = step.key.unwrap_or('1');
             let text = step.text.clone();
             app.diagnose.pending_apply = Some((id, key));
-            if !app.diagnose.is_demo() {
-                apply_pending_remediation(app);
-                return;
-            }
             app.diagnose
                 .set_status(format!("apply: {text}?  y = yes, n = no"));
         }
         None => {
-            let has_any = issue
-                .remediation
-                .iter()
-                .any(|s| s.kind == crate::diagnose::issue::StepKind::Apply);
             app.diagnose.set_status(if has_any {
                 format!(
                     "nothing to apply — the fix for this issue needs {}",
@@ -5601,7 +5605,10 @@ fn stage_remediation(app: &mut App) {
     }
 }
 
-/// Carry out a confirmed remediation, journalling before it writes.
+/// Carry out a confirmed remediation. Only the demo stages one, and it
+/// simulates it: the scenario changes what the resolver reports, and the
+/// engine's own verify condition closes the issue. Nothing on this host is
+/// written to.
 fn apply_pending_remediation(app: &mut App) {
     let Some((id, key)) = app.diagnose.pending_apply.take() else {
         return;
@@ -5615,40 +5622,25 @@ fn apply_pending_remediation(app: &mut App) {
     let Some(action) = step.action.clone() else {
         return;
     };
-
-    // Demo mode simulates the remediation: the scenario changes what the
-    // resolver reports, and the engine's own verify condition closes the
-    // issue. Nothing on this host is written to.
-    if let Some(mut driver) = app.diagnose.demo.take() {
-        let applied = driver.apply(&action);
-        app.diagnose.demo = Some(driver);
-        let msg = match &applied {
-            crate::diagnose::issue::Applied::Yes { before, after, .. } => {
-                format!("simulated · {before} → {after} · watching for verify to hold")
-            }
-            crate::diagnose::issue::Applied::RecoveryRequired { .. } => {
-                applied.recovery_summary().unwrap()
-            }
-            crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
-            crate::diagnose::issue::Applied::Reverted { reason, .. } => {
-                format!("reverted · {reason}")
-            }
-        };
-        app.diagnose.engine.record_applied(&id, key, applied);
-        app.diagnose.set_status(msg);
+    let Some(mut driver) = app.diagnose.demo.take() else {
         return;
-    }
-
-    let reason = app.diagnose.journal.blocked_reason().map(str::to_owned)
-        .unwrap_or_else(|| match action {
-            crate::diagnose::issue::Action::SetResolver { .. } =>
-                format!("{}; automatic TUI edits are unavailable; follow the manual steps or inspect with netwatch resolver status", crate::diagnose::remediation::resolver::ownership().map(|o| o.description().to_owned()).unwrap_or_else(|e| format!("resolver ownership unavailable: {e}"))),
-            _ => "netwatch cannot perform this step itself".into(),
-        });
-    app.diagnose.set_status(format!("not applied · {reason}"));
-    app.diagnose
-        .engine
-        .record_applied(&id, key, crate::diagnose::issue::Applied::No { reason });
+    };
+    let applied = driver.apply(&action);
+    app.diagnose.demo = Some(driver);
+    let msg = match &applied {
+        crate::diagnose::issue::Applied::Yes { before, after, .. } => {
+            format!("simulated · {before} → {after} · watching for verify to hold")
+        }
+        crate::diagnose::issue::Applied::RecoveryRequired { .. } => {
+            applied.recovery_summary().unwrap()
+        }
+        crate::diagnose::issue::Applied::No { reason } => format!("not applied · {reason}"),
+        crate::diagnose::issue::Applied::Reverted { reason, .. } => {
+            format!("reverted · {reason}")
+        }
+    };
+    app.diagnose.engine.record_applied(&id, key, applied);
+    app.diagnose.set_status(msg);
 }
 
 /// Write `report.md` and `report.json`, and say where they went.
@@ -5751,5 +5743,99 @@ pub fn build_diagnose_report(app: &App) -> crate::diagnose::report::Report {
             .and_then(|i| i.mac.clone())
             .map(|_| vec!["report.json".to_string()])
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod diagnose_action_tests {
+    use super::*;
+    use crate::diagnose::issue::Capability;
+
+    /// The fixture's issues on a live (not demo) Diagnose tab, running as
+    /// root, with the cursor on the slow resolver.
+    fn live_app_on_the_resolver_issue() -> App {
+        let mut app = App::prepare_with_config(NetwatchConfig::default());
+        let (engine, baselines) = crate::diagnose::fixture::run();
+        app.diagnose.selected = engine
+            .primary()
+            .iter()
+            .position(|i| i.rule == "dns.slow_resolver")
+            .expect("the fixture opens the resolver issue");
+        app.diagnose.engine = engine;
+        app.diagnose.baselines = baselines;
+        app.diagnose.capability = Capability::Root;
+        app.ui.current_tab = Tab::Diagnose;
+        app
+    }
+
+    /// `y` copied `Verdict::line()`, which words the same state differently
+    /// from the verdict row ("no visible findings" against "no issues
+    /// found"). It now copies the row's words, with issues open and without.
+    #[test]
+    fn y_copies_the_words_on_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let screen = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            terminal
+                .draw(|f| crate::ui::diagnose::render(f, app, f.size()))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.get(x, y).symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = live_app_on_the_resolver_issue();
+        let summary = diagnose_summary(&app);
+        assert!(summary.starts_with("3 issues · "), "{summary}");
+        assert!(summary.contains("slow dns resolver"), "{summary}");
+        assert!(!summary.contains("press 9"), "{summary}");
+        assert!(screen(&app).contains(&summary), "{summary}");
+
+        app.diagnose.engine =
+            crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock));
+        let summary = diagnose_summary(&app);
+        assert!(
+            summary.starts_with("no issues found · watching"),
+            "{summary}"
+        );
+        assert!(screen(&app).contains(&format!("◌ {summary}")), "{summary}");
+    }
+
+    /// Live, `↵` used to apply at once and record "not applied" against the
+    /// step. It now says what to do instead, stages nothing and records
+    /// nothing, however often it is pressed.
+    #[test]
+    fn enter_in_live_mode_records_nothing() {
+        let mut app = live_app_on_the_resolver_issue();
+        assert!(!app.diagnose.is_demo());
+        let id = selected_issue_id(&app).unwrap();
+        for _ in 0..2 {
+            handle_key(
+                &mut app,
+                crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(app.diagnose.pending_apply, None);
+        assert_eq!(
+            app.diagnose.status.as_deref(),
+            Some("netwatch won't change this from here; run the command shown")
+        );
+        let issue = app.diagnose.engine.get(&id).unwrap();
+        assert!(
+            issue
+                .remediation
+                .iter()
+                .any(|s| s.kind == crate::diagnose::issue::StepKind::Apply),
+            "the step is still listed, with its command"
+        );
+        for step in &issue.remediation {
+            assert_eq!(step.applied, None, "{}", step.text);
+        }
     }
 }
