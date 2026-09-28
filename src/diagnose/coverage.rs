@@ -171,6 +171,19 @@ impl Coverage {
                 ),
             }
         };
+        // Behind a local stub the resolver RTT is measured, so the rule stays
+        // available, but what it times is the stub answering root NS from its
+        // cache. The reason says so rather than implying the upstream is fast.
+        let stub = obs
+            .dns
+            .as_ref()
+            .filter(|d| d.rtt_p50_ms.is_some() && d.is_local_stub())
+            .map(|d| {
+                format!(
+                    "limited: measures the local stub at {}, not the upstream",
+                    d.resolver
+                )
+            });
         let mut coverage = Self { rules: rules::CATALOGUE.iter().map(|rule| {
             let (status, reason) = if let RuleStatus::Planned(reason) = rule.status {
                 (NotImplemented, reason)
@@ -188,6 +201,7 @@ impl Coverage {
                 "wifi.weak_signal" => present(obs.iface.as_ref().is_some_and(|i| i.wireless == Some(true) && (i.signal_dbm.is_some() || i.tx_retry_pct.is_some())), "wireless signal/retries not measured"),
                 "gateway.unreachable" => present(obs.gateway.as_ref().is_some_and(|g| g.addr.is_some() && g.internet_reachable.is_some()), "gateway and corroborating internet probe required"),
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
+                "dns.slow_resolver" if stub.is_some() => (Available, stub.as_deref().unwrap_or_default()),
                 "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "resolver RTT not measured; absolute threshold remains usable without a baseline"),
                 "dns.failing" | "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
                 "dns.hijack_suspect" => present(obs.dns.as_ref().and_then(|d| d.cross.as_ref()).is_some(), "resolver cross-check not measured"),

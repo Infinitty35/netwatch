@@ -295,6 +295,18 @@ pub struct DnsObs {
     pub cross: Option<DnsCross>,
 }
 
+impl DnsObs {
+    /// The configured resolver is a stub on this host, such as
+    /// systemd-resolved's 127.0.0.53. The probe asks root NS, which the stub
+    /// answers from its cache, so what it times is the stub's round trip,
+    /// not the upstream the stub forwards to.
+    pub fn is_local_stub(&self) -> bool {
+        self.resolver
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+}
+
 /// A public name asked of the configured resolver and of a validating
 /// reference, and whether they agreed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1606,6 +1618,9 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
 
 // ----------------------------------------------------------------- dns
 
+/// Why a check about the resolver's upstream did not run behind a local stub.
+const UPSTREAM_UNKNOWN: &str = "the upstream behind the stub is not identified";
+
 fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let Some(dns) = &obs.dns else {
         return vec![];
@@ -1901,8 +1916,17 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     }
 
     let alt_fast = matches!(dns.alt_rtt_ms, Some(a) if a < p50 / 4.0);
-    let icmp_normal = dns.icmp_rtt_ms.map(|r| r < 10.0);
-    let cached_fast = matches!(dns.cached_rtt_ms, Some(c) if c < p50 / 4.0);
+    // Behind a local stub, ICMP to the resolver and its cached answers say
+    // nothing about the upstream these checks are about: loopback always
+    // answers, and the probe's own root-NS answer is a cache hit.
+    let stub = dns.is_local_stub();
+    let (icmp_rtt_ms, cached_rtt_ms) = if stub {
+        (None, None)
+    } else {
+        (dns.icmp_rtt_ms, dns.cached_rtt_ms)
+    };
+    let icmp_normal = icmp_rtt_ms.map(|r| r < 10.0);
+    let cached_fast = matches!(cached_rtt_ms, Some(c) if c < p50 / 4.0);
 
     d.causes = vec![
         Cause::new(
@@ -1930,7 +1954,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                     )
                     .weighted(2.0),
                 },
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(true), Some(rtt)) => CheckResult::pass(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
@@ -1941,6 +1965,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms is slow too"),
                     ),
+                    _ if stub => CheckResult::not_run(
+                        "resolver_itself_is_reachable",
+                        "resolver itself is reachable",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
+                    ),
                     _ => CheckResult::not_run(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
@@ -1948,7 +1978,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "no icmp probe",
                     ),
                 },
-                match (cached_fast, dns.cached_rtt_ms) {
+                match (cached_fast, cached_rtt_ms) {
                     (true, Some(c)) => CheckResult::pass(
                         "cached_names_still_fast",
                         "cached names still fast",
@@ -1958,6 +1988,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "cached_names_still_fast",
                         "cached names still fast",
                         format!("even cache hits take {c:.1}ms"),
+                    ),
+                    _ if stub => CheckResult::not_run(
+                        "cached_names_still_fast",
+                        "cached names still fast",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
                     ),
                     _ => CheckResult::not_run(
                         "cached_names_still_fast",
@@ -1972,7 +2008,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             "resolver_overloaded",
             "the resolver is overloaded",
             vec![
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(false), Some(rtt)) => CheckResult::pass(
                         "icmp_rtt_raised",
                         "icmp rtt raised",
@@ -1982,6 +2018,12 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "icmp_rtt_raised",
                         "icmp rtt raised",
                         format!("icmp is normal at {rtt:.1}ms"),
+                    ),
+                    _ if stub => CheckResult::not_run(
+                        "icmp_rtt_raised",
+                        "icmp rtt raised",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
                     ),
                     _ => CheckResult::not_run(
                         "icmp_rtt_raised",
@@ -2090,7 +2132,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         via_iface: None,
         processes_measured: false,
         via_resolver: Some(dns.resolver.clone()),
-        note: Some("every new connection pays this before it can start".into()),
+        note: Some(if stub {
+            format!(
+                "every new connection pays this before it can start · the probe asks root NS; \
+                 the local stub at {} answers from cache, so this is the stub's round trip",
+                dns.resolver
+            )
+        } else {
+            "every new connection pays this before it can start".into()
+        }),
     };
     out.push(d);
     out
@@ -4473,6 +4523,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// On a systemd-resolved host the probe asks 127.0.0.53 for root NS, which
+    /// the stub answers from its cache in 0 ms. Coverage keeps the rule
+    /// available, since the stub's RTT is measured, and says what it times;
+    /// a finding says so in its scope; the checks about the upstream abstain
+    /// instead of reading loopback ICMP and the stub's cache as the upstream.
+    #[test]
+    fn a_loopback_resolver_says_it_measures_the_stub() {
+        use crate::diagnose::coverage::{Availability as A, Coverage};
+        for (addr, stub) in [
+            ("127.0.0.53", true),
+            ("127.0.0.54", true),
+            ("::1", true),
+            ("169.254.1.1", false),
+            ("192.168.8.1", false),
+            ("fe80::1%eth0", false),
+        ] {
+            let dns = DnsObs {
+                resolver: addr.into(),
+                ..slow_dns()
+            };
+            assert_eq!(dns.is_local_stub(), stub, "{addr}");
+        }
+
+        let coverage_of = |dns: DnsObs| {
+            Coverage::from_observations(&obs_with_dns(dns), &store())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "dns.slow_resolver")
+                .unwrap()
+        };
+        // The Fedora host: healthy, 0 ms, nothing opens.
+        let quiet = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(0.0),
+            rtt_p95_ms: Some(0.1),
+            ..slow_dns()
+        };
+        let row = coverage_of(quiet.clone());
+        assert_eq!(row.status, A::Available);
+        assert_eq!(
+            row.reason,
+            "limited: measures the local stub at 127.0.0.53, not the upstream"
+        );
+        let found = detect(&obs_with_dns(quiet), &store(), &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"dns.slow_resolver"));
+        assert_ne!(
+            coverage_of(slow_dns()).reason,
+            row.reason,
+            "a resolver off the host is not a stub"
+        );
+
+        // A stub slow enough to cross the ceiling, with loopback ICMP and a
+        // cache probe that would otherwise read as the upstream's.
+        let slow_stub = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(150.0),
+            rtt_p95_ms: Some(180.0),
+            icmp_rtt_ms: Some(0.05),
+            cached_rtt_ms: Some(0.9),
+            ..slow_dns()
+        };
+        let found = detect(&obs_with_dns(slow_stub), &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("150ms is over the 100ms ceiling");
+        let note = d.scope.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains(
+                "the probe asks root NS; the local stub at 127.0.0.53 answers from cache, \
+                 so this is the stub's round trip"
+            ),
+            "{note}"
+        );
+        for id in [
+            "resolver_itself_is_reachable",
+            "cached_names_still_fast",
+            "icmp_rtt_raised",
+        ] {
+            let check = d
+                .causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .find(|k| k.id == id)
+                .unwrap();
+            assert_eq!(check.passed, None, "{id}: {check:?}");
+            assert_eq!(check.why_not, Some(A::NotMeasured), "{id}");
+            assert_eq!(check.detail, UPSTREAM_UNKNOWN, "{id}");
+        }
+
+        // Off the host, the same readings are the resolver's own.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(&obs_with_dns(slow_dns()), &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .unwrap();
+        assert!(!d.scope.note.as_deref().unwrap_or_default().contains("stub"));
+        let icmp = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "resolver_itself_is_reachable")
+            .unwrap();
+        assert_eq!(icmp.passed, Some(true));
     }
 
     /// REVIEW §2.4: propose a resolver only after measuring it. Live, the
