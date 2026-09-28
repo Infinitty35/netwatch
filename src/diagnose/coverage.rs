@@ -179,10 +179,13 @@ impl Coverage {
                 "tcp.connect_failures" | "tcp.timewait_exhaustion" => obs.kernel.as_ref().map(|o| o.coverage(rule.id)).unwrap_or((if cfg!(target_os = "linux") { CollectorFailed } else { Unsupported }, "namespace TCP accounting unavailable")),
                 "egress.drift" | "egress.policy_violation" => obs.egress.as_ref().map(|o| o.coverage(rule.id)).unwrap_or((NotMeasured, "no fresh egress observation")),
                 "iface.errors" if obs.iface.as_ref().and_then(|i| i.counter_window_secs).is_some_and(|s| s < 60.0) => (Learning, "collecting a full elapsed minute of interface counter changes"),
+                "link.down" if obs.iface.as_ref().is_some_and(|i| i.carrier.is_none()) => (NotMeasured, "no interface info, so carrier state is unknown"),
+                "iface.errors" if obs.iface.as_ref().is_some_and(|i| i.drops_per_min.is_none()) => (Available, "interface error counters present; drops not counted on macOS"),
                 "link.down" | "iface.errors" => present(obs.iface.is_some(), "interface counters not measured"),
                 "iface.saturated" => present(obs.iface.as_ref().and_then(|i| i.utilisation_pct()).is_some(), "link rate or interface counters missing"),
-                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| !i.wireless) => (NotApplicable, "selected interface is not wireless"),
-                "wifi.weak_signal" => present(obs.iface.as_ref().is_some_and(|i| i.wireless && (i.signal_dbm.is_some() || i.tx_retry_pct.is_some())), "wireless signal/retries not measured"),
+                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| i.wireless == Some(false)) => (NotApplicable, "selected interface is not wireless"),
+                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| i.wireless.is_none()) => (NotMeasured, "not known whether the selected interface is wireless"),
+                "wifi.weak_signal" => present(obs.iface.as_ref().is_some_and(|i| i.wireless == Some(true) && (i.signal_dbm.is_some() || i.tx_retry_pct.is_some())), "wireless signal/retries not measured"),
                 "gateway.unreachable" => present(obs.gateway.as_ref().is_some_and(|g| g.addr.is_some() && g.internet_reachable.is_some()), "gateway and corroborating internet probe required"),
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
                 "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "resolver RTT not measured; absolute threshold remains usable without a baseline"),
@@ -495,6 +498,22 @@ mod tests {
                 .status,
             Availability::Learning
         );
+    }
+
+    #[test]
+    fn unknown_wireless_is_not_measured_not_not_applicable() {
+        let weak_signal = |wireless| {
+            let mut obs = fixture::observations_at(300);
+            obs.iface.as_mut().unwrap().wireless = wireless;
+            Coverage::from_observations(&obs, &fixture::baselines())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "wifi.weak_signal")
+                .unwrap()
+                .status
+        };
+        assert_eq!(weak_signal(Some(false)), Availability::NotApplicable);
+        assert_eq!(weak_signal(None), Availability::NotMeasured);
     }
 
     #[test]

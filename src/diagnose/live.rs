@@ -21,6 +21,8 @@ use super::detectors::{
     SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
+use crate::collectors::traffic::InterfaceTraffic;
+use crate::platform::InterfaceInfo;
 
 /// Metrics fed to the baseline store every tick, each paired with the rule
 /// that consumes it.
@@ -52,6 +54,17 @@ fn link_rate_bps(iface: &str) -> Option<f64> {
 fn parse_link_speed(text: &str) -> Option<f64> {
     let mbps: i64 = text.trim().parse().ok()?;
     (mbps > 0).then_some(mbps as f64 * 1_000_000.0)
+}
+
+/// Frames a radio has to send in the retry window before its retry share
+/// says anything. An idle link sends a few management frames a minute, and
+/// no retries out of no frames is not 0%.
+pub(super) const WIFI_MIN_FRAMES: u64 = 1_000;
+
+/// Retries as a percentage of the frames sent over the same window, or
+/// `None` under [`WIFI_MIN_FRAMES`].
+fn retry_share(d_retries: u64, d_packets: u64) -> Option<f64> {
+    (d_packets >= WIFI_MIN_FRAMES).then(|| d_retries as f64 * 100.0 / d_packets as f64)
 }
 
 /// One probe result destined for the baseline store.
@@ -378,8 +391,9 @@ impl LiveSampler {
         if !crate::collectors::health::ProbeTimes::fresh(completed, 15) {
             return None;
         }
+        let completed = completed?;
         if let Some((at, cached)) = &self.interface_sample {
-            if Some(*at) == completed && cached.name == app.capture_interface {
+            if *at == completed && cached.name == app.capture_interface {
                 return Some(cached.clone());
             }
         }
@@ -387,51 +401,66 @@ impl LiveSampler {
             .iter()
             .find(|i| i.name == app.capture_interface)?;
         let info = app.interface_info.iter().find(|i| i.name == t.name);
+        let observed = self.iface_obs(t, info, completed, crate::platform::IFACE_DROPS_COUNTED);
+        self.interface_sample = Some((completed, observed.clone()));
+        Some(observed)
+    }
 
+    /// One interface's observation from its counters and whatever the
+    /// platform said about it, with the per-minute windows moved on to
+    /// `completed`. `drops_counted` is [`crate::platform::IFACE_DROPS_COUNTED`]
+    /// in the app, and a parameter so tests can run the macOS case anywhere.
+    fn iface_obs(
+        &mut self,
+        t: &InterfaceTraffic,
+        info: Option<&InterfaceInfo>,
+        completed: Instant,
+        drops_counted: bool,
+    ) -> IfaceObs {
         let errors = t.rx_errors + t.tx_errors;
         let drops = t.rx_drops + t.tx_drops;
         let history = self
             .iface_history
             .entry(t.name.clone())
             .or_insert_with(|| IfaceCounters::new(errors, drops));
-        let (errors_per_min, drops_per_min) = history.observe(completed?, errors, drops);
+        let (errors_per_min, drops_per_min) = history.observe(completed, errors, drops);
         let counter_window_secs = Some(
-            completed?
+            completed
                 .saturating_duration_since(history.started_at)
                 .as_secs_f64()
                 .min(60.0),
         );
 
-        let wireless = info.and_then(|i| i.is_wireless).unwrap_or(false);
+        // No info is unknown, not "carrier up, wired", and info that does
+        // not say whether the link is a radio leaves just that unknown.
+        let wireless = info.and_then(|i| i.is_wireless);
         // Retries as a share of frames sent over the same minute. Both are
-        // lifetime counters, so the rate is delta over delta.
-        let tx_retry_pct = t.tx_retries.map(|retries| {
+        // lifetime counters, so the rate is delta over delta. The window
+        // moves every tick, idle or not, so it is already full when traffic
+        // starts.
+        let tx_retry_pct = t.tx_retries.and_then(|retries| {
             let (d_retries, d_packets) = self
                 .wifi_history
                 .entry(t.name.clone())
                 .or_insert_with(|| IfaceCounters::new(retries, t.tx_packets))
-                .observe(completed.unwrap(), retries, t.tx_packets);
-            if d_packets == 0 {
-                0.0
-            } else {
-                d_retries as f64 / d_packets as f64 * 100.0
-            }
+                .observe(completed, retries, t.tx_packets);
+            retry_share(d_retries, d_packets)
         });
 
-        let observed = IfaceObs {
+        IfaceObs {
             name: t.name.clone(),
-            carrier: info.map(|i| i.is_up).unwrap_or(true),
+            carrier: info.map(|i| i.is_up),
             rx_errors: t.rx_errors,
             tx_errors: t.tx_errors,
             rx_dropped: t.rx_drops,
             tx_dropped: t.tx_drops,
             counter_window_secs,
             errors_per_min,
-            drops_per_min,
+            drops_per_min: drops_counted.then_some(drops_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
-            link_rate_bps: if wireless {
+            link_rate_bps: if wireless == Some(true) {
                 None
             } else {
                 link_rate_bps(&t.name)
@@ -441,9 +470,7 @@ impl LiveSampler {
             tx_retry_pct,
             rx_bps: t.rx_rate,
             tx_bps: t.tx_rate,
-        };
-        self.interface_sample = Some((completed.unwrap(), observed.clone()));
-        Some(observed)
+        }
     }
 
     fn paths(&mut self, app: &App) -> Vec<PathObs> {
@@ -839,6 +866,121 @@ mod tests {
         let mut c = IfaceCounters::new(10, 20);
         for _ in 0..120 {
             assert_eq!(c.observe(Instant::now(), 10, 20), (0, 0));
+        }
+    }
+
+    /// Counters for one interface at one moment, everything else zero.
+    fn traffic(name: &str, tx_packets: u64, tx_retries: Option<u64>) -> InterfaceTraffic {
+        InterfaceTraffic {
+            name: name.into(),
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            rx_bytes_total: 0,
+            tx_bytes_total: 0,
+            rx_packets: 0,
+            tx_packets,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_drops: 0,
+            tx_drops: 0,
+            signal_dbm: None,
+            tx_retries,
+            rx_history: Default::default(),
+            tx_history: Default::default(),
+            sample_times: Default::default(),
+        }
+    }
+
+    fn info(name: &str, is_wireless: Option<bool>) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.into(),
+            ipv4: None,
+            ipv6: None,
+            mac: None,
+            mtu: None,
+            is_up: true,
+            is_wireless,
+        }
+    }
+
+    /// C04's missing-info row, through the sampler. An interface the
+    /// platform gave no info for used to read as carrier up and wired.
+    #[test]
+    fn the_sampler_reads_missing_interface_info_as_unknown() {
+        let mut sampler = LiveSampler::new();
+        let t = traffic("nwtest0", 0, None);
+        let obs = sampler.iface_obs(&t, None, Instant::now(), true);
+        assert_eq!((obs.carrier, obs.wireless), (None, None));
+        // Info that does not say whether the link is a radio leaves only
+        // that unknown.
+        let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now(), true);
+        assert_eq!((obs.carrier, obs.wireless), (Some(true), None));
+    }
+
+    /// Where the platform counts no drops (macOS), the recording says so
+    /// with a null rather than a 0. Both cases run on every platform.
+    #[test]
+    fn the_sampler_records_no_drop_rate_where_drops_are_not_counted() {
+        let t = traffic("nwtest0", 0, None);
+        for counted in [true, false] {
+            let obs = LiveSampler::new().iface_obs(&t, None, Instant::now(), counted);
+            assert_eq!(obs.drops_per_min.is_some(), counted);
+            let json = serde_json::to_value(&obs).unwrap();
+            assert_eq!(json["drops_per_min"].is_null(), !counted, "{json}");
+        }
+    }
+
+    #[test]
+    fn an_idle_radio_has_no_retry_share() {
+        assert_eq!(retry_share(0, 0), None, "no frames is not 0%");
+        assert_eq!(retry_share(40, 999), None, "one frame short");
+    }
+
+    #[test]
+    fn a_busy_radio_reports_its_share() {
+        assert_eq!(retry_share(70, 1_000), Some(7.0));
+        assert_eq!(retry_share(0, 5_000), Some(0.0), "a busy clean link is 0%");
+    }
+
+    /// C04's idle-radio row, through the sampler. A radio that sends nothing
+    /// for a minute has no retry share, where it used to read 0%. The window
+    /// keeps moving while it idles, so the share appears once traffic has
+    /// sent enough frames.
+    #[test]
+    fn the_sampler_gives_an_idle_radio_no_retry_share() {
+        use crate::diagnose::coverage::{Availability, Coverage};
+        let mut sampler = LiveSampler::new();
+        let wlan0 = info("wlan0", Some(true));
+        let start = Instant::now();
+        let at = |s: u64| start + std::time::Duration::from_secs(s);
+        let mut idle_minute = None;
+        for s in 0..=60 {
+            let idle = traffic("wlan0", 5_000, Some(300));
+            let obs = sampler.iface_obs(&idle, Some(&wlan0), at(s), true);
+            assert_eq!(obs.tx_retry_pct, None, "idle, second {s}");
+            idle_minute = Some(obs);
+        }
+        // With no signal level either, the rule has nothing to judge.
+        let coverage = Coverage::from_observations(
+            &Observations {
+                iface: idle_minute,
+                ..Default::default()
+            },
+            &crate::diagnose::fixture::baselines(),
+        );
+        let weak_signal = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "wifi.weak_signal")
+            .unwrap();
+        assert_eq!(weak_signal.status, Availability::NotMeasured);
+        assert_eq!(weak_signal.reason, "wireless signal/retries not measured");
+        // 50 frames a second, 5 of them retried: 1,000 frames by second 20.
+        for s in 1..=20 {
+            let busy = traffic("wlan0", 5_000 + 50 * s, Some(300 + 5 * s));
+            let obs = sampler.iface_obs(&busy, Some(&wlan0), at(60 + s), true);
+            let want = (s >= 20).then_some(10.0);
+            assert_eq!(obs.tx_retry_pct, want, "busy, second {s}");
         }
     }
 
