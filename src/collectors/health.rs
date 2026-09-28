@@ -250,6 +250,13 @@ impl HealthProber {
         Arc::clone(&safe_read(&self.snapshot, "health::status"))
     }
 
+    /// Publish `status` as if a probe cycle had produced it, for tests of
+    /// what the readers make of it.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, status: HealthStatus) {
+        *safe_write(&self.snapshot, "health::publish") = Arc::new(status);
+    }
+
     pub fn nat_outcome(&self) -> Option<Result<(), String>> {
         self.nat_outcome.read().unwrap().clone()
     }

@@ -318,23 +318,102 @@ mod tests {
         assert_eq!(Outcome::NoFinding as i32, 0);
     }
 
+    const GATEWAY: &str = "192.0.2.1";
+
+    /// The prober's status after `cycles` gateway probes, each an (rtt, loss)
+    /// pair recorded the way the probe thread records it: every cycle stamps
+    /// `completed.gateway`, and only a measured one joins the history.
+    fn after_gateway_cycles(
+        cycles: &[(Option<f64>, crate::collectors::health::Loss)],
+    ) -> crate::collectors::health::HealthStatus {
+        let mut status = (*crate::collectors::health::HealthProber::new().status()).clone();
+        for &(rtt, loss) in cycles {
+            let completed = Instant::now();
+            status.gateway_rtt_ms = rtt;
+            status.gateway_loss = loss;
+            if loss.is_measured() {
+                status.completed.gateway_history.push_back(completed);
+                status.gateway_rtt_history.push_back(rtt);
+            }
+            status.completed.gateway = Some(completed);
+            status.completed.gateway_target = Some(GATEWAY.into());
+        }
+        status
+    }
+
+    /// One live sample on a host whose gateway is [`GATEWAY`] and which lists
+    /// no resolver, with `status` as the prober's latest.
+    fn sample_with(
+        status: crate::collectors::health::HealthStatus,
+    ) -> (crate::diagnose::live::LiveSampler, Observations) {
+        let mut app =
+            crate::app::App::prepare_with_config(crate::config::NetwatchConfig::default());
+        app.config_collector.config.gateway = Some(GATEWAY.into());
+        app.config_collector.config.dns_servers.clear();
+        app.health_prober.publish_for_test(status);
+        let mut sampler = crate::diagnose::live::LiveSampler::new();
+        let observations = sampler.sample(&app, &app.diagnose.engine.settings().thresholds);
+        (sampler, observations)
+    }
+
     /// REVIEW §2.1: count gateway evidence only when loss is measured. A
     /// gateway cycle that could send nothing ("icmp is blocked here and the
-    /// gateway answers no tcp port") yields no gateway observation, and with
-    /// no resolver either the run has nothing to conclude from.
+    /// gateway answers no tcp port") still stamps the prober's completion
+    /// time, which the run used to count; it yields no gateway observation,
+    /// and with no resolver either the run has nothing to conclude from.
     #[test]
     fn an_unmeasured_gateway_is_not_evidence() {
-        let nothing_measured = Observations::default();
-        assert!(!evidence(&nothing_measured, None));
-        assert_eq!(
-            outcome(&[], evidence(&nothing_measured, None)),
-            Outcome::Incomplete
+        use crate::collectors::health::Loss;
+        let unmeasured = (
+            None,
+            Loss::Unmeasured("icmp is blocked here and the gateway answers no tcp port"),
         );
+        let measured = |rtt| (Some(rtt), Loss::Measured(0.0));
+        for (case, cycles) in [
+            ("never measured", vec![unmeasured]),
+            (
+                "measured before, not now",
+                vec![measured(0.9), measured(1.1), unmeasured],
+            ),
+        ] {
+            let (sampler, observations) = sample_with(after_gateway_cycles(&cycles));
+            assert!(
+                sampler.completed.health.gateway.is_some(),
+                "{case}: the old check would have counted this cycle"
+            );
+            assert_eq!(
+                sampler.completed.health.gateway_target.as_deref(),
+                Some(GATEWAY),
+                "{case}"
+            );
+            assert!(observations.gateway.is_none(), "{case}");
+            assert!(observations.dns.is_none(), "{case}");
+            assert!(!evidence(&observations, None), "{case}");
+            assert_eq!(
+                outcome(&[], evidence(&observations, None)),
+                Outcome::Incomplete,
+                "{case}"
+            );
+        }
     }
 
     #[test]
     fn a_measured_gateway_is_evidence() {
+        use crate::collectors::health::Loss;
         use crate::diagnose::detectors::{DnsObs, GatewayObs};
+        // Through the sampler, on the same seam the unmeasured test uses: a
+        // measured cycle, including one that lost everything, is observed.
+        for (rtt, loss) in [
+            (Some(0.9), Loss::Measured(0.0)),
+            (None, Loss::Measured(100.0)),
+        ] {
+            let (_, observations) = sample_with(after_gateway_cycles(&[(rtt, loss)]));
+            let observed = observations.gateway.as_ref().expect("a measured gateway");
+            assert_eq!(observed.addr.as_deref(), Some(GATEWAY));
+            assert_eq!(Some(observed.loss_pct), loss.pct());
+            assert!(evidence(&observations, None));
+        }
+
         let gateway = Observations {
             gateway: Some(GatewayObs {
                 addr: Some("192.0.2.2".into()),
