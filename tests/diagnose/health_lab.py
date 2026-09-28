@@ -56,6 +56,9 @@ WARMUP_SECS = 15
 # Seconds a scenario keeps running after its last expected close, so an issue
 # that reopens at once is seen doing it.
 SETTLE_SECS = 15
+# The health probes' cadence. A row that expects nothing judges its rules'
+# inputs from one cycle after the fault goes in.
+PROBE_SECS = 5
 # lab.rs state_name: the states in which an issue is still open.
 OPEN = {'open', 'acked', 'muted'}
 # The namespace each device a fault can name lives in, as a Lab attribute.
@@ -85,7 +88,10 @@ DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
 #                  must be listed under that one whenever both are open, and
 #                  must be seen so at least once
 #   expect_close   rules that must close after the clear and stay closed
-#   forbid         rules that must never be listed, in any state; '*' is all
+#   forbid         rules that must never be listed, in any state; '*' is all.
+#                  In a row that expects nothing to open, each forbidden core
+#                  rule must also have been available on every fault tick
+#                  past the first probe cycle
 #   quick          in --quick; the rest are the weekly long negatives
 #   asserted       False: measured and reported, never failed on
 SCENARIOS = [
@@ -595,8 +601,8 @@ def run_scenario(lab, s):
 
 
 def evaluate(s, rows, fault_at, clear_at):
-    """Every assertion the row makes, as a list of failures, and the open and
-    close times it measured."""
+    """Every assertion the row makes, as a list of failures, the open and
+    close times it measured, and how long a negative row's rules could open."""
     failures = []
     # Anything else is the host's network, and every judgement after it is
     # about the wrong resolver or gateway.
@@ -613,6 +619,19 @@ def evaluate(s, rows, fault_at, clear_at):
             failures.append(f'{key} listed at {t}s, before the fault')
         elif '*' in s['forbid'] or rule in s['forbid']:
             failures.append(f'{key} listed at {t}s, {t - fault_at}s into the fault, and is forbidden')
+    # A rule whose input is stale or unmeasured cannot open, so a row that
+    # expects nothing passes only on ticks where what it forbids was judged.
+    judged = {}
+    if not s['expect_open']:
+        ticks = [r for r in rows if fault_at + PROBE_SECS < r['t'] <= clear_at]
+        for rule in [r for r in CORE_RULES if '*' in s['forbid'] or r in s['forbid']]:
+            status = [(r['t'], next((c['status'] for c in r['coverage'] if c['rule'] == rule), None))
+                      for r in ticks]
+            off = [(t, st) for t, st in status if st != 'available']
+            judged[rule] = {'available': len(ticks) - len(off), 'ticks': len(ticks)}
+            if off:
+                failures.append(f'{rule} was {off[0][1]} at {off[0][0]}s, and not available on '
+                                f'{len(off)} of {len(ticks)} fault ticks')
     faulted = [r for r in rows if r['t'] > fault_at]
     opened = {}
     for e in s['expect_open']:
@@ -656,7 +675,7 @@ def evaluate(s, rows, fault_at, clear_at):
         again = first([r for r in cleared if r['t'] > t], lambda r: is_open(r, rule))
         if again is not None:
             failures.append(f'{rule} reopened {again - clear_at}s after the clear')
-    return failures, opened, closed
+    return failures, opened, closed, judged
 
 
 def timeline(rows):
@@ -681,7 +700,7 @@ def scenario(name, artifacts):
     s = next(s for s in SCENARIOS if s['name'] == name)
     with Lab() as lab:
         rows, err, fault_at, clear_at = run_scenario(lab, s)
-        failures, opened, closed = evaluate(s, rows, fault_at, clear_at)
+        failures, opened, closed, judged = evaluate(s, rows, fault_at, clear_at)
         episodes = lab.home / '.local/state/netwatch/episodes'
         recorded = sorted(str(p.relative_to(episodes)) for p in episodes.rglob('*.json.gz')) \
             if episodes.is_dir() else []
@@ -698,8 +717,8 @@ def scenario(name, artifacts):
                 shutil.copytree(episodes, keep / 'episodes', dirs_exist_ok=True)
     return {'scenario': name, 'asserted': s.get('asserted', True), 'passed': not failures,
             'failures': failures, 'fault': s['fault'], 'fault_at': fault_at, 'clear_at': clear_at,
-            'ended_at': rows[-1]['t'], 'open': opened, 'close': closed, 'issues': timeline(rows),
-            'episodes': recorded}
+            'ended_at': rows[-1]['t'], 'open': opened, 'close': closed, 'judged': judged,
+            'issues': timeline(rows), 'episodes': recorded}
 
 
 def orchestrate(names, smoke, out, artifacts):
