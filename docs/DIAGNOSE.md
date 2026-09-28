@@ -109,8 +109,11 @@ part of the interface:
 
 Exit 0 and exit 2 are deliberately different. A run that gathered nothing has
 established nothing, and a script that treats silence as health will report a
-dead link as a healthy one. With `--target`, only that target's own probes
-count as evidence: another target completing says nothing about this one.
+dead link as a healthy one. Without `--target`, a measured gateway, a measured
+resolver or a completed target probe counts as evidence. A gateway probe that
+could send nothing, because ICMP is blocked and the gateway answers no TCP port,
+does not. With `--target`, only that target's own probes count: another target
+completing says nothing about this one.
 
 Budgets accept `30s`, `2m` or a bare number of seconds, between 5s and 10m.
 JSON output carries the ruleset size, the sampling window, the coverage object
