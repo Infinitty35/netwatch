@@ -659,10 +659,15 @@ fn severity_color(sev: Severity, t: &Theme) -> Color {
 }
 
 fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
-    let t = view.theme;
-    let verdict = view.engine.verdict(view.baselines);
+    let spans = verdict_spans(view.engine, view.baselines, view.theme);
+    f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
+}
 
-    let coverage = view.engine.coverage();
+/// The verdict row: a glyph, then the words.
+fn verdict_spans(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> Vec<Span<'static>> {
+    let verdict = engine.verdict(baselines);
+
+    let coverage = engine.coverage();
     // "rules", not "checks": a check is one line of evidence inside a cause,
     // and the coverage object counts catalogue rules. Two different numbers
     // under one word made the generated coverage document read as though it
@@ -676,22 +681,34 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
             .count(),
         coverage.rules.len()
     );
-    let spans: Vec<Span> = match &verdict {
+    match &verdict {
         // "Nothing found", never "healthy": the clause after it says how much
-        // of the ruleset that is based on.
-        Verdict::Clear | Verdict::Incomplete { .. } => vec![
+        // of the ruleset that is based on. The engine never returns Clear
+        // until green is earned (C14); this arm is what it will draw then.
+        Verdict::Clear => vec![
             Span::styled("● ", Style::default().fg(t.status_good)),
             Span::styled("no issues found", Style::default().fg(t.text_primary)),
             Span::styled(format!(" · {watching}"), Style::default().fg(t.text_muted)),
         ],
+        // Ready baselines and an empty list are not health: the engine
+        // returns this, never Clear, until C14 says which rules must have
+        // had input. Muted, like Learning, because the module's rule is that
+        // nothing is green unless it is healthy.
+        Verdict::Incomplete { .. } => vec![
+            Span::styled("◌ ", Style::default().fg(t.text_muted)),
+            Span::styled(
+                format!("no issues found · {watching}"),
+                Style::default().fg(t.text_muted),
+            ),
+        ],
         // A host that hasn't learned its network yet says so, rather than
         // rendering the reassuring green it hasn't earned.
         Verdict::Learning { .. } => {
-            let readiness = view.baselines.overall_readiness();
-            let learning = if view.baselines.switched_network() {
+            let readiness = baselines.overall_readiness();
+            let learning = if baselines.switched_network() {
                 format!(
                     "new network {} · baselines {}",
-                    view.baselines.fingerprint().label(),
+                    baselines.fingerprint().label(),
                     readiness.label()
                 )
             } else {
@@ -730,9 +747,20 @@ fn render_verdict(f: &mut Frame, view: &View, area: Rect) {
                 Span::styled(headline.clone(), Style::default().fg(t.text_primary)),
             ]
         }
-    };
+    }
+}
 
-    f.render_widget(Paragraph::new(Line::from(spans)), inset(area));
+/// The verdict row's words, without its glyph: what `y` copies, so a pasted
+/// summary says what the screen says. It used to copy `Verdict::line()`,
+/// which words the same state differently ("no visible findings").
+pub fn verdict_words(engine: &Engine, baselines: &BaselineStore, t: &Theme) -> String {
+    verdict_spans(engine, baselines, t)
+        .iter()
+        .skip(1)
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn inset(area: Rect) -> Rect {
@@ -2013,6 +2041,55 @@ mod tests {
         let severity = severity_color(issue.severity, &theme);
         assert_eq!(spans[0].style.fg, Some(theme.text_muted), "below threshold");
         assert_eq!(spans[3].style.fg, Some(severity), "above threshold");
+    }
+
+    /// With learned baselines and nothing open the engine says Incomplete,
+    /// never Clear, and the row drew that as the green ● of health.
+    #[test]
+    fn incomplete_never_draws_status_good_in_the_verdict_row() {
+        use crate::diagnose::engine::{Engine, SystemClock};
+
+        let engine = Engine::new(Box::new(SystemClock));
+        let baselines = fixture::baselines();
+        assert!(matches!(
+            engine.verdict(&baselines),
+            Verdict::Incomplete { .. }
+        ));
+        for name in crate::theme::THEME_NAMES {
+            let theme = crate::theme::by_name(name);
+            let view = View {
+                engine: &engine,
+                baselines: &baselines,
+                theme: &theme,
+                selected: 0,
+                show_report: false,
+                capability: Capability::Root,
+                ai: None,
+                endpoint: "local".to_string(),
+                status: None,
+                demo_banner: None,
+                running_tests: vec![],
+                history: None,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|f| render_body(f, &view, f.size())).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.get(x, 0).symbol())
+                .collect();
+            assert!(
+                row.contains("◌ no issues found · watching"),
+                "{name}: {row}"
+            );
+            for x in 0..buf.area.width {
+                let cell = buf.get(x, 0);
+                assert!(
+                    cell.symbol() == " " || cell.fg != theme.status_good,
+                    "{name}: green {:?} at column {x} of {row}",
+                    cell.symbol()
+                );
+            }
+        }
     }
 
     #[test]

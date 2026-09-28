@@ -5546,12 +5546,10 @@ fn selected_issue_id(app: &App) -> Option<String> {
         .map(|i| i.id.clone())
 }
 
-/// One-line summary of what is wrong, for `y` and for the export toast.
-/// Reads from the same `Issue` the screen renders, so a pasted summary always
-/// matches the screenshot next to it.
+/// One-line summary of what is wrong, for `y`: the words of the verdict row,
+/// so a pasted summary always matches the screenshot next to it.
 fn diagnose_summary(app: &App) -> String {
-    let verdict = app.diagnose.engine.verdict(&app.diagnose.baselines);
-    verdict.line()
+    crate::ui::diagnose::verdict_words(&app.diagnose.engine, &app.diagnose.baselines, &app.theme)
 }
 
 /// Stage the first applicable remediation for confirmation.
@@ -5768,6 +5766,45 @@ mod diagnose_action_tests {
         app.diagnose.capability = Capability::Root;
         app.ui.current_tab = Tab::Diagnose;
         app
+    }
+
+    /// `y` copied `Verdict::line()`, which words the same state differently
+    /// from the verdict row ("no visible findings" against "no issues
+    /// found"). It now copies the row's words, with issues open and without.
+    #[test]
+    fn y_copies_the_words_on_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let screen = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            terminal
+                .draw(|f| crate::ui::diagnose::render(f, app, f.size()))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.get(x, y).symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = live_app_on_the_resolver_issue();
+        let summary = diagnose_summary(&app);
+        assert!(summary.starts_with("3 issues · "), "{summary}");
+        assert!(summary.contains("slow dns resolver"), "{summary}");
+        assert!(!summary.contains("press 9"), "{summary}");
+        assert!(screen(&app).contains(&summary), "{summary}");
+
+        app.diagnose.engine =
+            crate::diagnose::Engine::new(Box::new(crate::diagnose::engine::SystemClock));
+        let summary = diagnose_summary(&app);
+        assert!(
+            summary.starts_with("no issues found · watching"),
+            "{summary}"
+        );
+        assert!(screen(&app).contains(&format!("◌ {summary}")), "{summary}");
     }
 
     /// Live, `↵` used to apply at once and record "not applied" against the
