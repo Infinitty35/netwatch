@@ -89,7 +89,8 @@ DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
 #                  must be seen so at least once
 #   under          {family: root}: whenever root is open, every open issue in
 #                  the family ('dns.*', or one rule) must be listed under it
-#   expect_close   rules that must close after the clear and stay closed
+#   expect_close   rules that must close after the clear and stay closed, each
+#                  within the row's close window or its own
 #   forbid         rules that must never be listed, in any state; '*' is all.
 #                  In a row that expects nothing to open, each forbidden core
 #                  rule must also have been available on every fault tick
@@ -103,7 +104,7 @@ SCENARIOS = [
      'expect_open': [{'rule': 'dns.slow_resolver'}], 'open_within_s': 60, 'open_expect_s': 30,
      # 12 slow samples need 10 healthy ones to lose the median (50 s), then
      # the 60 s hold.
-     'expect_close': ['dns.slow_resolver'], 'close_within_s': 220, 'close_expect_s': 110,
+     'expect_close': [{'rule': 'dns.slow_resolver'}], 'close_within_s': 220, 'close_expect_s': 110,
      'forbid': ['dns.failing', 'gateway.unreachable', 'gateway.rtt_spike', 'path.rtt_spike',
                 'link.down']},
     {'name': 'L-DNS-DOWN',
@@ -111,7 +112,7 @@ SCENARIOS = [
      # 3 samples about 10 s apart, the first landing mid-cycle.
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 40, 'open_expect_s': 20,
      # dns.failing holds its verify for 120 s.
-     'expect_close': ['dns.failing'], 'close_within_s': 250, 'close_expect_s': 125,
+     'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,
      'forbid': ['dns.slow_resolver', 'gateway.unreachable', 'gateway.rtt_spike',
                 'path.rtt_spike', 'link.down']},
     # Reported, not asserted, until B15; the windows are the ones B15 will be
@@ -121,7 +122,7 @@ SCENARIOS = [
     {'name': 'L-DNS-LOSSY', 'asserted': False,
      'fault': [('dns', 'gw', 'drop:20')], 'fault_secs': 180, 'clear': [('dns', 'gw', 'ok')],
      'expect_open': [{'rule': 'dns.failing'}], 'open_within_s': 120, 'open_expect_s': 60,
-     'expect_close': ['dns.failing'], 'close_within_s': 250, 'close_expect_s': 125,
+     'expect_close': [{'rule': 'dns.failing'}], 'close_within_s': 250, 'close_expect_s': 125,
      'forbid': []},
     # Total loss, per decision D2, until gateway.loss exists. Nothing answers,
     # so samples come about 25 s apart and the first lands up to 20 s in.
@@ -136,7 +137,7 @@ SCENARIOS = [
      'open_within_s': 130, 'open_expect_s': 65,
      'under': {'dns.*': 'gateway.unreachable'},
      # The cycle in flight at the clear still times out, then the 60 s hold.
-     'expect_close': ['gateway.unreachable'], 'close_within_s': 140, 'close_expect_s': 70,
+     'expect_close': [{'rule': 'gateway.unreachable'}], 'close_within_s': 140, 'close_expect_s': 70,
      'forbid': ['link.down', 'gateway.rtt_spike', 'path.rtt_spike']},
     # ICMP only, so DNS stays fast and only the gateway's answers slow. The
     # trace's answers are ICMP too, so path.rtt_spike opens as well, after 3
@@ -147,7 +148,11 @@ SCENARIOS = [
      'expect_open': [{'rule': 'gateway.rtt_spike', 'within_s': 30, 'expect_s': 15},
                      {'rule': 'path.rtt_spike', 'suppressed_by': 'gateway.rtt_spike'}],
      'open_within_s': 180, 'open_expect_s': 90,
-     'expect_close': ['gateway.rtt_spike'], 'close_within_s': 250, 'close_expect_s': 125,
+     # The gateway's next sample, then its 120 s hold; the path's close, as in
+     # L-PATH-SPIKE, waits on traces and outlasts it.
+     'expect_close': [{'rule': 'gateway.rtt_spike'},
+                      {'rule': 'path.rtt_spike', 'within_s': 360, 'expect_s': 180}],
+     'close_within_s': 250, 'close_expect_s': 125,
      'forbid': ['dns.slow_resolver', 'dns.failing', 'gateway.unreachable', 'link.down']},
     # Against the seeded `internet` baseline: the trace target has none of its own.
     {'name': 'L-PATH-SPIKE',
@@ -155,7 +160,7 @@ SCENARIOS = [
      'clear': [('netem', 'gw1', None)],
      'expect_open': [{'rule': 'path.rtt_spike'}], 'open_within_s': 180, 'open_expect_s': 90,
      # 2 trace intervals plus the 120 s hold, doubled.
-     'expect_close': ['path.rtt_spike'], 'close_within_s': 360, 'close_expect_s': 180,
+     'expect_close': [{'rule': 'path.rtt_spike'}], 'close_within_s': 360, 'close_expect_s': 180,
      'forbid': ['dns.slow_resolver', 'dns.failing', 'gateway.unreachable', 'gateway.rtt_spike',
                 'link.down']},
     {'name': 'L-HEALTHY',
@@ -545,8 +550,9 @@ def check_table(scenarios):
     assert len(set(names)) == len(names), names
     for s in scenarios:
         name, opens = s['name'], [e['rule'] for e in s['expect_open']]
-        for rule in opens + s['expect_close'] + [e['suppressed_by'] for e in s['expect_open']
-                                                 if 'suppressed_by' in e]:
+        closes = [e['rule'] for e in s['expect_close']]
+        for rule in opens + closes + [e['suppressed_by'] for e in s['expect_open']
+                                      if 'suppressed_by' in e]:
             assert rule in rules, (name, rule)
         assert all(r == '*' or r in rules for r in s['forbid']), (name, s['forbid'])
         for family, root in s.get('under', {}).items():
@@ -554,25 +560,28 @@ def check_table(scenarios):
             # Otherwise the root might never open, and the check never run.
             assert root in opens, (name, root, 'a root the row does not expect to open')
         assert not set(opens) & set(s['forbid']) and not ('*' in s['forbid'] and opens), name
-        assert set(s['expect_close']) <= set(opens), (name, 'a close needs its open')
+        assert set(closes) <= set(opens), (name, 'a close needs its open')
         for e in s['expect_open']:
-            within, expect = open_window(s, e)
+            within, expect = window(s, e, 'open')
             assert within >= 2 * expect, (name, e['rule'], 'open window')
             # The open is judged under the fault, never after it cleared.
             assert s['fault_secs'] >= within, (name, e['rule'], 'fault shorter than its window')
-        if s['expect_close']:
-            assert s['close_within_s'] >= 2 * s['close_expect_s'], (name, 'close window')
+        for e in s['expect_close']:
+            within, expect = window(s, e, 'close')
+            assert within >= 2 * expect, (name, e['rule'], 'close window')
         assert scenario_secs(s) <= 3600, (name, 'longer than the driver runs')
 
 
-def open_window(s, e):
-    """An expected open's window and expected time: its own, or the row's."""
-    return e.get('within_s', s.get('open_within_s')), e.get('expect_s', s.get('open_expect_s'))
+def window(s, e, kind):
+    """An expected open's or close's window and expected time: its own, or
+    the row's."""
+    return e.get('within_s', s.get(f'{kind}_within_s')), e.get('expect_s', s.get(f'{kind}_expect_s'))
 
 
 def scenario_secs(s):
     """The longest a scenario can run: the driver's --seconds."""
-    return WARMUP_SECS + s['fault_secs'] + s.get('close_within_s', 0) + SETTLE_SECS
+    close = max((window(s, e, 'close')[0] for e in s['expect_close']), default=0)
+    return WARMUP_SECS + s['fault_secs'] + close + SETTLE_SECS
 
 
 def run_scenario(lab, s):
@@ -603,10 +612,11 @@ def run_scenario(lab, s):
                 at['clear'] = t
             return
         # A rule that never opened cannot close, and has failed already.
-        for rule in s['expect_close']:
+        closes = [e['rule'] for e in s['expect_close']]
+        for rule in closes:
             if rule in seen and rule not in closed and not is_open(r, rule):
                 closed[rule] = t
-        waiting = [rule for rule in s['expect_close'] if rule in seen and rule not in closed]
+        waiting = [rule for rule in closes if rule in seen and rule not in closed]
         if not waiting and t >= max(closed.values(), default=at['clear']) + SETTLE_SECS:
             stop.touch()
 
@@ -651,7 +661,7 @@ def evaluate(s, rows, fault_at, clear_at):
     opened = {}
     for e in s['expect_open']:
         rule = e['rule']
-        within, expect = open_window(s, e)
+        within, expect = window(s, e, 'open')
         t = first(faulted, lambda r: is_open(r, rule))
         got = opened[rule] = {'after_s': None if t is None else t - fault_at, 'within_s': within,
                               'expect_s': expect}
@@ -678,9 +688,10 @@ def evaluate(s, rows, fault_at, clear_at):
             failures.append(f'{wrong[0][1]} was not under {root} at {wrong[0][0]}s: {wrong[0][2]}')
     cleared = [r for r in rows if r['t'] > clear_at]
     closed = {}
-    for rule in s['expect_close']:
-        got = closed[rule] = {'after_s': None, 'within_s': s['close_within_s'],
-                              'expect_s': s['close_expect_s']}
+    for e in s['expect_close']:
+        rule = e['rule']
+        within, expect = window(s, e, 'close')
+        got = closed[rule] = {'after_s': None, 'within_s': within, 'expect_s': expect}
         if opened[rule]['after_s'] is None:
             continue
         if not any(is_open(r, rule) for r in rows if r['t'] == clear_at):
@@ -691,8 +702,8 @@ def evaluate(s, rows, fault_at, clear_at):
             failures.append(f'{rule} still open {rows[-1]["t"] - clear_at}s after the clear')
             continue
         got['after_s'] = t - clear_at
-        if t - clear_at > s['close_within_s']:
-            failures.append(f'{rule} closed {t - clear_at}s after the clear, past {s["close_within_s"]}s')
+        if t - clear_at > within:
+            failures.append(f'{rule} closed {t - clear_at}s after the clear, past {within}s')
         again = first([r for r in cleared if r['t'] > t], lambda r: is_open(r, rule))
         if again is not None:
             failures.append(f'{rule} reopened {again - clear_at}s after the clear')
