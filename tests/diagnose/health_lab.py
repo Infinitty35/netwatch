@@ -87,6 +87,8 @@ DEVICES = {'nw0': None, 'gw0': 'gw', 'gw1': 'gw', 'inet0': 'inet'}
 #                  row's open window or its own. With suppressed_by, the rule
 #                  must be listed under that one whenever both are open, and
 #                  must be seen so at least once
+#   under          {family: root}: whenever root is open, every open issue in
+#                  the family ('dns.*', or one rule) must be listed under it
 #   expect_close   rules that must close after the clear and stay closed
 #   forbid         rules that must never be listed, in any state; '*' is all.
 #                  In a row that expects nothing to open, each forbidden core
@@ -123,12 +125,16 @@ SCENARIOS = [
      'forbid': []},
     # Total loss, per decision D2, until gateway.loss exists. Nothing answers,
     # so samples come about 25 s apart and the first lands up to 20 s in.
+    # That is close to the 30 s a gateway sample stays fresh (engine.rs
+    # `observe_live_at`): on a runner a few seconds slower the observation
+    # lapses between samples and the confirmation starts over.
     {'name': 'L-GW-DOWN',
      'fault': [('netem', 'nw0', 'loss 100%')], 'fault_secs': 130, 'clear_on_open': True,
      'clear': [('netem', 'nw0', None)],
      'expect_open': [{'rule': 'gateway.unreachable'},
                      {'rule': 'dns.failing', 'suppressed_by': 'gateway.unreachable'}],
      'open_within_s': 130, 'open_expect_s': 65,
+     'under': {'dns.*': 'gateway.unreachable'},
      # The cycle in flight at the clear still times out, then the 60 s hold.
      'expect_close': ['gateway.unreachable'], 'close_within_s': 140, 'close_expect_s': 70,
      'forbid': ['link.down', 'gateway.rtt_spike', 'path.rtt_spike']},
@@ -523,6 +529,11 @@ def catalogue():
     return rules
 
 
+def matches(rule, family):
+    """Whether a rule is in a row's family: one rule id, or 'dns.*'."""
+    return rule == family or family.endswith('.*') and rule.startswith(family[:-1])
+
+
 def check_table(scenarios):
     """The table's own rules, checked before anything runs: a window narrower
     than twice what the rule should take is a flake waiting to happen, and a
@@ -538,6 +549,10 @@ def check_table(scenarios):
                                                  if 'suppressed_by' in e]:
             assert rule in rules, (name, rule)
         assert all(r == '*' or r in rules for r in s['forbid']), (name, s['forbid'])
+        for family, root in s.get('under', {}).items():
+            assert any(matches(r, family) for r in rules), (name, family)
+            # Otherwise the root might never open, and the check never run.
+            assert root in opens, (name, root, 'a root the row does not expect to open')
         assert not set(opens) & set(s['forbid']) and not ('*' in s['forbid'] and opens), name
         assert set(s['expect_close']) <= set(opens), (name, 'a close needs its open')
         for e in s['expect_open']:
@@ -655,6 +670,12 @@ def evaluate(s, rows, fault_at, clear_at):
                 failures.append(f'{rule} was never open while {root} was')
             elif wrong:
                 failures.append(f'{rule} was not under {root} at {wrong[0][0]}s: {wrong[0][1]}')
+    for family, root in s.get('under', {}).items():
+        wrong = [(r['t'], i['key'], i['suppressed_by']) for r in rows if is_open(r, root)
+                 for i in r['issues'] if i['state'] in OPEN and matches(i['rule'], family)
+                 and not (i['suppressed_by'] or '').startswith(root + '|')]
+        if wrong:
+            failures.append(f'{wrong[0][1]} was not under {root} at {wrong[0][0]}s: {wrong[0][2]}')
     cleared = [r for r in rows if r['t'] > clear_at]
     closed = {}
     for rule in s['expect_close']:
