@@ -362,9 +362,12 @@ class Lab:
         elif kind == 'netem':
             cmd('tc', 'qdisc', 'replace', 'dev', target, 'root', 'netem', *spec.split(), ns=ns)
         elif kind == 'netem-icmp':
-            # prio's default priomap never picks band 3, so only what the
-            # filter sends there, ICMP, meets the netem under it.
-            cmd('tc', 'qdisc', 'replace', 'dev', target, 'root', 'handle', '1:', 'prio', ns=ns)
+            # prio's default priomap sends priorities 1, 2, 3 and 5, which a
+            # TOS or SO_PRIORITY sets, to band 3 (1:3). This one sends every
+            # priority to band 2 (1:2), so only what the filter sends to band
+            # 3, ICMP, meets the netem under it.
+            cmd('tc', 'qdisc', 'replace', 'dev', target, 'root', 'handle', '1:', 'prio',
+                'priomap', *['1'] * 16, ns=ns)
             cmd('tc', 'qdisc', 'add', 'dev', target, 'parent', '1:3', 'handle', '30:', 'netem',
                 *spec.split(), ns=ns)
             cmd('tc', 'filter', 'add', 'dev', target, 'parent', '1:', 'protocol', 'ip', 'prio', '1',
