@@ -8,4 +8,4 @@ One line per PR, in order. Source: docs/DIAGNOSE-PLAN-2026-09.md §4.
 - [x] P04 diagnose/033-lab-driver (C05, C06)
 - [x] P05 diagnose/033-abstain-iface (A04, A05, A06)
 - [x] P06 diagnose/033-lab-scenarios (C07)
-- [ ] P07 diagnose/033-honesty (B16, X03, X04, X05, C19a, X02, X06)
+- [x] P07 diagnose/033-honesty (B16, X03, X04, X05, C19a, X02, X06)
