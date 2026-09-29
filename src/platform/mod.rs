@@ -41,6 +41,12 @@ pub struct InterfaceStats {
     pub tx_retries: Option<u64>,
 }
 
+/// Whether `rx_drops` and `tx_drops` are counted on this platform. macOS
+/// reads `netstat -ibn`, which has no drop column, so its drops are 0 by
+/// construction rather than by measurement. `netstat -ibnd` does print one;
+/// reading it is future work.
+pub const IFACE_DROPS_COUNTED: bool = !cfg!(target_os = "macos");
+
 #[derive(Debug, Clone)]
 pub struct InterfaceInfo {
     pub name: String,

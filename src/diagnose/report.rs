@@ -360,9 +360,18 @@ impl Report {
                     ));
                 }
                 (_, _, Some(missing)) => {
+                    // Why it is missing, in the words of its `why_not`: a
+                    // test nobody has run is not a probe that failed to report.
+                    let why = missing
+                        .why_not
+                        .as_ref()
+                        .map_or("not measured", super::issue::Availability::label);
                     m.push_str(&format!(
-                        "Not measured: {} — {}.\n\n",
-                        missing.name, missing.detail
+                        "{}{}: {} — {}.\n\n",
+                        why[..1].to_uppercase(),
+                        &why[1..],
+                        missing.name,
+                        missing.detail
                     ));
                 }
                 _ => {}
@@ -776,7 +785,7 @@ mod tests {
 
     #[test]
     fn a_qualified_cause_names_the_measurement_it_is_missing() {
-        use crate::diagnose::issue::{Cause, CheckResult};
+        use crate::diagnose::issue::{Availability, Cause, CheckResult};
         let mut report = report();
         report.issues.truncate(1);
         let issue = &mut report.issues[0];
@@ -785,9 +794,10 @@ mod tests {
             "the receiver is queueing",
             vec![
                 CheckResult::pass("symptom", "rtt tracks our own tx", "3 MB/s in flight"),
-                CheckResult::skipped(
+                CheckResult::not_run(
                     "discriminator",
                     "link-level bufferbloat test passed",
+                    Availability::AwaitingTest,
                     "no loaded-rtt test has run",
                 )
                 .weighted(2.0),
@@ -795,8 +805,12 @@ mod tests {
         )];
         let md = report.to_markdown();
         assert!(
-            md.contains("Not measured: link-level bufferbloat test passed"),
+            md.contains("Awaiting test: link-level bufferbloat test passed"),
             "{md}"
+        );
+        assert!(
+            !md.contains("Not measured:"),
+            "a test nobody has run is not a measurement that failed: {md}"
         );
         assert!(
             !md.contains("Sufficient evidence: link-level bufferbloat test passed"),

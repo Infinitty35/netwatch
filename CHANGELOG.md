@@ -2,6 +2,177 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+Diagnose stops reading what it did not measure as evidence. A check that
+could not run now says why instead of passing, a probe that sent nothing no
+longer counts as an answer, and nothing Diagnose draws is green until it has
+earned it. A lab that runs the real engine against a network it controls now
+checks, in CI, that DNS, gateway and path findings open and close when they
+should.
+
+### Changed
+- Diagnose checks that could not run now say why. Each carries a `why_not`
+  from the words the coverage view already uses: `not_measured`,
+  `not_implemented`, `awaiting_test`, `not_applicable`, `unsupported` or
+  `learning`. Each also has a `state` of `passed`, `failed` or `not_run` next
+  to `passed`. `diagnose run --format json` only gains fields, and older
+  recordings still load.
+- The Diagnose tab's check lines, the text output of `diagnose run` and the
+  Markdown report give that reason in place of a blanket "not measured"
+  ("awaiting test: link-level bufferbloat test passed"). A test nobody has
+  run, a probe netwatch has never had and a sample that has not arrived no
+  longer read the same. Redacted exports keep the reason even though they
+  clear the detail.
+- A timing stage a target does not have, such as TLS on an `http://` target,
+  reads as not applicable rather than waiting forever for a baseline. So does
+  a reference resolver's answer that came back without AD. The clock-offset
+  check reads as unsupported on macOS and Windows, where netwatch does not
+  read the NTP status.
+- The resolver step no longer promises a write. It said netwatch "writes
+  resolv.conf, keeps a backup, and puts it back on quit", but live ↵ wrote
+  nothing and recorded "not applied". The step now appears only for an
+  alternate resolver that was measured: for a slow resolver, one that
+  answered in under a quarter of its median, and for a failing one, one that
+  answered at all. It gives the measured time and the command to run (`sudo
+  netwatch resolver set <alt> --unmanaged`, or `resolvectl dns <iface>
+  <alt>`). netwatch does not time an alternate resolver on a live host yet, so
+  for now only the demo shows the step. Live mode no longer offers ↵ at all,
+  and Enter says to run the command shown. The demo still offers and
+  simulates the switch. The unused `apply_file_edit` and `make_permanent`
+  helpers are gone.
+- An incomplete verdict is no longer drawn with the green ● of health. The
+  Diagnose tab reads `◌ no issues found · …` in muted text, the header shows a
+  muted `◌ no issues`, and `y` copies the words on screen. No verdict
+  Diagnose can reach today earns green, so nothing is drawn green.
+- The feature schema hash changed from `a3141086556720b1` to
+  `e476c3f5ae717da6`. `ml/schema.json` gained two check columns,
+  `check.dns.slow_resolver.local_udp_path.local_drop_counters` and
+  `check.tcp.retrans_burst.packet_loss.socket_rtt_below_queueing_line`, so
+  `netwatch_ml.load` refuses feature files exported by 0.32. Export them again
+  with `netwatch diagnose features`.
+
+### Added
+- A headless lab driver, `examples/diagnose_lab`, runs the real `App::tick`
+  once a second and prints one JSON line per tick: the verdict, what each
+  health probe measured and against which address, and every tracked issue
+  with its state, closed ones included. It refuses to start unless its home,
+  cache, config and state directories are inside a temp home the lab created.
+  `--seed` gives the gateway, DNS and path baselines ready values before the
+  first tick, so a recorded episode replays against the same baselines. A
+  seed that can't be applied stops the driver instead of leaving those rules
+  learning.
+- `tests/diagnose/health_lab.py` gives Diagnose a network it controls. A peer
+  namespace owns 1.1.1.1, a temp `resolv.conf` names the lab gateway, and
+  sysfs is remounted so interface rules read the lab's interfaces, not the
+  host's. The lab keeps its own `resolv.conf` when the host's systemd-resolved
+  rewrites its file mid-run. It drives the real engine through a slow, dead
+  and lossy resolver, total gateway loss, ICMP delay at the gateway, delay
+  beyond it, and a healthy link. It asserts what opens, what is listed under
+  what, what closes and when, and that a scenario expecting nothing kept its
+  rules measured throughout. `--quick` runs in the CI workflow the release
+  guard waits on, on every push to main and on pull requests that touch
+  Diagnose. The 20-minute quiet-loss negative runs weekly. A run that hangs is
+  killed 60 s past its length, and a killed or timed-out run takes its
+  namespaces and resolvers with it.
+- Tests that hold Diagnose to the above. The pinned replay corpus now carries
+  health-probe times, so it sees DNS and gateway decisions. It was re-recorded
+  at the new 100 ms DNS ceiling, and the fixture's slow resolver is pinned: it
+  opens at 06:48:20 on its baseline, with the upstream forwarder as the top
+  cause. `iface.errors`, `iface.saturated` and `tcp.retrans_burst` each have
+  tests that fire at today's thresholds and stay quiet just below them. One
+  test lists every input Diagnose can leave unmeasured and fails if a
+  detector reads one as evidence.
+- The README says how to report a Diagnose misread, and asks for the output
+  of `netwatch diagnose run --format json`.
+
+### Fixed
+- "100% loss" on a fresh start, and on any host where ICMP is blocked and
+  the gateway answers no TCP port. The prober started every series at 100%
+  and reported 100% when a probe could not be sent at all, so the dashboard
+  tile, Lite's verdict line, the dense view and every export read a working
+  network as dead until the first probe landed, or for good without
+  privileges. Loss is now a three-state value: pending, unmeasured with the
+  reason ("icmp is blocked here and the gateway answers no tcp port", "the
+  resolver address is not usable by the probe"), or measured. Unmeasured
+  probes no longer enter the rtt history, so Diagnose sees no observation
+  rather than a dead gateway or a resolver failing 100% of queries. The
+  incident report, AI Insights, the remote payload and the metrics endpoint
+  carry "unmeasured" or `null` instead of `100`.
+- Diagnose findings that read an input nobody measured as evidence:
+  - `dns.slow_resolver` blamed the local UDP path on nothing. With no
+    alternate resolver probed, "the alternate is also slow" passed, and one
+    dropped frame a minute counted as interface drops, so a Wi-Fi laptop got
+    "local: conntrack, udp buffers or nftables · strong". The alternate check
+    now shows as not measured when there is no alternate, and the drops check
+    needs the same 60/min floor as `iface.errors`. Until netwatch reads the
+    kernel's UDP and conntrack drop counters, that cause can reach Likely at
+    most, never Strong.
+  - A socket whose RTT was never measured was treated as a 0 ms socket. It
+    can no longer open `tcp.bufferbloat_remote` or give it RTT evidence. A
+    retransmit burst on such a socket still opens, but its "rtt below the
+    queueing line" check shows as not measured, so the cause stays at Likely.
+  - An idle Wi-Fi link read as 0% retries. Under 1,000 frames a minute there
+    is no retry share, and `retries_high` gives that as the reason it did not
+    run instead of saying there is no retry counter. With no signal level
+    either, `wifi.weak_signal` coverage says its inputs were not measured.
+  - An interface the platform gave no info for read as "carrier up, wired".
+    `link.down` and `wifi.weak_signal` now report not measured, and an open
+    `link.down` no longer closes as fixed when the interface's info
+    disappears.
+  - macOS counts no interface drops (`netstat -ibn` has no drop column), and
+    Diagnose read that as 0. There, `iface.errors` now judges errors alone
+    and ranks a bad cable or duplex mismatch as the probable cause, not a
+    small ring buffer. Its drop checks and `local_udp_path`'s
+    `interface_drops` report `unsupported`, and recordings carry
+    `"drops_per_min": null`.
+  - `netwatch diagnose run` exited 0 ("the rules that could be evaluated
+    were") on a host where ICMP is blocked and the gateway answers no TCP
+    port, because a gateway probe that sent nothing still counted as
+    evidence. It now exits 2 (incomplete) unless a gateway or resolver was
+    actually measured or a target probe completed.
+- On a systemd-resolved host `dns.slow_resolver` times the local stub, which
+  answers root NS from its cache in 0 ms, and nothing said so. Coverage now
+  reads "limited: measures the local stub at 127.0.0.53, not the upstream", a
+  finding's scope says the same, and checks that would need the upstream
+  show as not measured.
+- Diagnose verdicts that were wrong for reasons no better model would fix:
+  - `dns.failing` read an ICMP probe that has never run on the live path as
+    "no reply", so every failing resolver ranked as *down*. A check that was
+    not made now shows as not run for both causes, and the ranking says so.
+  - `dns.slow_resolver`'s first-run ceiling was 20 ms, inside the normal
+    range of ISP and mobile resolvers, so a first run on such a network opened
+    a finding with no baseline behind it. The ceiling is now 100 ms; anything
+    below that waits for the 3σ baseline test. The catalogue text matches.
+  - The `dns.rtt_p50` baseline was learned from the latest single probe while
+    the rule judged the rolling p50 of the probe history, two different
+    statistics under one name. The baseline is now fed the p50 it is asked
+    to judge, and only from a cycle that got a reply. The history still holds
+    the replies from before an outage, so a silent resolver used to keep
+    feeding its baseline the old timings.
+  - `tcp.bufferbloat_remote` opened at Medium on any sending socket with rtt
+    ≥ 100 ms even when no loaded-rtt test had placed the queue. It was already
+    retitled "side unmeasured" in that case; it is now Info as well, since an
+    unplaced queue is a reason to run the test, not a fault.
+  - The link, saturation and socket detectors read `Thresholds::default()`
+    instead of the engine's thresholds, so tuning the engine did not reach
+    them. They take the engine's thresholds now.
+  - `tcp.retrans_burst`'s catalogue trigger described a 3σ-over-baseline test
+    the code does not implement; it now describes the absolute test it does
+    (5 or more retransmits per minute on a socket under the queueing rtt).
+  - `path.rtt_spike` never opened or closed while periodic traces ran. Each
+    new trace cleared the last one's path for a tick, which restarted both
+    the confirmation and the verify hold. The previous trace now stands until
+    its result is 120 s old.
+
+### Known gaps
+- No recorded episode shows a finding opening and then closing. The pinned
+  corpus's three findings all stay open to its end, so the replay test cannot
+  catch a change in when a finding closes, and no rule this release touched
+  has an open-to-close episode behind it. The health lab checks the closes of
+  the DNS, gateway and path rules it drives. An open-to-close episode for
+  every touched rule is a condition of 0.34.
+
 ## [0.32.5] - 2026-09-27
 
 ### Fixed

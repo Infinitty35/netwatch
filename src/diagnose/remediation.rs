@@ -7,11 +7,13 @@
 //! for manual review. Automatic TUI apply actions remain disabled; the explicit
 //! Linux resolver command uses its own fixed root-owned authority store.
 //!
-//! The legacy apply/reconcile APIs remain for transaction tests and explicit
-//! library callers. They journal before mutation and compare installed contents
-//! before reverting, but do not provide durable storage, trustworthy PID identity,
-//! cross-process exclusion or path validation. They are not the live bootstrap's
-//! authorized recovery mechanism.
+//! The legacy reconcile APIs remain for journals an older netwatch wrote and for
+//! explicit library callers. They compare installed contents before reverting,
+//! but do not provide durable storage, trustworthy PID identity, cross-process
+//! exclusion or path validation. They are not the live bootstrap's authorized
+//! recovery mechanism. The file-edit and make-permanent helpers that wrote those
+//! journals had no caller and are gone (decision X02); the resolver command
+//! writes in place through its own store.
 
 pub mod resolver;
 pub mod store;
@@ -19,7 +21,7 @@ pub mod store;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::issue::{Action, Applied};
+use super::issue::Action;
 
 /// Where a journal entry is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,105 +307,6 @@ impl Journal {
         Ok(())
     }
 
-    /// Apply a file-edit remediation: journal the intent, back the file up,
-    /// then write. Errors are returned only before the target write is attempted.
-    /// Any subsequent failure is recorded as recovery-required, even if a
-    /// failed write may have left only part of the intended contents.
-    ///
-    /// Returns the [`Applied`] record to attach to the [`Step`], carrying the
-    /// before/after values the report prints.
-    ///
-    /// [`Step`]: super::issue::Step
-    pub fn apply_file_edit<H: Host>(
-        &mut self,
-        host: &mut H,
-        issue_id: &str,
-        action: Action,
-        target: &Path,
-        new_contents: &str,
-        summarise: impl Fn(&str) -> String,
-    ) -> std::io::Result<Applied> {
-        self.ensure_writable()?;
-        if self
-            .entries
-            .iter()
-            .any(|e| e.target.as_deref() == Some(target) && e.state != EntryState::Reverted)
-        {
-            return Err(std::io::Error::other(
-                "target has an existing change; review recovery before applying again",
-            ));
-        }
-        let before = host.read(target)?;
-        let backup = backup_path(target, host.pid());
-
-        // 1. Journal the intent *first*. A crash between here and the write
-        //    leaves a Pending entry, and reconciliation can check whether the
-        //    write actually landed.
-        let entry = JournalEntry {
-            id: format!("{}-{}", issue_id, self.entries.len() + 1),
-            issue_id: issue_id.to_string(),
-            action,
-            target: Some(target.to_path_buf()),
-            backup: Some(backup.clone()),
-            installed: Some(new_contents.to_string()),
-            state: EntryState::Pending,
-            applied_at: host.now(),
-            pid: host.pid(),
-            permanent: false,
-        };
-        let idx = self.entries.len();
-        self.entries.push(entry);
-        self.flush(host)?;
-
-        // 2. Back up, then write.
-        host.write(&backup, &before)?;
-        if let Err(e) = host.write(target, new_contents) {
-            return Ok(self.recovery_required(idx, "target write", &e));
-        }
-
-        // 3. Confirm.
-        self.entries[idx].state = EntryState::Applied;
-        if let Err(e) = self.flush(host) {
-            return Ok(self.recovery_required(idx, "completion journal write", &e));
-        }
-
-        Ok(Applied::Yes {
-            at: self.entries[idx].applied_at.clone(),
-            before: summarise(&before),
-            after: summarise(new_contents),
-        })
-    }
-
-    fn recovery_required(&self, idx: usize, stage: &str, error: &std::io::Error) -> Applied {
-        let entry = &self.entries[idx];
-        Applied::RecoveryRequired {
-            operation_id: entry.id.clone(),
-            reason: format!("{stage} failed: {error}; target may have changed"),
-            backup: entry
-                .backup
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        }
-    }
-
-    /// Mark an issue's changes permanent — they survive quit and are never
-    /// reconciled away.
-    pub fn make_permanent<H: Host>(&mut self, host: &mut H, issue_id: &str) -> std::io::Result<()> {
-        self.ensure_writable()?;
-        let previous = self.entries.clone();
-        for e in self.entries.iter_mut() {
-            if e.issue_id == issue_id && e.state == EntryState::Applied {
-                e.permanent = true;
-            }
-        }
-        if let Err(e) = self.flush(host) {
-            self.entries = previous;
-            return Err(e);
-        }
-        Ok(())
-    }
-
     /// Put one entry back. Refuses when the target no longer contains what we
     /// installed — that means something else edited it, and clobbering that
     /// would be worse than leaving our change in place.
@@ -539,14 +442,6 @@ fn describe(e: &JournalEntry) -> String {
     }
 }
 
-/// `/etc/resolv.conf` → `/etc/resolv.conf.netwatch-<pid>.bak`, kept next to
-/// the original so a human looking at the directory finds it immediately.
-fn backup_path(target: &Path, pid: u32) -> PathBuf {
-    let mut name = target.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".netwatch-{pid}.bak"));
-    target.with_file_name(name)
-}
-
 /// Build the resolv.conf text that switching to `addr` produces: replace the
 /// first `nameserver` line, leave every other directive (search, options,
 /// comments) untouched.
@@ -593,7 +488,6 @@ mod tests {
         clock: u32,
         writes: usize,
         fail_write: Option<usize>,
-        partial_write: bool,
         unreadable: HashSet<PathBuf>,
     }
 
@@ -623,10 +517,6 @@ mod tests {
         fn write(&mut self, path: &Path, contents: &str) -> std::io::Result<()> {
             self.writes += 1;
             if self.fail_write == Some(self.writes) {
-                if self.partial_write {
-                    self.files
-                        .insert(path.to_path_buf(), contents.chars().take(7).collect());
-                }
                 return Err(std::io::Error::other("injected write failure"));
             }
             self.files.insert(path.to_path_buf(), contents.to_string());
@@ -653,20 +543,39 @@ mod tests {
         PathBuf::from("/var/cache/netwatch/applied.json")
     }
 
-    fn apply_resolver(host: &mut FakeHost, journal: &mut Journal, addr: &str) -> Applied {
+    /// What a netwatch before 0.33 left on disk after switching the resolver:
+    /// the journal entry, a backup beside the target, and the rewritten
+    /// target. Nothing writes these any more (decision X02), but a journal an
+    /// older version wrote can still hold them.
+    fn legacy_apply(host: &mut FakeHost, journal: &mut Journal, addr: &str) {
         let target = PathBuf::from(TARGET);
-        let current = host.read(&target).unwrap_or_default();
-        let new = resolv_conf_with(&current, addr);
-        journal
-            .apply_file_edit(
-                host,
-                "2026-0903-01",
-                Action::SetResolver { addr: addr.into() },
-                &target,
-                &new,
-                first_nameserver,
-            )
-            .unwrap()
+        let before = host.read(&target).unwrap();
+        let installed = resolv_conf_with(&before, addr);
+        let backup = PathBuf::from(format!("{TARGET}.netwatch-{}.bak", host.pid()));
+        journal.entries.push(JournalEntry {
+            id: format!("2026-0903-01-{}", journal.entries.len() + 1),
+            issue_id: "2026-0903-01".into(),
+            action: Action::SetResolver { addr: addr.into() },
+            target: Some(target.clone()),
+            backup: Some(backup.clone()),
+            installed: Some(installed.clone()),
+            state: EntryState::Applied,
+            applied_at: host.now(),
+            pid: host.pid(),
+            permanent: false,
+        });
+        journal.flush(host).unwrap();
+        host.write(&backup, &before).unwrap();
+        host.write(&target, &installed).unwrap();
+    }
+
+    /// A legacy entry whose write was never confirmed, with the target left
+    /// holding `target`: the original, or what a partial write left.
+    fn legacy_pending(host: &mut FakeHost, journal: &mut Journal, target: &str) {
+        legacy_apply(host, journal, "1.1.1.1");
+        journal.entries[0].state = EntryState::Pending;
+        journal.flush(host).unwrap();
+        host.files.insert(TARGET.into(), target.into());
     }
 
     #[cfg(unix)]
@@ -700,7 +609,7 @@ mod tests {
         let mut host = FakeHost::new(41);
         host.files.insert(TARGET.into(), RESOLV.into());
         let mut legacy = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut legacy, "1.1.1.1");
+        legacy_apply(&mut host, &mut legacy, "1.1.1.1");
         let before = host.files.clone();
         let live = Journal::load_with_store(journal_path(), &host, Some(directory.clone()));
         let warning = live.blocked_reason().unwrap();
@@ -733,7 +642,7 @@ mod tests {
                 let mut host = FakeHost::new(41);
                 host.files.insert(TARGET.into(), RESOLV.into());
                 let mut journal = Journal::new(journal_path());
-                apply_resolver(&mut host, &mut journal, "1.1.1.1");
+                legacy_apply(&mut host, &mut journal, "1.1.1.1");
                 let before = host.files.clone();
                 host.pid = current_pid;
                 host.alive.clear();
@@ -765,8 +674,9 @@ mod tests {
         host.files.clear();
         host.files.insert(TARGET.into(), RESOLV.into());
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "1.1.1.1");
-        journal.make_permanent(&mut host, "2026-0903-01").unwrap();
+        legacy_apply(&mut host, &mut journal, "1.1.1.1");
+        journal.entries[0].permanent = true;
+        journal.flush(&mut host).unwrap();
         let before = host.files.clone();
         assert!(journal
             .inspect_recovery(RecoveryAuthority::InspectOnly)
@@ -792,38 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_then_clean_quit_restores_the_original() {
-        let mut host = FakeHost::new(100);
-        host.write(Path::new(TARGET), RESOLV).unwrap();
-        let mut journal = Journal::new(journal_path());
-
-        let applied = apply_resolver(&mut host, &mut journal, "192.168.8.1");
-        assert_eq!(
-            applied,
-            Applied::Yes {
-                at: "2026-09-03 06:50:00".into(),
-                before: "169.254.1.1".into(),
-                after: "192.168.8.1".into()
-            }
-        );
-        assert_eq!(
-            first_nameserver(&host.read(Path::new(TARGET)).unwrap()),
-            "192.168.8.1"
-        );
-
-        let r = journal.revert_session(&mut host);
-        assert_eq!(r.reverted.len(), 1);
-        assert_eq!(host.read(Path::new(TARGET)).unwrap(), RESOLV);
-    }
-
-    #[test]
     fn a_killed_netwatch_does_not_leave_the_resolver_rewritten() {
         // Run 1 applies the change and is then SIGKILLed: no revert_session,
         // and the journal on disk still says Applied.
         let mut host = FakeHost::new(100);
         host.write(Path::new(TARGET), RESOLV).unwrap();
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "192.168.8.1");
+        legacy_apply(&mut host, &mut journal, "192.168.8.1");
         drop(journal);
         host.alive.remove(&100);
 
@@ -883,7 +768,7 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.write(Path::new(TARGET), RESOLV).unwrap();
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "192.168.8.1");
+        legacy_apply(&mut host, &mut journal, "192.168.8.1");
         drop(journal);
         host.alive.remove(&100);
 
@@ -915,8 +800,9 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.write(Path::new(TARGET), RESOLV).unwrap();
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "192.168.8.1");
-        journal.make_permanent(&mut host, "2026-0903-01").unwrap();
+        legacy_apply(&mut host, &mut journal, "192.168.8.1");
+        journal.entries[0].permanent = true;
+        journal.flush(&mut host).unwrap();
 
         let r = journal.revert_session(&mut host);
         assert!(r.is_empty());
@@ -942,7 +828,7 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.write(Path::new(TARGET), RESOLV).unwrap();
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "192.168.8.1");
+        legacy_apply(&mut host, &mut journal, "192.168.8.1");
 
         // A second netwatch starts while the first is still running.
         host.pid = 200;
@@ -962,7 +848,7 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.write(Path::new(TARGET), RESOLV).unwrap();
         let mut journal = Journal::new(journal_path());
-        apply_resolver(&mut host, &mut journal, "192.168.8.1");
+        legacy_apply(&mut host, &mut journal, "192.168.8.1");
         drop(journal);
         host.alive.remove(&100);
         host.pid = 200;
@@ -979,78 +865,16 @@ mod tests {
         assert_eq!(host.read(Path::new(TARGET)).unwrap(), RESOLV);
     }
 
-    fn try_apply(host: &mut FakeHost, journal: &mut Journal) -> std::io::Result<Applied> {
-        journal.apply_file_edit(
-            host,
-            "fault-test",
-            Action::SetResolver {
-                addr: "1.1.1.1".into(),
-            },
-            Path::new(TARGET),
-            &resolv_conf_with(RESOLV, "1.1.1.1"),
-            first_nameserver,
-        )
-    }
-
-    #[test]
-    fn faults_before_target_write_do_not_change_target() {
-        for stage in [1, 2] {
-            let mut host = FakeHost::new(100);
-            host.files.insert(TARGET.into(), RESOLV.into());
-            host.fail_write = Some(stage);
-            let mut journal = Journal::new(journal_path());
-            assert!(try_apply(&mut host, &mut journal).is_err());
-            assert_eq!(host.files[Path::new(TARGET)], RESOLV);
-        }
-    }
-
-    #[test]
-    fn target_write_and_completion_failures_record_recovery_required() {
-        for stage in [3, 4] {
-            for partial in [false, true] {
-                let mut host = FakeHost::new(100);
-                host.files.insert(TARGET.into(), RESOLV.into());
-                host.fail_write = Some(stage);
-                host.partial_write = partial;
-                let mut journal = Journal::new(journal_path());
-                let outcome = try_apply(&mut host, &mut journal).unwrap();
-                let Applied::RecoveryRequired {
-                    operation_id,
-                    backup,
-                    ..
-                } = &outcome
-                else {
-                    panic!("expected recovery required: {outcome:?}");
-                };
-                assert_eq!(operation_id, "fault-test-1");
-                assert_eq!(host.files[Path::new(backup)], RESOLV);
-                assert!(outcome
-                    .recovery_summary()
-                    .unwrap()
-                    .contains("recovery required"));
-                if stage == 4 {
-                    assert_eq!(
-                        host.files[Path::new(TARGET)],
-                        resolv_conf_with(RESOLV, "1.1.1.1")
-                    );
-                    assert!(journal.blocked_reason().is_some());
-                }
-                let writes = host.writes;
-                assert!(try_apply(&mut host, &mut journal).is_err());
-                assert_eq!(host.writes, writes, "retry must preserve the backup");
-            }
-        }
-    }
-
     #[test]
     fn partial_pending_write_is_not_reported_as_reverted_after_restart() {
         let mut host = FakeHost::new(100);
         host.files.insert(TARGET.into(), RESOLV.into());
-        host.fail_write = Some(3);
-        host.partial_write = true;
         let mut journal = Journal::new(journal_path());
-        try_apply(&mut host, &mut journal).unwrap();
-        let partial = host.files[Path::new(TARGET)].clone();
+        let partial: String = resolv_conf_with(RESOLV, "1.1.1.1")
+            .chars()
+            .take(7)
+            .collect();
+        legacy_pending(&mut host, &mut journal, &partial);
         host.alive.remove(&100);
         host.pid = 200;
         let mut restarted = Journal::load(journal_path(), &host);
@@ -1065,9 +889,8 @@ mod tests {
     fn pending_write_with_unchanged_target_and_backup_is_resolved() {
         let mut host = FakeHost::new(100);
         host.files.insert(TARGET.into(), RESOLV.into());
-        host.fail_write = Some(3);
         let mut journal = Journal::new(journal_path());
-        try_apply(&mut host, &mut journal).unwrap();
+        legacy_pending(&mut host, &mut journal, RESOLV);
         let result = journal.revert_session(&mut host);
         assert_eq!(result.reverted.len(), 1);
         assert!(result.abandoned.is_empty());
@@ -1082,8 +905,6 @@ mod tests {
             host.files.insert(TARGET.into(), RESOLV.into());
             let mut journal = Journal::load(journal_path(), &host);
             assert!(journal.blocked_reason().is_some());
-            assert!(try_apply(&mut host, &mut journal).is_err());
-            assert!(journal.make_permanent(&mut host, "fault-test").is_err());
             assert!(!journal.reconcile(&mut host).abandoned.is_empty());
             assert!(!journal.revert_session(&mut host).abandoned.is_empty());
             assert_eq!(host.writes, 0);
@@ -1100,21 +921,8 @@ mod tests {
         host.unreadable.insert(journal_path());
         let mut journal = Journal::load(journal_path(), &host);
         assert!(journal.blocked_reason().unwrap().contains("cannot read"));
-        assert!(try_apply(&mut host, &mut journal).is_err());
         journal.revert_session(&mut host);
         assert_eq!(host.writes, 0);
-    }
-
-    #[test]
-    fn missing_or_unreadable_target_is_never_replaced_with_empty_contents() {
-        let mut host = FakeHost::new(100);
-        let mut journal = Journal::new(journal_path());
-        assert!(try_apply(&mut host, &mut journal).is_err());
-        host.files.insert(TARGET.into(), RESOLV.into());
-        host.unreadable.insert(TARGET.into());
-        assert!(try_apply(&mut host, &mut journal).is_err());
-        assert_eq!(host.writes, 0);
-        assert!(journal.entries().is_empty());
     }
 
     #[test]
@@ -1122,7 +930,7 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.files.insert(TARGET.into(), RESOLV.into());
         let mut journal = Journal::new(journal_path());
-        try_apply(&mut host, &mut journal).unwrap();
+        legacy_apply(&mut host, &mut journal, "1.1.1.1");
         host.unreadable.insert(TARGET.into());
         let result = journal.revert_session(&mut host);
         assert!(result.reverted.is_empty());
@@ -1135,18 +943,12 @@ mod tests {
         let mut host = FakeHost::new(100);
         host.files.insert(TARGET.into(), RESOLV.into());
         let mut journal = Journal::new(journal_path());
-        try_apply(&mut host, &mut journal).unwrap();
+        legacy_apply(&mut host, &mut journal, "1.1.1.1");
         host.fail_write = Some(host.writes + 2); // restore succeeds; journal fails
         let result = journal.revert_session(&mut host);
         assert_eq!(host.files[Path::new(TARGET)], RESOLV);
         assert_eq!(result.reverted.len(), 1);
         assert_eq!(result.abandoned.len(), 1);
         assert!(journal.blocked_reason().is_some());
-    }
-
-    #[test]
-    fn backup_path_sits_next_to_the_original() {
-        let p = backup_path(Path::new("/etc/resolv.conf"), 4242);
-        assert_eq!(p, PathBuf::from("/etc/resolv.conf.netwatch-4242.bak"));
     }
 }

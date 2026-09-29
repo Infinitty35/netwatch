@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::baseline::BaselineStore;
 use super::issue::{
-    Action, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject, Verify,
+    Action, Availability, Capability, Cause, CheckResult, Evidence, Scope, Severity, Step, Subject,
+    Verify,
 };
 use super::rules;
 
@@ -28,7 +29,11 @@ pub struct Thresholds {
     /// A socket verdict must persist this long before it becomes an issue.
     pub verdict_hold_secs: u64,
     /// Absolute DNS ceiling — a resolver this slow is a problem whatever its
-    /// baseline says, which is what makes the rule work on a first run.
+    /// baseline says, which is what makes the rule work on a first run. It
+    /// has to sit above what ordinary resolvers do: the previous 20 ms was
+    /// inside the normal range of ISP and mobile resolvers, so every first
+    /// run on such a network opened a finding with no baseline behind it.
+    /// Anything the baseline can catch, the 3σ test catches once it is ready.
     pub dns_ceiling_ms: f64,
     /// Socket rtt above this, with retransmits, reads as receiver-side queue.
     pub socket_rtt_ms: f64,
@@ -62,7 +67,7 @@ impl Default for Thresholds {
             sigma_k: 3.0,
             consecutive_n: 3,
             verdict_hold_secs: 30,
-            dns_ceiling_ms: 20.0,
+            dns_ceiling_ms: 100.0,
             socket_rtt_ms: 100.0,
             loaded_rtt_delta_ms: 100.0,
             saturation_pct: 90.0,
@@ -145,17 +150,18 @@ pub fn classify_socket(s: &SocketObs, t: &Thresholds) -> SocketVerdict {
     if s.rwnd == Some(0) {
         return SocketVerdict::ZeroWindow;
     }
-    let rtt = s.rtt_ms.unwrap_or(0.0);
-
     // Retransmits dominate: a socket losing segments is describing the path,
     // not its own queueing, and the retrans rule carries the better causes.
-    if s.retrans.is_some_and(|n| n >= 5) && rtt < t.socket_rtt_ms {
+    // The count is measured; with no rtt only the queueing exclusion is
+    // unknown, and the finding says so rather than reading the rtt as 0.
+    if s.retrans.is_some_and(|n| n >= 5) && s.rtt_ms.is_none_or(|r| r < t.socket_rtt_ms) {
         return SocketVerdict::RetransBurst;
     }
 
     // Bufferbloat: high rtt while *this* socket is the one sending. A high rtt
-    // on an idle socket is just a distant peer.
-    if rtt >= t.socket_rtt_ms && s.tx_bps > 0.0 {
+    // on an idle socket is just a distant peer, and a socket with no rtt is
+    // not a bloated one.
+    if s.rtt_ms.is_some_and(|r| r >= t.socket_rtt_ms) && s.tx_bps > 0.0 {
         return SocketVerdict::Bufferbloat;
     }
 
@@ -219,7 +225,10 @@ pub struct IfaceObs {
     #[serde(default)]
     pub counter_window_secs: Option<f64>,
     pub name: String,
-    pub carrier: bool,
+    /// Link up. `None` when the platform gave no info for this interface,
+    /// which is not the same as up. Older recordings' booleans read as
+    /// `Some`.
+    pub carrier: Option<bool>,
     pub rx_errors: u64,
     pub tx_errors: u64,
     pub rx_dropped: u64,
@@ -228,19 +237,32 @@ pub struct IfaceObs {
     /// counter. A NIC that logged 40 errors during boot last month is not a
     /// live fault, and a per-tick delta reported as "/min" is off by 60.
     pub errors_per_min: u64,
-    pub drops_per_min: u64,
+    /// `None` where the platform does not count drops (macOS), which is not
+    /// the same as none dropped.
+    pub drops_per_min: Option<u64>,
     pub link_rate_bps: Option<f64>,
     pub rx_bps: f64,
     pub tx_bps: f64,
-    /// The kernel registered this as an 802.11 device.
-    pub wireless: bool,
+    /// The kernel registered this as an 802.11 device. `None` when the
+    /// platform did not say, which is not the same as wired.
+    pub wireless: Option<bool>,
     /// Signal level, where the platform reports one.
     pub signal_dbm: Option<i32>,
     /// Transmit retries over the last minute as a share of frames sent.
+    /// `None` when the radio sent too few frames for a share to mean
+    /// anything, so an idle link does not read as 0%.
     pub tx_retry_pct: Option<f64>,
 }
 
 impl IfaceObs {
+    /// Errors plus drops a minute, where drops are counted, and errors alone
+    /// where they are not. `iface.errors` opens and verifies on this one
+    /// statistic.
+    pub fn error_rate(&self) -> u64 {
+        self.drops_per_min
+            .map_or(self.errors_per_min, |d| self.errors_per_min + d)
+    }
+
     pub fn utilisation_pct(&self) -> Option<f64> {
         let rate = self.link_rate_bps?;
         if rate <= 0.0 {
@@ -271,6 +293,18 @@ pub struct DnsObs {
     pub window_secs: u64,
     /// The latest answer cross-check against a validating reference.
     pub cross: Option<DnsCross>,
+}
+
+impl DnsObs {
+    /// The configured resolver is a stub on this host, such as
+    /// systemd-resolved's 127.0.0.53. The probe asks root NS, which the stub
+    /// answers from its cache, so what it times is the stub's round trip,
+    /// not the upstream the stub forwards to.
+    pub fn is_local_stub(&self) -> bool {
+        self.resolver
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
 }
 
 /// A public name asked of the configured resolver and of a validating
@@ -389,7 +423,7 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     let mut out = Vec::new();
     out.extend(super::active::detect(&obs.active));
     out.extend(super::kernel::detect(obs.kernel.as_ref()));
-    out.extend(detect_link(obs));
+    out.extend(detect_link(obs, t));
     out.extend(detect_gateway(obs, base, t));
     out.extend(detect_dns(obs, base, t));
     out.extend(detect_paths(obs, base, t));
@@ -398,11 +432,12 @@ pub fn detect(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     out.extend(detect_nat(obs));
     out.extend(super::egress::detect(obs.egress.as_ref()));
     out.extend(detect_targets(obs, base, t));
+    let valid = |d: &Detection| ids_are_valid(d).and_then(|()| not_run_checks_say_why(d));
     debug_assert!(
-        out.iter().all(|d| ids_are_valid(d).is_ok()),
+        out.iter().all(|d| valid(d).is_ok()),
         "{:?}",
         out.iter()
-            .filter_map(|d| ids_are_valid(d).err())
+            .filter_map(|d| valid(d).err())
             .collect::<Vec<_>>()
     );
     out
@@ -500,9 +535,10 @@ fn target_detection(
             .count();
         let asked = target.lookups.len();
         let other_answers = if asked == 0 {
-            CheckResult::skipped(
+            CheckResult::not_run(
                 "another_resolver_answers",
                 "another resolver knows the name",
+                Availability::NotMeasured,
                 "no resolvers to ask directly",
             )
         } else if answered > 0 {
@@ -552,9 +588,10 @@ fn target_detection(
                             "public names are failing too",
                             "the resolver answers other names",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "public_names_failing_too",
                             "public names are failing too",
+                            Availability::NotMeasured,
                             "no resolver probe",
                         ),
                     },
@@ -572,9 +609,10 @@ fn target_detection(
                         )
                         .weighted(2.0)
                     } else if asked == 0 {
-                        CheckResult::skipped(
+                        CheckResult::not_run(
                             "every_resolver_says_nxdomain",
                             "every resolver says it doesn't exist",
+                            Availability::NotMeasured,
                             "no resolvers to ask directly",
                         )
                     } else {
@@ -681,9 +719,10 @@ fn target_detection(
                             "the internet is reachable",
                             "nothing beyond the gateway answers",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "internet_reachable",
                             "the internet is reachable",
+                            Availability::NotMeasured,
                             "no internet probe",
                         ),
                     },
@@ -698,9 +737,10 @@ fn target_detection(
                             "the other address family fails too",
                             "ipv4 and ipv6 both fail",
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "other_address_family_also_fails",
                             "the other address family fails too",
+                            Availability::NotApplicable,
                             "the name has only one address family",
                         ),
                     },
@@ -722,9 +762,10 @@ fn target_detection(
                         "both families behave the same",
                     )
                     .weighted(2.0),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "ipv6_fails_ipv4_works",
                         "ipv6 fails but ipv4 works",
+                        Availability::NotApplicable,
                         "the name has only one address family",
                     ),
                 }],
@@ -827,10 +868,19 @@ fn target_detection(
                             "our clock is more than 5 minutes off",
                             format!("{o:+.0}s"),
                         ),
-                        None => CheckResult::skipped(
+                        // Only Linux reads the local NTP status; elsewhere
+                        // the offset is a platform gap, not a missed sample.
+                        None if cfg!(target_os = "linux") => CheckResult::not_run(
                             "clock_offset_large",
                             "our clock is more than 5 minutes off",
+                            Availability::NotMeasured,
                             "no synchronised local NTP status available",
+                        ),
+                        None => CheckResult::not_run(
+                            "clock_offset_large",
+                            "our clock is more than 5 minutes off",
+                            Availability::Unsupported,
+                            "the local NTP status is read only on Linux",
                         ),
                     },
                 ],
@@ -897,36 +947,41 @@ fn target_detection(
             "the network delivered the request; the answer was an error",
         )];
     } else {
-        // Everything worked. Slower than usual?
+        // Everything worked. Slower than usual? A plain-TCP target has no tls
+        // or first-byte stage, and a plain-HTTP one no tls stage.
         let stages = [
             (
                 "dns_stage_slow",
                 "target.resolve_ms",
                 Some(&target.resolve),
                 "resolve",
+                true,
             ),
             (
                 "connect_stage_slow",
                 "target.connect_ms",
                 target.connect.as_ref(),
                 "connect",
+                true,
             ),
             (
                 "tls_stage_slow",
                 "target.tls_ms",
                 target.tls_stage.as_ref(),
                 "tls",
+                target.tls,
             ),
             (
                 "server_stage_slow",
                 "target.ttfb_ms",
                 target.http_stage.as_ref(),
                 "first byte",
+                target.http,
             ),
         ];
         let sigmas: Vec<_> = stages
             .iter()
-            .map(|(cause, metric, stage, word)| {
+            .map(|(cause, metric, stage, word, applies)| {
                 let ms = stage.and_then(|s| s.ms);
                 let b = base.get(target.baseline_subject(), metric);
                 (
@@ -935,6 +990,7 @@ fn target_detection(
                     ms,
                     b.and_then(|b| ms.and_then(|v| b.sigma_above(v))),
                     b.map(|b| b.mean),
+                    *applies,
                 )
             })
             .collect();
@@ -946,7 +1002,7 @@ fn target_detection(
             return None;
         }
         d = Detection::new("target.slow_stage", subject);
-        let (_, word, ms, _, mean) = worst.0;
+        let (_, word, ms, _, mean, _) = worst.0;
         let mut ev = Evidence::new(
             format!("target.{}_ms", word.replace(' ', "_")),
             ms.unwrap_or_default(),
@@ -959,11 +1015,11 @@ fn target_detection(
         d.evidence
             .push(Evidence::new("target.worst_stage_sigma", worst.1, "σ"));
         let stage_check = |id: &'static str, cause: &str| {
-            let (_, word, ms, sigma, _) = sigmas
+            let (_, word, ms, sigma, _, applies) = sigmas
                 .iter()
                 .find(|s| s.0 == cause)
                 .expect("every stage is listed");
-            stage_result(id, word, *ms, *sigma, t.sigma_k)
+            stage_result(id, word, *applies, *ms, *sigma, t.sigma_k)
         };
         d.causes = vec![
             Cause::new(
@@ -1015,10 +1071,12 @@ fn target_detection(
 }
 
 /// One stage of a target against its baseline. Ids are literals at the call
-/// site, which the catalogue scan reads.
+/// site, which the catalogue scan reads. `applies` is false for a stage this
+/// kind of target never has, such as tls on a plain-HTTP target.
 fn stage_result(
     id: &'static str,
     word: &str,
+    applies: bool,
     ms: Option<f64>,
     sigma: Option<f64>,
     k: f64,
@@ -1029,6 +1087,7 @@ fn stage_result(
             id: id.into(),
             name,
             passed: Some(true),
+            why_not: None,
             detail: format!("{:.0}ms, {s:.1}σ above baseline", ms.unwrap_or_default()),
             weight: 1.0,
         },
@@ -1036,16 +1095,29 @@ fn stage_result(
             id: id.into(),
             name,
             passed: Some(false),
+            why_not: None,
             detail: format!("{s:.1}σ"),
             weight: 1.0,
         },
-        None => CheckResult {
-            id: id.into(),
-            name,
-            passed: None,
-            detail: "no baseline for this stage yet".into(),
-            weight: 1.0,
-        },
+        None => {
+            let (why_not, detail) = if ms.is_some() {
+                (
+                    Availability::Learning,
+                    "no baseline for this stage yet".to_string(),
+                )
+            } else if !applies {
+                (
+                    Availability::NotApplicable,
+                    format!("this target has no {word} stage"),
+                )
+            } else {
+                (
+                    Availability::NotMeasured,
+                    format!("no {word} time in this probe"),
+                )
+            };
+            CheckResult::not_run(id, name, why_not, detail)
+        }
     }
 }
 
@@ -1078,15 +1150,44 @@ fn ids_are_valid(d: &Detection) -> Result<(), String> {
     Ok(())
 }
 
+/// A check that did not run names an [`Availability`] and one that ran does
+/// not. Checked beside the ids on every `detect` in debug builds, so every
+/// detector test also checks the reasons its branches give. `Available` would
+/// print "ready" on a check that did not run, and `Unknown` is only for
+/// records made before `why_not`, so a detector may give neither.
+fn not_run_checks_say_why(d: &Detection) -> Result<(), String> {
+    for c in &d.causes {
+        for k in &c.checks {
+            if k.passed.is_none() != k.why_not.is_some()
+                || matches!(
+                    k.why_not,
+                    Some(Availability::Available | Availability::Unknown)
+                )
+            {
+                return Err(format!(
+                    "{}/{}: passed {:?} with why_not {:?}",
+                    c.key(d.rule),
+                    k.id,
+                    k.passed,
+                    k.why_not
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- link
 
-fn detect_link(obs: &Observations) -> Vec<Detection> {
+fn detect_link(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
     let Some(iface) = &obs.iface else {
         return vec![];
     };
     let mut out = Vec::new();
 
-    if !iface.carrier {
+    // Only a reported down. With no interface info the carrier is unknown,
+    // and unknown is not down.
+    if iface.carrier == Some(false) {
         let mut d = Detection::new(
             "link.down",
             Subject::Iface {
@@ -1108,9 +1209,10 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             Cause::new(
                 "wifi_disassociated",
                 "wifi disassociated",
-                vec![CheckResult::skipped(
+                vec![CheckResult::not_run(
                     "wireless",
                     "wireless",
+                    Availability::NotImplemented,
                     "no wireless statistics for this interface",
                 )],
             ),
@@ -1130,10 +1232,13 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
         return out;
     }
 
-    let t = Thresholds::default();
-    if iface.errors_per_min as f64 >= t.iface_error_floor
-        || iface.drops_per_min as f64 >= t.iface_drop_floor
-    {
+    // Where drops are not counted the rule stands on errors alone, and
+    // neither cause can weigh one against the other.
+    let errors = iface.errors_per_min;
+    let drops_over_floor = iface
+        .drops_per_min
+        .is_some_and(|d| d as f64 >= t.iface_drop_floor);
+    if errors as f64 >= t.iface_error_floor || drops_over_floor {
         let mut d = Detection::new(
             "iface.errors",
             Subject::Iface {
@@ -1141,55 +1246,60 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
             },
         );
         d.evidence.push(
-            Evidence::new(
-                "iface.error_rate",
-                (iface.errors_per_min + iface.drops_per_min) as f64,
-                "/min",
-            )
-            .with_window(60, 1),
+            Evidence::new("iface.error_rate", iface.error_rate() as f64, "/min").with_window(60, 1),
         );
         d.causes = vec![
             Cause::new(
                 "ring_buffer_small",
                 "ring buffer too small for the offered rate",
-                vec![if iface.drops_per_min > iface.errors_per_min {
-                    CheckResult::pass(
+                vec![match iface.drops_per_min {
+                    Some(drops) if drops > errors => CheckResult::pass(
                         "drops_dominate",
                         "drops dominate",
-                        format!(
-                            "{} drops vs {} errors",
-                            iface.drops_per_min, iface.errors_per_min
-                        ),
-                    )
-                } else {
-                    CheckResult::fail(
+                        format!("{drops} drops vs {errors} errors"),
+                    ),
+                    Some(drops) => CheckResult::fail(
                         "drops_dominate",
                         "drops dominate",
-                        format!(
-                            "{} drops vs {} errors",
-                            iface.drops_per_min, iface.errors_per_min
-                        ),
-                    )
+                        format!("{drops} drops vs {errors} errors"),
+                    ),
+                    None => CheckResult::not_run(
+                        "drops_dominate",
+                        "drops dominate",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS",
+                    ),
                 }],
             ),
             Cause::new(
                 "bad_cable_or_duplex",
                 "bad cable or duplex mismatch",
-                vec![if iface.errors_per_min > iface.drops_per_min {
-                    CheckResult::pass(
+                vec![match iface.drops_per_min {
+                    Some(drops) if errors > drops => CheckResult::pass(
                         "errors_dominate",
                         "errors dominate",
-                        format!("{} errors this window", iface.errors_per_min),
-                    )
-                } else {
-                    CheckResult::fail(
+                        format!("{errors} errors this window"),
+                    ),
+                    Some(_) => CheckResult::fail(
                         "errors_dominate",
                         "errors dominate",
-                        format!("only {} errors this window", iface.errors_per_min),
-                    )
+                        format!("only {errors} errors this window"),
+                    ),
+                    None => CheckResult::not_run(
+                        "errors_dominate",
+                        "errors dominate",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS, so errors have nothing to outweigh",
+                    ),
                 }],
             ),
         ];
+        // Neither cause can be tested here, so they rank in the order
+        // written. A ring that is too small overflows as drops, and this
+        // link shows only errors, so the wire goes first.
+        if iface.drops_per_min.is_none() {
+            d.causes.reverse();
+        }
         d.remediation = vec![
             Step::instruct(
                 "grow the rx ring",
@@ -1200,7 +1310,7 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
         out.push(d);
     }
 
-    if iface.wireless {
+    if iface.wireless == Some(true) {
         let weak = matches!(iface.signal_dbm, Some(s) if (s as f64) <= t.wifi_rssi_dbm);
         let retrying = matches!(iface.tx_retry_pct, Some(r) if r > t.wifi_retry_pct);
         if weak || retrying {
@@ -1233,9 +1343,10 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
                             "signal weak",
                             format!("{s} dBm is fine"),
                         ),
-                        None => CheckResult::skipped(
+                        None => CheckResult::not_run(
                             "signal_weak",
                             "signal weak",
+                            Availability::NotMeasured,
                             "no signal level reported",
                         ),
                     }],
@@ -1255,10 +1366,17 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
                                 "retries high",
                                 format!("{r:.0}% of frames retried"),
                             ),
-                            None => CheckResult::skipped(
+                            // The sampler gives no share for a radio
+                            // that sent too little to judge, as well as
+                            // for one with no counter.
+                            None => CheckResult::not_run(
                                 "retries_high",
                                 "retries high",
-                                "no retry counter",
+                                Availability::NotMeasured,
+                                format!(
+                                    "no retry counter, or under {} frames sent in the last minute",
+                                    super::live::WIFI_MIN_FRAMES
+                                ),
                             ),
                         },
                         match iface.signal_dbm {
@@ -1268,9 +1386,10 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
                             Some(s) => {
                                 CheckResult::fail("signal_fine", "signal fine", format!("{s} dBm"))
                             }
-                            None => CheckResult::skipped(
+                            None => CheckResult::not_run(
                                 "signal_fine",
                                 "signal fine",
+                                Availability::NotMeasured,
                                 "no signal level",
                             ),
                         },
@@ -1296,7 +1415,7 @@ fn detect_link(obs: &Observations) -> Vec<Detection> {
     }
 
     if let Some(util) = iface.utilisation_pct() {
-        if util >= Thresholds::default().saturation_pct {
+        if util >= t.saturation_pct {
             let mut d = Detection::new(
                 "iface.saturated",
                 Subject::Iface {
@@ -1355,9 +1474,10 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
             "the internet is reachable through this gateway",
         )
         .weighted(3.0),
-        None => CheckResult::skipped(
+        None => CheckResult::not_run(
             "nothing_beyond_the_gateway_answers_either",
             "nothing beyond the gateway answers either",
+            Availability::NotMeasured,
             "no internet probe has completed yet",
         )
         .weighted(3.0),
@@ -1379,9 +1499,12 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                         "arp resolves",
                         "no arp reply from the gateway",
                     ),
-                    None => {
-                        CheckResult::skipped("arp_resolves", "arp resolves", "no arp probe has run")
-                    }
+                    None => CheckResult::not_run(
+                        "arp_resolves",
+                        "arp resolves",
+                        Availability::NotImplemented,
+                        "no arp probe has run",
+                    ),
                 },
                 CheckResult::fail(
                     "icmp_reaches_the_gateway",
@@ -1404,7 +1527,12 @@ fn detect_gateway(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> V
                     Some(true) => {
                         CheckResult::fail("arp_fails", "arp fails", "arp resolved normally")
                     }
-                    None => CheckResult::skipped("arp_fails", "arp fails", "no arp probe has run"),
+                    None => CheckResult::not_run(
+                        "arp_fails",
+                        "arp fails",
+                        Availability::NotImplemented,
+                        "no arp probe has run",
+                    ),
                 }
                 .weighted(2.0),
                 corroboration,
@@ -1467,9 +1595,10 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
         Cause::new(
             "gateway_loaded",
             "the gateway itself is loaded",
-            vec![CheckResult::skipped(
+            vec![CheckResult::not_run(
                 "gateway_cpu",
                 "gateway cpu",
+                Availability::Unsupported,
                 "netwatch cannot see inside the gateway",
             )],
         ),
@@ -1488,6 +1617,9 @@ fn detect_gateway_rtt(gw: &GatewayObs, base: &BaselineStore, t: &Thresholds) -> 
 }
 
 // ----------------------------------------------------------------- dns
+
+/// Why a check about the resolver's upstream did not run behind a local stub.
+const UPSTREAM_UNKNOWN: &str = "the upstream behind the stub is not identified";
 
 fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<Detection> {
     let Some(dns) = &obs.dns else {
@@ -1510,11 +1642,16 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             Cause::new(
                 "resolver_down",
                 "resolver is down",
+                // `icmp_rtt_ms` is `None` when the probe has not run, which
+                // on the live path is always. Reading that as "no reply" made
+                // every failing resolver rank as down; a check that was never
+                // made is skipped, and the next-test suggester can offer it.
                 vec![match dns.icmp_rtt_ms {
-                    None => CheckResult::pass(
+                    None => CheckResult::not_run(
                         "resolver_unreachable",
                         "resolver unreachable",
-                        "no icmp reply from the resolver",
+                        Availability::NotImplemented,
+                        "no icmp probe of the resolver has run",
                     ),
                     Some(rtt) => CheckResult::fail(
                         "resolver_unreachable",
@@ -1532,15 +1669,16 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver reachable",
                         format!("icmp {rtt:.1}ms but queries fail — udp/53 may be filtered"),
                     ),
-                    None => CheckResult::fail(
+                    None => CheckResult::not_run(
                         "resolver_reachable",
                         "resolver reachable",
-                        "no icmp reply either",
+                        Availability::NotImplemented,
+                        "no icmp probe of the resolver has run",
                     ),
                 }],
             ),
         ];
-        d.remediation = dns_remediation(dns);
+        d.remediation = dns_remediation(dns, None);
         out.push(d);
         // A resolver that is failing outright makes its latency uninteresting.
         return out;
@@ -1573,9 +1711,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             Cause::new(
                 "middlebox_clamps_udp",
                 "a middlebox strips EDNS or clamps UDP replies",
-                vec![CheckResult::skipped(
+                vec![CheckResult::not_run(
                     "edns_through_the_path",
                     "edns through the path",
+                    Availability::NotImplemented,
                     "not probed — compare a direct query against the resolver's",
                 )],
             ),
@@ -1669,10 +1808,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                                 format!("{} set AD on its answer", cross.reference_resolver),
                             )
                         } else {
-                            CheckResult::skipped(
+                            // The reference did answer, just without AD
+                            // (most often an unsigned zone), so this is a
+                            // fresh result with nothing to validate, not a
+                            // missing one.
+                            CheckResult::not_run(
                                 "reference_validated",
                                 "reference validated",
-                                "reference did not validate the answer",
+                                Availability::NotApplicable,
+                                format!("{} answered without AD", cross.reference_resolver),
                             )
                         },
                     ],
@@ -1697,9 +1841,10 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         )
                         .weighted(2.0)
                     } else {
-                        CheckResult::skipped(
+                        CheckResult::not_run(
                             "private_answer_for_a_public_name",
                             "private answer for a public name",
+                            Availability::NotApplicable,
                             "the answer is public, so an internal zone does not explain it",
                         )
                         .weighted(2.0)
@@ -1771,8 +1916,17 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
     }
 
     let alt_fast = matches!(dns.alt_rtt_ms, Some(a) if a < p50 / 4.0);
-    let icmp_normal = dns.icmp_rtt_ms.map(|r| r < 10.0);
-    let cached_fast = matches!(dns.cached_rtt_ms, Some(c) if c < p50 / 4.0);
+    // Behind a local stub, ICMP to the resolver and its cached answers say
+    // nothing about the upstream these checks are about: loopback always
+    // answers, and the probe's own root-NS answer is a cache hit.
+    let stub = dns.is_local_stub();
+    let (icmp_rtt_ms, cached_rtt_ms) = if stub {
+        (None, None)
+    } else {
+        (dns.icmp_rtt_ms, dns.cached_rtt_ms)
+    };
+    let icmp_normal = icmp_rtt_ms.map(|r| r < 10.0);
+    let cached_fast = matches!(cached_rtt_ms, Some(c) if c < p50 / 4.0);
 
     d.causes = vec![
         Cause::new(
@@ -1792,14 +1946,15 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         format!("{alt} is also slow at {rtt:.1}ms"),
                     )
                     .weighted(2.0),
-                    _ => CheckResult::skipped(
+                    _ => CheckResult::not_run(
                         "alt_resolver_is_fast",
                         "alt resolver is fast",
+                        Availability::NotMeasured,
                         "no alternate resolver probed",
                     )
                     .weighted(2.0),
                 },
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(true), Some(rtt)) => CheckResult::pass(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
@@ -1810,13 +1965,20 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "resolver itself is reachable",
                         format!("icmp {rtt:.1}ms is slow too"),
                     ),
-                    _ => CheckResult::skipped(
+                    _ if stub => CheckResult::not_run(
                         "resolver_itself_is_reachable",
                         "resolver itself is reachable",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
+                    ),
+                    _ => CheckResult::not_run(
+                        "resolver_itself_is_reachable",
+                        "resolver itself is reachable",
+                        Availability::NotImplemented,
                         "no icmp probe",
                     ),
                 },
-                match (cached_fast, dns.cached_rtt_ms) {
+                match (cached_fast, cached_rtt_ms) {
                     (true, Some(c)) => CheckResult::pass(
                         "cached_names_still_fast",
                         "cached names still fast",
@@ -1827,9 +1989,16 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "cached names still fast",
                         format!("even cache hits take {c:.1}ms"),
                     ),
-                    _ => CheckResult::skipped(
+                    _ if stub => CheckResult::not_run(
                         "cached_names_still_fast",
                         "cached names still fast",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
+                    ),
+                    _ => CheckResult::not_run(
+                        "cached_names_still_fast",
+                        "cached names still fast",
+                        Availability::NotImplemented,
                         "no cache probe",
                     ),
                 },
@@ -1839,7 +2008,7 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
             "resolver_overloaded",
             "the resolver is overloaded",
             vec![
-                match (icmp_normal, dns.icmp_rtt_ms) {
+                match (icmp_normal, icmp_rtt_ms) {
                     (Some(false), Some(rtt)) => CheckResult::pass(
                         "icmp_rtt_raised",
                         "icmp rtt raised",
@@ -1850,9 +2019,18 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
                         "icmp rtt raised",
                         format!("icmp is normal at {rtt:.1}ms"),
                     ),
-                    _ => {
-                        CheckResult::skipped("icmp_rtt_raised", "icmp rtt raised", "no icmp probe")
-                    }
+                    _ if stub => CheckResult::not_run(
+                        "icmp_rtt_raised",
+                        "icmp rtt raised",
+                        Availability::NotMeasured,
+                        UPSTREAM_UNKNOWN,
+                    ),
+                    _ => CheckResult::not_run(
+                        "icmp_rtt_raised",
+                        "icmp rtt raised",
+                        Availability::NotImplemented,
+                        "no icmp probe",
+                    ),
                 },
                 if dns.failed > 0 || dns.truncated > 0 {
                     CheckResult::pass(
@@ -1872,42 +2050,79 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         Cause::new(
             "local_udp_path",
             "local: conntrack, udp buffers or nftables",
+            // Neither shared check tells this cause apart from a slow or
+            // lossy uplink, which slows the alternate too. They used to pass
+            // with no alternate probed and on a single drop, so a Wi-Fi
+            // laptop shedding one multicast frame a minute got a strong local
+            // fault from two checks that measured nothing local.
             vec![
-                if alt_fast {
-                    CheckResult::fail(
+                // "Also slow" is half this resolver's median or more. The
+                // half is a judgement, not a validated line; below it the
+                // alternate is at least twice as fast over the same path.
+                match dns.alt_rtt_ms {
+                    Some(alt) if alt >= p50 / 2.0 => CheckResult::pass(
                         "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
-                        "the alternate resolver is fast over the same path",
-                    )
-                } else {
-                    CheckResult::pass(
+                        format!(
+                            "the alternate took {alt:.1}ms against {p50:.1}ms — the problem may be local"
+                        ),
+                    ),
+                    Some(alt) => CheckResult::fail(
                         "alt_resolver_over_the_same_path_is_also_slow",
                         "alt resolver over the same path is also slow",
-                        "both resolvers are slow — the problem may be local",
-                    )
+                        format!("the alternate answered in {alt:.1}ms over the same path"),
+                    ),
+                    None => CheckResult::not_run(
+                        "alt_resolver_over_the_same_path_is_also_slow",
+                        "alt resolver over the same path is also slow",
+                        Availability::NotMeasured,
+                        "no alternate resolver probed",
+                    ),
                 },
+                // The same floor iface.errors uses: a wireless NIC drops
+                // multicast and management frames as a matter of course.
                 match obs.iface.as_ref().map(|i| i.drops_per_min) {
-                    Some(d) if d > 0 => CheckResult::pass(
+                    Some(Some(d)) if d as f64 >= t.iface_drop_floor => CheckResult::pass(
                         "interface_drops",
                         "interface drops",
-                        format!("{d} drops this window"),
+                        format!("{d} drops a minute"),
                     ),
-                    Some(_) => CheckResult::fail(
+                    Some(Some(d)) => CheckResult::fail(
                         "interface_drops",
                         "interface drops",
-                        "no drops on the interface",
+                        format!(
+                            "{d} drops a minute, under the {:.0}/min floor",
+                            t.iface_drop_floor
+                        ),
                     ),
-                    None => CheckResult::skipped(
+                    Some(None) => CheckResult::not_run(
                         "interface_drops",
                         "interface drops",
+                        Availability::Unsupported,
+                        "interface drops are not counted on macOS",
+                    ),
+                    None => CheckResult::not_run(
+                        "interface_drops",
+                        "interface drops",
+                        Availability::NotMeasured,
                         "no interface counters",
                     ),
                 },
+                // The discriminator: the kernel counting UDP datagrams it
+                // threw away on this host. Until it is read the cause stops
+                // at Likely, however the shared checks come out.
+                CheckResult::not_run(
+                    "local_drop_counters",
+                    "local drop counters",
+                    Availability::NotImplemented,
+                    "UDP receive-buffer and conntrack drop counters are not read yet",
+                )
+                .weighted(2.0),
             ],
         ),
     ];
 
-    d.remediation = dns_remediation(dns);
+    d.remediation = dns_remediation(dns, Some(p50));
     d.verify = Verify::below("dns.rtt_p50", 5.0, "ms").holding_for(60);
     d.scope = Scope {
         configuration: None,
@@ -1917,26 +2132,43 @@ fn detect_dns(obs: &Observations, base: &BaselineStore, t: &Thresholds) -> Vec<D
         via_iface: None,
         processes_measured: false,
         via_resolver: Some(dns.resolver.clone()),
-        note: Some("every new connection pays this before it can start".into()),
+        note: Some(if stub {
+            format!(
+                "every new connection pays this before it can start · the probe asks root NS; \
+                 the local stub at {} answers from cache, so this is the stub's round trip",
+                dns.resolver
+            )
+        } else {
+            "every new connection pays this before it can start".into()
+        }),
     };
     out.push(d);
     out
 }
 
-fn dns_remediation(dns: &DnsObs) -> Vec<Step> {
+/// Steps for a failing or slow resolver. A switch is proposed only to an
+/// alternate that was measured: for a slow resolver, one that answered in
+/// under a quarter of `slow_p50`, the line `alt_resolver_is_fast` passes on;
+/// for a failing one (`None`), answering at all is the case for it. Live, no
+/// alternate is timed until A11 keeps the reference resolver's RTT, so today
+/// the step appears only in the demo, which simulates it.
+fn dns_remediation(dns: &DnsObs, slow_p50: Option<f64>) -> Vec<Step> {
     let mut steps = Vec::new();
-    if let Some(alt) = &dns.alt_resolver {
-        let detail = match dns.alt_rtt_ms {
-            Some(rtt) => format!(
-                "writes resolv.conf, keeps a backup, and puts it back on quit \
-                 (measured {rtt:.1}ms during the check)"
-            ),
-            None => "writes resolv.conf, keeps a backup, and puts it back on quit".to_string(),
-        };
+    let measured = match (&dns.alt_resolver, dns.alt_rtt_ms) {
+        (Some(alt), Some(rtt)) if slow_p50.is_none_or(|p50| rtt < p50 / 4.0) => Some((alt, rtt)),
+        _ => None,
+    };
+    if let Some((alt, rtt)) = measured {
+        // The live `↵` writes nothing, so the text says what to run instead
+        // of promising an edit netwatch will not make.
         steps.push(Step::apply(
             '1',
             format!("switch this session's resolver to {alt}"),
-            detail,
+            format!(
+                "{alt} answered in {rtt:.1}ms during the check; netwatch does not change \
+                 resolvers from this screen; run: sudo netwatch resolver set {alt} --unmanaged \
+                 (unmanaged resolv.conf only), or resolvectl dns <iface> {alt}"
+            ),
             Action::SetResolver { addr: alt.clone() },
             Capability::Root,
         ));
@@ -2025,9 +2257,10 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
                     "one hop dominates",
                     format!("hop {hop} adds {delta:.0}ms over its predecessor"),
                 ),
-                None => CheckResult::skipped(
+                None => CheckResult::not_run(
                     "one_hop_dominates",
                     "one hop dominates",
+                    Availability::NotMeasured,
                     "not enough per-hop timing to attribute the increase",
                 ),
             }],
@@ -2048,9 +2281,10 @@ fn detect_path_rtt(path: &PathObs, base: &BaselineStore, t: &Thresholds) -> Opti
                         "the route is unchanged",
                     ),
                 },
-                None => CheckResult::skipped(
+                None => CheckResult::not_run(
                     "the_path_changed",
                     "the path changed",
+                    Availability::AwaitingTest,
                     "no previous trace to compare",
                 ),
             }],
@@ -2237,9 +2471,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             format!("{:.0}% at hop {} and beyond", hop.loss_pct, hop.number),
         )
     } else {
-        CheckResult::skipped(
+        CheckResult::not_run(
             "loss_propagates_to_later_hops",
             "loss propagates to later hops",
+            Availability::NotMeasured,
             "every hop after this one is silent, so propagation was not observed",
         )
     };
@@ -2250,9 +2485,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             "later hops lose packets too, so this is real loss",
         )
     } else {
-        CheckResult::skipped(
+        CheckResult::not_run(
             "later_hops_are_clean",
             "later hops are clean",
+            Availability::NotMeasured,
             "no hop after this one answered, so there is nothing to compare",
         )
     };
@@ -2269,9 +2505,10 @@ fn detect_path_loss(path: &PathObs) -> Option<Detection> {
             format!("{} never replied to the trace", path.target),
         )
         .weighted(2.0),
-        None => CheckResult::skipped(
+        None => CheckResult::not_run(
             "destination_answered_the_trace",
             "destination answered the trace",
+            Availability::NotMeasured,
             "this trace cannot tell whether the destination answered",
         )
         .weighted(2.0),
@@ -2327,7 +2564,7 @@ fn detect_sockets(obs: &Observations, t: &Thresholds) -> Vec<Detection> {
         if s.verdict_age_secs < t.verdict_hold_secs {
             continue;
         }
-        if let Some(d) = socket_detection(s, verdict, obs) {
+        if let Some(d) = socket_detection(s, verdict, obs, t) {
             out.push(d);
         }
     }
@@ -2338,21 +2575,22 @@ fn socket_detection(
     s: &SocketObs,
     verdict: SocketVerdict,
     obs: &Observations,
+    t: &Thresholds,
 ) -> Option<Detection> {
     let subject = Subject::Socket {
         local: s.local.clone(),
         remote: s.remote.clone(),
     };
-    let rtt = s.rtt_ms.unwrap_or(0.0);
     let link_test_passed = match (obs.idle_rtt_ms, obs.loaded_rtt_ms) {
-        (Some(idle), Some(loaded)) => {
-            Some(loaded - idle < Thresholds::default().loaded_rtt_delta_ms)
-        }
+        (Some(idle), Some(loaded)) => Some(loaded - idle < t.loaded_rtt_delta_ms),
         _ => None,
     };
 
     let mut d = match verdict {
         SocketVerdict::Bufferbloat => {
+            // The verdict needs a measured rtt; with none there is no finding,
+            // and never one quoting an rtt of 0.
+            let rtt = s.rtt_ms?;
             let mut d = Detection::new("tcp.bufferbloat_remote", subject);
             d.evidence
                 .push(Evidence::new("tcp.socket_rtt", rtt, "ms").with_window(30, 30));
@@ -2381,9 +2619,10 @@ fn socket_detection(
                         "our own uplink bloats under load too",
                     )
                     .weighted(2.0),
-                    None => CheckResult::skipped(
+                    None => CheckResult::not_run(
                         "link_level_bufferbloat_test_passed",
                         "link-level bufferbloat test passed",
+                        Availability::AwaitingTest,
                         "no loaded-rtt test has run, so the queue cannot be placed",
                     )
                     .weighted(2.0),
@@ -2455,6 +2694,10 @@ fn socket_detection(
                 // line most people read and the only one a copied summary
                 // carries.
                 d.title = "socket queueing, side unmeasured".into();
+                // And it is not a Medium finding either: until the loaded-rtt
+                // test places the queue, "rtt is high while sending" is an
+                // observation to act on by running that test, not a fault.
+                d.severity = Severity::Info;
                 d.scope.note = Some(
                     "rtt is high while this socket sends, but no loaded-rtt test has \
                      run — a distant peer looks the same as a queue"
@@ -2471,14 +2714,42 @@ fn socket_detection(
             d.causes = vec![Cause::new(
                 "packet_loss",
                 "packet loss between here and the peer",
-                vec![CheckResult::pass(
-                    "retransmits_observed",
-                    "retransmits observed",
-                    format!(
-                        "{} retransmits in the last minute on this socket",
-                        s.retrans?
+                vec![
+                    CheckResult::pass(
+                        "retransmits_observed",
+                        "retransmits observed",
+                        format!(
+                            "{} retransmits in the last minute on this socket",
+                            s.retrans?
+                        ),
                     ),
-                )],
+                    // What keeps a queue out of it: a bloated socket
+                    // retransmits too, once its ACKs queue past the RTO.
+                    match s.rtt_ms {
+                        Some(rtt) if rtt < t.socket_rtt_ms => CheckResult::pass(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, under the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        Some(rtt) => CheckResult::fail(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            format!(
+                                "rtt {rtt:.0}ms, over the {:.0}ms queueing line",
+                                t.socket_rtt_ms
+                            ),
+                        ),
+                        None => CheckResult::not_run(
+                            "socket_rtt_below_queueing_line",
+                            "socket rtt below queueing line",
+                            Availability::NotMeasured,
+                            "no rtt for this socket, so a queue is not ruled out",
+                        ),
+                    },
+                ],
             )];
             d.remediation = vec![Step::instruct(
                 "trace the peer",
@@ -2584,9 +2855,10 @@ fn detect_nat(obs: &Observations) -> Vec<Detection> {
         Cause::new(
             "router_symmetric_nat",
             "the router's nat set to symmetric or 'strict'",
-            vec![CheckResult::skipped(
+            vec![CheckResult::not_run(
                 "single_nat_layer",
                 "single nat layer",
+                Availability::NotImplemented,
                 "cannot tell the router from a carrier nat behind it",
             )],
         ),
@@ -2610,9 +2882,10 @@ fn detect_nat(obs: &Observations) -> Vec<Detection> {
 fn path_loss_check(remote: &str, obs: &Observations) -> CheckResult {
     let host = remote.rsplit_once(':').map(|(h, _)| h).unwrap_or(remote);
     let Some(path) = obs.paths.iter().find(|p| p.target == host) else {
-        return CheckResult::skipped(
+        return CheckResult::not_run(
             "the_path_to_this_peer_is_losing_packets",
             "the path to this peer is losing packets",
+            Availability::AwaitingTest,
             format!("no trace to {host} — press t to run one"),
         );
     };
@@ -2790,15 +3063,15 @@ mod tests {
         let iface = |wireless: bool, signal: Option<i32>, retry: Option<f64>| IfaceObs {
             counter_window_secs: None,
             name: "wlan0".into(),
-            carrier: true,
+            carrier: Some(true),
             rx_errors: 0,
             tx_errors: 0,
             rx_dropped: 0,
             tx_dropped: 0,
             errors_per_min: 0,
-            drops_per_min: 0,
+            drops_per_min: Some(0),
             link_rate_bps: None,
-            wireless,
+            wireless: Some(wireless),
             signal_dbm: signal,
             tx_retry_pct: retry,
             rx_bps: 0.0,
@@ -2820,6 +3093,35 @@ mod tests {
         assert!(!fires(iface(true, Some(-50), Some(2.0))), "healthy");
         assert!(!fires(iface(true, None, None)), "no wireless statistics");
         assert!(!fires(iface(false, Some(-90), Some(90.0))), "not wireless");
+    }
+
+    /// A weak signal on a radio that sent too little for a retry share. The
+    /// retry counter exists, so the not-run reason must not deny it.
+    #[test]
+    fn an_idle_radio_is_not_read_as_having_no_retry_counter() {
+        let obs = Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                link_rate_bps: None,
+                wireless: Some(true),
+                signal_dbm: Some(-80),
+                tx_retry_pct: None,
+                ..eth0()
+            }),
+            ..Default::default()
+        };
+        let d = detect(&obs, &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "wifi.weak_signal")
+            .expect("a weak signal fires");
+        let retries = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|c| c.id == "retries_high")
+            .unwrap();
+        assert_eq!(retries.why_not, Some(Availability::NotMeasured));
+        assert!(retries.detail.contains("frames sent"), "{}", retries.detail);
     }
 
     #[test]
@@ -2902,6 +3204,150 @@ mod tests {
             "both resolvers slow should point local, got {:?}",
             causes[0].label
         );
+        // Pointing local is as far as it goes: no local drop counter is read.
+        assert_eq!(
+            causes[0].confidence(),
+            super::super::issue::Confidence::Likely
+        );
+    }
+
+    /// A Wi-Fi laptop behind a resolver at 33× its baseline. The report's
+    /// scenario is one drop a minute and no alternate probed, which live is
+    /// always.
+    fn laptop_with_a_slow_resolver(alt_rtt_ms: Option<f64>, drops_per_min: u64) -> Observations {
+        Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                wireless: Some(true),
+                link_rate_bps: None,
+                drops_per_min: Some(drops_per_min),
+                ..eth0()
+            }),
+            ..obs_with_dns(DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            })
+        }
+    }
+
+    fn local_udp_path(obs: &Observations) -> (Cause, Vec<Cause>) {
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(obs, &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("dns.slow_resolver should fire");
+        let (mut local, others): (Vec<Cause>, _) = d
+            .causes
+            .iter()
+            .cloned()
+            .partition(|c| c.id == "local_udp_path");
+        (local.remove(0), others)
+    }
+
+    #[test]
+    fn one_dropped_multicast_frame_a_minute_is_not_a_local_udp_fault() {
+        use super::super::issue::Confidence;
+        let (local, others) = local_udp_path(&laptop_with_a_slow_resolver(None, 1));
+        assert!(
+            local.confidence() <= Confidence::Weak,
+            "{} on {}",
+            local.confidence().label(),
+            local.checks_label()
+        );
+        // The engine ranks by confidence first, so a cause above it on
+        // confidence keeps it off the top.
+        assert!(
+            others.iter().any(|c| c.confidence() > local.confidence()),
+            "local_udp_path ranks top: {:?}",
+            others
+                .iter()
+                .map(|c| (c.id.clone(), c.confidence()))
+                .collect::<Vec<_>>()
+        );
+        let check = |id| local.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            check("alt_resolver_over_the_same_path_is_also_slow").why_not,
+            Some(Availability::NotMeasured)
+        );
+        assert_eq!(check("interface_drops").passed, Some(false));
+    }
+
+    #[test]
+    fn local_udp_path_is_never_strong_without_a_local_counter() {
+        // Everything the rule can see points local: the alternate is as slow
+        // over the same path, and the interface drops twice the floor.
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(Some(38.0), 120));
+        assert_eq!(local.score(), Some(1.0), "{}", local.checks_label());
+        assert_eq!(local.confidence(), super::super::issue::Confidence::Likely);
+        assert_eq!(
+            local.missing_discriminator().map(|c| c.id.as_str()),
+            Some("local_drop_counters")
+        );
+    }
+
+    fn local_udp_check(alt_rtt_ms: Option<f64>, drops_per_min: u64, id: &str) -> CheckResult {
+        let (local, _) = local_udp_path(&laptop_with_a_slow_resolver(alt_rtt_ms, drops_per_min));
+        local.checks.into_iter().find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn interface_drops_is_unsupported_without_drop_counters() {
+        let mut obs = laptop_with_a_slow_resolver(None, 0);
+        obs.iface.as_mut().unwrap().drops_per_min = None;
+        let (local, _) = local_udp_path(&obs);
+        let c = local
+            .checks
+            .iter()
+            .find(|c| c.id == "interface_drops")
+            .unwrap();
+        assert_eq!(c.why_not, Some(Availability::Unsupported));
+    }
+
+    #[test]
+    fn the_alternate_is_also_slow_at_half_the_median() {
+        // The median is 40ms, so the line is 20ms.
+        let c = local_udp_check(
+            Some(20.0),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn the_alternate_is_not_also_slow_below_half_the_median() {
+        let c = local_udp_check(
+            Some(19.9),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false), "{}", c.detail);
+        // An alternate far under the line says the path is fine.
+        let c = local_udp_check(
+            Some(1.4),
+            120,
+            "alt_resolver_over_the_same_path_is_also_slow",
+        );
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(
+            c.detail,
+            "the alternate answered in 1.4ms over the same path"
+        );
+    }
+
+    #[test]
+    fn local_udp_interface_drops_pass_at_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 60, "interface_drops");
+        assert_eq!(c.passed, Some(true), "{}", c.detail);
+    }
+
+    #[test]
+    fn local_udp_interface_drops_fail_below_the_drop_floor() {
+        let c = local_udp_check(Some(38.0), 59, "interface_drops");
+        assert_eq!(c.passed, Some(false));
+        assert_eq!(c.detail, "59 drops a minute, under the 60/min floor");
     }
 
     #[test]
@@ -2915,11 +3361,50 @@ mod tests {
     }
 
     #[test]
-    fn the_absolute_ceiling_fires_without_any_baseline() {
-        // First run on a new network: no baseline at all, but 40ms of DNS
-        // latency is still worth saying out loud.
+    fn an_ordinary_resolver_does_not_trip_the_ceiling_on_a_first_run() {
+        // No baseline and a 40ms median: an ISP or mobile resolver on day
+        // one. The old 20ms ceiling opened a finding here on every such
+        // network; the rule now waits for a baseline to say what slow is.
         let base = store();
         let obs = obs_with_dns(slow_dns());
+        let found = detect(&obs, &base, &Thresholds::default());
+        assert!(
+            !found.iter().any(|d| d.rule == "dns.slow_resolver"),
+            "40ms with no baseline is not a finding"
+        );
+    }
+
+    #[test]
+    fn a_failing_resolver_with_no_icmp_probe_does_not_claim_it_is_down() {
+        let mut dns = slow_dns();
+        dns.failure_rate_pct = 40.0;
+        dns.failed = 15;
+        dns.icmp_rtt_ms = None; // the live path never runs this probe
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let d = found.iter().find(|d| d.rule == "dns.failing").unwrap();
+        assert!(
+            d.causes
+                .iter()
+                .all(|c| c.confidence() != super::super::issue::Confidence::Strong),
+            "an unrun icmp probe was read as evidence: {:?}",
+            d.causes
+                .iter()
+                .map(|c| (c.label.clone(), c.confidence()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_absolute_ceiling_fires_without_any_baseline() {
+        // First run on a new network: no baseline at all, but a 160ms median
+        // is worth saying out loud anywhere. 40ms is not — that is an
+        // ordinary ISP or mobile resolver — which is why the ceiling sits at
+        // 100ms and the baseline test carries everything below it.
+        let base = store();
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(160.0);
+        dns.rtt_p95_ms = Some(190.0);
+        let obs = obs_with_dns(dns);
         let found = detect(&obs, &base, &Thresholds::default());
         let d = found
             .iter()
@@ -3014,6 +3499,24 @@ mod tests {
     }
 
     #[test]
+    fn an_unplaced_socket_queue_is_information_not_a_finding() {
+        // Only the loaded-rtt test can say which end is queueing. Until it
+        // runs, "rtt is high while this socket sends" is something to test,
+        // not a fault to report at Medium — a distant peer looks identical.
+        let obs = Observations {
+            sockets: vec![bloated_socket()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "tcp.bufferbloat_remote")
+            .expect("the socket rule still fires");
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(d.title, "socket queueing, side unmeasured");
+    }
+
+    #[test]
     fn a_verdict_must_persist_before_it_becomes_an_issue() {
         let mut s = bloated_socket();
         s.verdict_age_secs = 5;
@@ -3032,6 +3535,132 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(detect(&obs, &store(), &Thresholds::default()).len(), 1);
+    }
+
+    /// A socket losing segments on an ordinary path: rtt well under the
+    /// queueing line, so only the retransmit count can classify it.
+    fn retransmitting_socket(retrans: u32) -> SocketObs {
+        SocketObs {
+            rtt_ms: Some(20.0),
+            rttvar_ms: Some(4.0),
+            retrans: Some(retrans),
+            ..bloated_socket()
+        }
+    }
+
+    #[test]
+    fn retrans_burst_fires_at_five_a_minute() {
+        let obs = Observations {
+            sockets: vec![retransmitting_socket(5)],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert_eq!(rules_of(&found), ["tcp.retrans_burst"]);
+        let d = &found[0];
+        assert_eq!(d.evidence[0].metric, "tcp.retrans_rate");
+        assert_eq!(d.evidence[0].value, 5.0);
+    }
+
+    #[test]
+    fn retrans_burst_is_quiet_below_five() {
+        let obs = Observations {
+            sockets: vec![retransmitting_socket(4)],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &Thresholds::default());
+        assert!(
+            !rules_of(&found).contains(&"tcp.retrans_burst"),
+            "4 retransmits a minute is under the burst line: {:?}",
+            rules_of(&found)
+        );
+    }
+
+    #[test]
+    fn a_socket_without_rtt_is_never_bufferbloat() {
+        // Sending hard with nothing retransmitted, so only the rtt the
+        // verdict turns on is missing.
+        let s = SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(0),
+            ..bloated_socket()
+        };
+        let t = Thresholds::default();
+        assert_ne!(classify_socket(&s, &t), SocketVerdict::Bufferbloat);
+        let obs = Observations {
+            sockets: vec![s.clone()],
+            ..Default::default()
+        };
+        let found = detect(&obs, &store(), &t);
+        assert!(
+            !rules_of(&found).contains(&"tcp.bufferbloat_remote"),
+            "{:?}",
+            rules_of(&found)
+        );
+        // Handed the verdict anyway, the detection refuses rather than
+        // quoting an rtt of 0.
+        assert!(socket_detection(&s, SocketVerdict::Bufferbloat, &obs, &t).is_none());
+    }
+
+    #[test]
+    fn a_missing_rtt_is_not_read_as_0_under_a_0_ms_line() {
+        // Under the default 100ms line an rtt read as 0 lands on the right
+        // side of both tests by luck. A 0ms line takes the luck away: 0 >= 0
+        // made the sender bloated and kept the retransmitter out of its burst.
+        let t = Thresholds {
+            socket_rtt_ms: 0.0,
+            ..Thresholds::default()
+        };
+        let no_rtt = |retrans| SocketObs {
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(retrans),
+            ..bloated_socket()
+        };
+        assert_ne!(classify_socket(&no_rtt(0), &t), SocketVerdict::Bufferbloat);
+        assert_eq!(
+            classify_socket(&no_rtt(12), &t),
+            SocketVerdict::RetransBurst
+        );
+    }
+
+    #[test]
+    fn retransmits_without_rtt_say_the_rtt_was_not_measured() {
+        use super::super::issue::Confidence;
+        let finding = |rtt_ms| {
+            let obs = Observations {
+                sockets: vec![SocketObs {
+                    rtt_ms,
+                    rttvar_ms: None,
+                    ..retransmitting_socket(12)
+                }],
+                ..Default::default()
+            };
+            let mut found = detect(&obs, &store(), &Thresholds::default());
+            assert_eq!(rules_of(&found), ["tcp.retrans_burst"]);
+            found.remove(0)
+        };
+        let check = |d: &Detection| {
+            d.causes[0]
+                .checks
+                .iter()
+                .find(|c| c.id == "socket_rtt_below_queueing_line")
+                .cloned()
+                .unwrap()
+        };
+
+        // The retransmit count is measured, so the rule still fires; only
+        // the check that rules a queue out is missing.
+        let d = finding(None);
+        let k = check(&d);
+        assert_eq!(k.passed, None);
+        assert_eq!(k.why_not, Some(Availability::NotMeasured));
+        assert_eq!(d.causes[0].confidence(), Confidence::Likely);
+        assert!(!d.evidence.iter().any(|e| e.metric == "tcp.socket_rtt"));
+
+        let d = finding(Some(20.0));
+        assert_eq!(check(&d).passed, Some(true));
+        assert_eq!(d.causes[0].confidence(), Confidence::Strong);
     }
 
     #[test]
@@ -3248,6 +3877,35 @@ mod tests {
             .expect("cause present");
         assert!(vlan.checks.iter().any(|k| k.passed.is_none()));
         assert_ne!(vlan.confidence(), super::super::issue::Confidence::Strong);
+    }
+
+    #[test]
+    fn a_reference_answer_without_ad_is_not_applicable_not_unmeasured() {
+        let mut dns = slow_dns();
+        dns.rtt_p50_ms = Some(1.0);
+        dns.cross = Some(DnsCross {
+            name: "dns.google".into(),
+            local: vec!["10.0.0.1".into()],
+            reference_resolver: "1.1.1.1".into(),
+            reference: vec!["8.8.8.8".into()],
+            validated: false,
+            private_answer: false,
+            mismatch_pct: 100.0,
+            cycles: 5,
+        });
+        let found = detect(&obs_with_dns(dns), &store(), &Thresholds::default());
+        let check = found
+            .iter()
+            .find(|d| d.rule == "dns.hijack_suspect")
+            .expect("disagreement with history fires the rule")
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "reference_validated")
+            .expect("forged_records carries the check");
+        assert_eq!(check.passed, None);
+        assert_eq!(check.why_not, Some(Availability::NotApplicable));
+        assert_eq!(check.detail, "1.1.1.1 answered without AD");
     }
 
     #[test]
@@ -3536,15 +4194,15 @@ mod tests {
             iface: Some(IfaceObs {
                 counter_window_secs: None,
                 name: "eth0".into(),
-                carrier: false,
+                carrier: Some(false),
                 rx_errors: 0,
                 tx_errors: 0,
                 rx_dropped: 0,
                 tx_dropped: 0,
                 errors_per_min: 40,
-                drops_per_min: 12,
+                drops_per_min: Some(12),
                 link_rate_bps: Some(1e9),
-                wireless: false,
+                wireless: Some(false),
                 signal_dbm: None,
                 tx_retry_pct: None,
                 rx_bps: 0.0,
@@ -3555,6 +4213,200 @@ mod tests {
         let found = detect(&obs, &store(), &Thresholds::default());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rule, "link.down");
+    }
+
+    /// No interface info used to read as "carrier up, wired". It is neither:
+    /// no link.down, and coverage says the carrier was not measured rather
+    /// than that the rule had its input.
+    #[test]
+    fn missing_interface_info_opens_no_link_issue() {
+        use crate::diagnose::{coverage::Coverage, fixture};
+        let mut obs = fixture::observations_at(300);
+        let iface = obs.iface.as_mut().unwrap();
+        iface.carrier = None;
+        iface.wireless = None;
+        let base = fixture::baselines();
+        let found = detect(&obs, &base, &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"link.down"));
+        let coverage = Coverage::from_observations(&obs, &base);
+        let link_down = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "link.down")
+            .unwrap();
+        assert_eq!(link_down.status, Availability::NotMeasured);
+    }
+
+    /// A healthy wired gigabit interface with nothing on its counters.
+    fn eth0() -> IfaceObs {
+        IfaceObs {
+            counter_window_secs: Some(60.0),
+            name: "eth0".into(),
+            carrier: Some(true),
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_dropped: 0,
+            tx_dropped: 0,
+            errors_per_min: 0,
+            drops_per_min: Some(0),
+            link_rate_bps: Some(1e9),
+            wireless: Some(false),
+            signal_dbm: None,
+            tx_retry_pct: None,
+            rx_bps: 3.1e6,
+            tx_bps: 2.6e6,
+        }
+    }
+
+    fn link_rules(iface: IfaceObs) -> Vec<&'static str> {
+        let obs = Observations {
+            iface: Some(iface),
+            ..Default::default()
+        };
+        detect(&obs, &store(), &Thresholds::default())
+            .iter()
+            .map(|d| d.rule)
+            .collect()
+    }
+
+    #[test]
+    fn iface_errors_fires_at_the_error_floor() {
+        // One error a minute: errors are rare and always mean something.
+        let found = link_rules(IfaceObs {
+            errors_per_min: 1,
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.errors"]);
+    }
+
+    #[test]
+    fn iface_errors_fires_at_the_drop_floor() {
+        let found = link_rules(IfaceObs {
+            drops_per_min: Some(60),
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.errors"]);
+    }
+
+    #[test]
+    fn iface_errors_is_quiet_below_both_floors() {
+        // No errors, and 59 drops a minute: a wireless NIC drops multicast
+        // and management frames as a matter of course.
+        let found = link_rules(IfaceObs {
+            errors_per_min: 0,
+            drops_per_min: Some(59),
+            ..eth0()
+        });
+        assert!(!found.contains(&"iface.errors"), "{found:?}");
+    }
+
+    /// A link on a platform that counts no drops (macOS), with this many
+    /// errors a minute.
+    fn uncounted_drops(errors_per_min: u64) -> IfaceObs {
+        IfaceObs {
+            errors_per_min,
+            drops_per_min: None,
+            ..eth0()
+        }
+    }
+
+    fn iface_errors(iface: IfaceObs) -> Detection {
+        let obs = Observations {
+            iface: Some(iface),
+            ..Default::default()
+        };
+        detect(&obs, &store(), &Thresholds::default())
+            .into_iter()
+            .find(|d| d.rule == "iface.errors")
+            .expect("iface.errors fires")
+    }
+
+    /// Without drop counters iface.errors fires on errors alone, and the
+    /// rate it opens on is the one its verify reads: errors plus drops where
+    /// drops are counted, errors alone where they are not.
+    #[test]
+    fn without_drop_counters_iface_errors_judges_errors_only() {
+        assert!(link_rules(uncounted_drops(0)).is_empty());
+        let d = iface_errors(uncounted_drops(3));
+        assert_eq!(d.evidence[0].metric, "iface.error_rate");
+        assert_eq!(d.evidence[0].value, 3.0);
+        assert_eq!(uncounted_drops(3).error_rate(), 3);
+        let counted = IfaceObs {
+            drops_per_min: Some(5),
+            ..uncounted_drops(3)
+        };
+        assert_eq!(counted.error_rate(), 8);
+
+        let obs = Observations {
+            iface: Some(uncounted_drops(3)),
+            ..Default::default()
+        };
+        let coverage = crate::diagnose::coverage::Coverage::from_observations(&obs, &store());
+        let row = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "iface.errors")
+            .unwrap();
+        assert_eq!(row.status, Availability::Available);
+        // A coverage row says what was measured, not what was found.
+        assert_eq!(
+            row.reason,
+            "interface error counters present; drops not counted on macOS"
+        );
+    }
+
+    /// Both causes weigh drops against errors, so neither can be judged
+    /// without drops. The ring buffer cause has no other check, and with
+    /// only errors to go on it must not be the probable cause.
+    #[test]
+    fn ring_buffer_cause_is_not_run_without_drop_counters() {
+        use crate::diagnose::engine::{Engine, FixedClock};
+        let d = iface_errors(uncounted_drops(3));
+        let cause = |id| d.causes.iter().find(|c| c.id == id).unwrap();
+        let ring = cause("ring_buffer_small");
+        assert_eq!(ring.confidence(), super::super::issue::Confidence::Untested);
+        for c in ring
+            .checks
+            .iter()
+            .chain(&cause("bad_cable_or_duplex").checks)
+        {
+            assert_eq!(c.why_not, Some(Availability::Unsupported), "{}", c.id);
+        }
+
+        let clock = std::sync::Arc::new(FixedClock::at("2026-09-03 06:48:10"));
+        let mut engine = Engine::new(Box::new(clock.clone()));
+        let obs = Observations {
+            iface: Some(uncounted_drops(40)),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            engine.observe(&obs, &store());
+            clock.advance_secs(10);
+        }
+        let issue = engine
+            .primary()
+            .into_iter()
+            .find(|i| i.rule == "iface.errors")
+            .expect("iface.errors opens");
+        assert_eq!(issue.top_cause().unwrap().id, "bad_cable_or_duplex");
+    }
+
+    #[test]
+    fn iface_saturated_fires_at_ninety_percent() {
+        let found = link_rules(IfaceObs {
+            rx_bps: 9e8,
+            ..eth0()
+        });
+        assert_eq!(found, ["iface.saturated"]);
+    }
+
+    #[test]
+    fn iface_saturated_is_quiet_at_eighty_nine() {
+        let found = link_rules(IfaceObs {
+            rx_bps: 8.9e8,
+            ..eth0()
+        });
+        assert!(!found.contains(&"iface.saturated"), "{found:?}");
     }
 
     #[test]
@@ -3604,6 +4456,259 @@ mod tests {
         assert!(applies > 0, "the dns rule should offer something to apply");
     }
 
+    /// The string literals in `src`, skipping comments and char literals, so
+    /// a word in a comment is not mistaken for text a user reads.
+    fn string_literals(src: &str) -> Vec<&str> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'\'' if b.get(i + 2) == Some(&b'\'') => i += 3,
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    out.push(&src[start..i.min(b.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// The live `↵` writes nothing, so no step may say netwatch writes, backs
+    /// up or restores anything. Read from the source, so a step on a branch
+    /// no test reaches is held to it as well, and from what the DNS rule
+    /// emits with and without a measured alternate.
+    #[test]
+    fn no_step_text_promises_a_write() {
+        const PROMISES: [&str; 3] = ["writes", "backup", "puts it back"];
+        let src = include_str!("detectors.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let literals = string_literals(body);
+        assert!(
+            literals.len() > 300,
+            "found only {} literals; did the scan break?",
+            literals.len()
+        );
+        for lit in &literals {
+            let lower = lit.to_lowercase();
+            for promise in PROMISES {
+                assert!(!lower.contains(promise), "{lit:?} promises a write");
+            }
+        }
+
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        for alt_rtt_ms in [Some(1.4), Some(38.0), None] {
+            let dns = DnsObs {
+                alt_rtt_ms,
+                ..slow_dns()
+            };
+            for d in detect(&obs_with_dns(dns), &base, &Thresholds::default()) {
+                for s in &d.remediation {
+                    let text = format!("{} {}", s.text, s.detail).to_lowercase();
+                    for promise in PROMISES {
+                        assert!(!text.contains(promise), "{}: {text}", d.rule);
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a systemd-resolved host the probe asks 127.0.0.53 for root NS, which
+    /// the stub answers from its cache in 0 ms. Coverage keeps the rule
+    /// available, since the stub's RTT is measured, and says what it times;
+    /// a finding says so in its scope; the checks about the upstream abstain
+    /// instead of reading loopback ICMP and the stub's cache as the upstream.
+    #[test]
+    fn a_loopback_resolver_says_it_measures_the_stub() {
+        use crate::diagnose::coverage::{Availability as A, Coverage};
+        for (addr, stub) in [
+            ("127.0.0.53", true),
+            ("127.0.0.54", true),
+            ("::1", true),
+            ("169.254.1.1", false),
+            ("192.168.8.1", false),
+            ("fe80::1%eth0", false),
+        ] {
+            let dns = DnsObs {
+                resolver: addr.into(),
+                ..slow_dns()
+            };
+            assert_eq!(dns.is_local_stub(), stub, "{addr}");
+        }
+
+        let coverage_of = |dns: DnsObs| {
+            Coverage::from_observations(&obs_with_dns(dns), &store())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "dns.slow_resolver")
+                .unwrap()
+        };
+        // The Fedora host: healthy, 0 ms, nothing opens.
+        let quiet = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(0.0),
+            rtt_p95_ms: Some(0.1),
+            ..slow_dns()
+        };
+        let row = coverage_of(quiet.clone());
+        assert_eq!(row.status, A::Available);
+        assert_eq!(
+            row.reason,
+            "limited: measures the local stub at 127.0.0.53, not the upstream"
+        );
+        let found = detect(&obs_with_dns(quiet), &store(), &Thresholds::default());
+        assert!(!rules_of(&found).contains(&"dns.slow_resolver"));
+        assert_ne!(
+            coverage_of(slow_dns()).reason,
+            row.reason,
+            "a resolver off the host is not a stub"
+        );
+
+        // A stub slow enough to cross the ceiling, with loopback ICMP and a
+        // cache probe that would otherwise read as the upstream's.
+        let slow_stub = DnsObs {
+            resolver: "127.0.0.53".into(),
+            rtt_p50_ms: Some(150.0),
+            rtt_p95_ms: Some(180.0),
+            icmp_rtt_ms: Some(0.05),
+            cached_rtt_ms: Some(0.9),
+            ..slow_dns()
+        };
+        let found = detect(&obs_with_dns(slow_stub), &store(), &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .expect("150ms is over the 100ms ceiling");
+        let note = d.scope.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains(
+                "the probe asks root NS; the local stub at 127.0.0.53 answers from cache, \
+                 so this is the stub's round trip"
+            ),
+            "{note}"
+        );
+        for id in [
+            "resolver_itself_is_reachable",
+            "cached_names_still_fast",
+            "icmp_rtt_raised",
+        ] {
+            let check = d
+                .causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .find(|k| k.id == id)
+                .unwrap();
+            assert_eq!(check.passed, None, "{id}: {check:?}");
+            assert_eq!(check.why_not, Some(A::NotMeasured), "{id}");
+            assert_eq!(check.detail, UPSTREAM_UNKNOWN, "{id}");
+        }
+
+        // Off the host, the same readings are the resolver's own.
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let found = detect(&obs_with_dns(slow_dns()), &base, &Thresholds::default());
+        let d = found
+            .iter()
+            .find(|d| d.rule == "dns.slow_resolver")
+            .unwrap();
+        assert!(!d.scope.note.as_deref().unwrap_or_default().contains("stub"));
+        let icmp = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "resolver_itself_is_reachable")
+            .unwrap();
+        assert_eq!(icmp.passed, Some(true));
+    }
+
+    /// REVIEW §2.4: propose a resolver only after measuring it. Live, the
+    /// second configured resolver is never timed, so the switch used to be
+    /// offered on nothing but its presence in resolv.conf.
+    #[test]
+    fn no_switch_step_without_a_measured_alternate() {
+        use super::super::issue::StepKind;
+        let mut base = store();
+        base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let steps = |dns: DnsObs| -> Vec<Step> {
+            detect(&obs_with_dns(dns), &base, &Thresholds::default())
+                .into_iter()
+                .find(|d| d.rule == "dns.slow_resolver")
+                .expect("a 40ms resolver against a 1.2ms baseline is slow")
+                .remediation
+        };
+        let offers_switch = |steps: &[Step]| {
+            steps
+                .iter()
+                .any(|s| s.kind == StepKind::Apply || s.text == "make it permanent")
+        };
+
+        // Live today: configured, never timed.
+        let unmeasured = steps(DnsObs {
+            alt_rtt_ms: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&unmeasured), "{unmeasured:?}");
+        // Timed, but no faster than a quarter of the 40ms median.
+        let slow = steps(DnsObs {
+            alt_rtt_ms: Some(10.0),
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&slow), "{slow:?}");
+        let none = steps(DnsObs {
+            alt_resolver: None,
+            ..slow_dns()
+        });
+        assert!(!offers_switch(&none), "{none:?}");
+
+        // The demo's alternate: 1.4ms against 40ms. Offered, with the command
+        // to run and the number that justified it.
+        let fast = steps(slow_dns());
+        let switch = fast
+            .iter()
+            .find(|s| s.kind == StepKind::Apply)
+            .expect("a measured fast alternate is proposed");
+        for want in [
+            "192.168.8.1 answered in 1.4ms",
+            "netwatch does not change resolvers from this screen",
+            "sudo netwatch resolver set 192.168.8.1 --unmanaged",
+            "resolvectl dns <iface> 192.168.8.1",
+        ] {
+            assert!(switch.detail.contains(want), "{want}: {}", switch.detail);
+        }
+
+        // A failing resolver has no speed to beat: an alternate that answered
+        // at all is the case for it, and one never asked is none.
+        let failing = |alt_rtt_ms| {
+            detect(
+                &obs_with_dns(DnsObs {
+                    failure_rate_pct: 40.0,
+                    alt_rtt_ms,
+                    ..slow_dns()
+                }),
+                &base,
+                &Thresholds::default(),
+            )
+            .into_iter()
+            .find(|d| d.rule == "dns.failing")
+            .expect("40% of queries failing")
+            .remediation
+        };
+        assert!(!offers_switch(&failing(None)));
+        assert!(offers_switch(&failing(Some(30.0))));
+    }
+
     #[test]
     fn id_validation_rejects_bad_and_duplicate_ids() {
         assert!(Cause::valid_id("upstream_slow"));
@@ -3644,15 +4749,22 @@ mod tests {
         let src = include_str!("detectors.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
         let mut causes = 0;
+        let mut forwarded = 0;
         for (needle, is_cause) in [
             ("Cause::new(", true),
             ("CheckResult::pass(", false),
             ("CheckResult::fail(", false),
-            ("CheckResult::skipped(", false),
+            ("CheckResult::not_run(", false),
             ("stage_check(", false),
         ] {
             for (at, _) in body.match_indices(needle) {
                 let rest = body[at + needle.len()..].trim_start();
+                // `stage_result` passes on the literal its `stage_check(`
+                // caller gave it, which this scan has already read.
+                if rest.starts_with("id,") {
+                    forwarded += 1;
+                    continue;
+                }
                 let lit = rest
                     .strip_prefix('"')
                     .and_then(|r| r.split_once('"'))
@@ -3671,6 +4783,402 @@ mod tests {
             causes >= 35,
             "found only {causes} causes; did the scan break?"
         );
+        assert_eq!(forwarded, 1, "only stage_result may forward an id");
+    }
+
+    /// `detect` checks this on every call in debug builds, so each detector
+    /// test above already holds its own branches to it. This one adds the
+    /// fixture's whole timeline and a host where every optional probe is
+    /// missing, and ties `state()` to the reason as well.
+    #[test]
+    fn a_not_run_check_always_says_why() {
+        use crate::diagnose::{fixture, issue::CheckState};
+        let mut scenarios: Vec<Observations> = (0..=fixture::SCENARIO_SECS)
+            .step_by(10)
+            .map(fixture::observations_at)
+            .collect();
+        scenarios.push(Observations {
+            now: "2026-09-03 06:51:19".into(),
+            dns: Some(DnsObs {
+                alt_rtt_ms: None,
+                icmp_rtt_ms: None,
+                cached_rtt_ms: None,
+                ..slow_dns()
+            }),
+            gateway: Some(GatewayObs {
+                arp_ok: None,
+                internet_reachable: None,
+                ..dead_gateway()
+            }),
+            iface: Some(IfaceObs {
+                counter_window_secs: Some(60.0),
+                name: "wlan0".into(),
+                carrier: Some(true),
+                rx_errors: 0,
+                tx_errors: 0,
+                rx_dropped: 0,
+                tx_dropped: 0,
+                errors_per_min: 0,
+                drops_per_min: Some(0),
+                link_rate_bps: None,
+                rx_bps: 0.0,
+                tx_bps: 0.0,
+                wireless: Some(true),
+                signal_dbm: None,
+                tx_retry_pct: Some(40.0),
+            }),
+            sockets: vec![bloated_socket()],
+            ..Default::default()
+        });
+        let base = fixture::baselines();
+        let mut not_run = 0;
+        for obs in &scenarios {
+            for d in detect(obs, &base, &Thresholds::default()) {
+                for c in &d.causes {
+                    for k in &c.checks {
+                        let key = format!("{}/{}", c.key(d.rule), k.id);
+                        assert_eq!(k.passed.is_none(), k.why_not.is_some(), "{key}");
+                        assert!(
+                            !matches!(
+                                k.why_not,
+                                Some(Availability::Available | Availability::Unknown)
+                            ),
+                            "{key}: {:?} is not a reason a check did not run",
+                            k.why_not
+                        );
+                        assert_eq!(
+                            k.state() == CheckState::NotRun,
+                            k.why_not.is_some(),
+                            "{key}"
+                        );
+                        not_run += usize::from(k.passed.is_none());
+                    }
+                }
+            }
+        }
+        assert!(not_run >= 10, "only {not_run} checks did not run");
+    }
+
+    #[test]
+    fn a_not_run_check_cannot_claim_to_be_ready_or_unknown() {
+        let with = |why_not| {
+            let mut d = Detection::new(
+                "dns.slow_resolver",
+                Subject::Resolver {
+                    addr: "127.0.0.53".into(),
+                },
+            );
+            d.causes = vec![Cause::new(
+                "resolver_overloaded",
+                "the resolver is overloaded",
+                vec![CheckResult::not_run(
+                    "icmp_rtt_raised",
+                    "icmp rtt raised",
+                    why_not,
+                    "no icmp probe",
+                )],
+            )];
+            not_run_checks_say_why(&d)
+        };
+        assert!(with(Availability::NotImplemented).is_ok());
+        assert!(with(Availability::Available).is_err());
+        assert!(with(Availability::Unknown).is_err());
+    }
+
+    // ------------------------------------------------------------ absence
+
+    /// Rows whose detectors still read the missing input as evidence. Each
+    /// is removed by the 0.33 abstain item that fixes its site, and a row
+    /// listed here that starts abstaining fails the test, so the list cannot
+    /// outlive the fix.
+    const EXPECTED_UNTIL_0_33_A: &[&str] = &[];
+
+    /// What one absence row demands of the detectors.
+    enum Expect {
+        /// The check is present, and neither passed nor failed.
+        NotRun(&'static str),
+        /// The rule does not fire.
+        NoRule(&'static str),
+        /// No evidence on this metric carries this value.
+        NoEvidence(&'static str, f64),
+        /// The rule fires, so the row reached the code that reads the input.
+        Fires(&'static str),
+    }
+
+    struct AbsenceRow {
+        /// The input left unmeasured.
+        input: &'static str,
+        obs: Observations,
+        base: BaselineStore,
+        expect: Vec<Expect>,
+    }
+
+    /// One row per input the live path can leave unmeasured. Everything else
+    /// in the row is set so the rules that read the input fire.
+    fn absence_rows() -> Vec<AbsenceRow> {
+        let mut dns_base = store();
+        dns_base.seed("169.254.1.1", "dns.rtt_p50", 1.2, 0.4, 2000);
+        let dns_row = |input, dns: DnsObs, expect| AbsenceRow {
+            input,
+            obs: obs_with_dns(dns),
+            base: dns_base.clone(),
+            expect,
+        };
+        let row = |input, obs, expect| AbsenceRow {
+            input,
+            obs,
+            base: store(),
+            expect,
+        };
+        let wlan0 = |signal_dbm, tx_retry_pct| Observations {
+            iface: Some(IfaceObs {
+                name: "wlan0".into(),
+                wireless: Some(true),
+                link_rate_bps: None,
+                signal_dbm,
+                tx_retry_pct,
+                ..eth0()
+            }),
+            ..Default::default()
+        };
+        // A target whose connect timed out: its firewall_or_route cause asks
+        // whether the internet answers.
+        let mut timed_out = super::target_tests::healthy();
+        timed_out.connect = Some(crate::diagnose::targets::Stage {
+            ms: Some(3000.0),
+            error: Some(crate::diagnose::targets::StageError::Timeout),
+        });
+        timed_out.connect_v4 = timed_out.connect.clone();
+        let no_rtt = |local: &str, retrans| SocketObs {
+            local: local.into(),
+            rtt_ms: None,
+            rttvar_ms: None,
+            retrans: Some(retrans),
+            ..bloated_socket()
+        };
+
+        vec![
+            dns_row(
+                "DnsObs.alt_rtt_ms",
+                DnsObs {
+                    alt_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("alt_resolver_is_fast"),
+                    Expect::NotRun("alt_resolver_over_the_same_path_is_also_slow"),
+                ],
+            ),
+            dns_row(
+                "DnsObs.icmp_rtt_ms",
+                DnsObs {
+                    icmp_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("icmp_rtt_raised"),
+                    Expect::NotRun("resolver_itself_is_reachable"),
+                ],
+            ),
+            // The same probe, read by the failing-resolver causes.
+            dns_row(
+                "DnsObs.icmp_rtt_ms, failing resolver",
+                DnsObs {
+                    icmp_rtt_ms: None,
+                    failure_rate_pct: 40.0,
+                    failed: 15,
+                    ..slow_dns()
+                },
+                vec![
+                    Expect::NotRun("resolver_unreachable"),
+                    Expect::NotRun("resolver_reachable"),
+                ],
+            ),
+            dns_row(
+                "DnsObs.cached_rtt_ms",
+                DnsObs {
+                    cached_rtt_ms: None,
+                    ..slow_dns()
+                },
+                vec![Expect::NotRun("cached_names_still_fast")],
+            ),
+            // Both sockets send. One retransmits, so it is classified; the
+            // other reaches the bufferbloat test with no rtt to judge.
+            row(
+                "SocketObs.rtt_ms",
+                Observations {
+                    sockets: vec![no_rtt("10.88.0.2:52344", 12), no_rtt("10.88.0.2:52346", 0)],
+                    ..Default::default()
+                },
+                vec![
+                    Expect::Fires("tcp.retrans_burst"),
+                    Expect::NotRun("socket_rtt_below_queueing_line"),
+                    Expect::NoRule("tcp.bufferbloat_remote"),
+                    Expect::NoEvidence("tcp.socket_rtt", 0.0),
+                ],
+            ),
+            row(
+                "IfaceObs.signal_dbm",
+                wlan0(None, Some(35.0)),
+                vec![Expect::NotRun("signal_weak"), Expect::NotRun("signal_fine")],
+            ),
+            row(
+                "IfaceObs.tx_retry_pct",
+                wlan0(Some(-80), None),
+                vec![Expect::NotRun("retries_high")],
+            ),
+            // Errors on the same interface fire, so the row gets past the
+            // carrier test, which returns early on a link that is down.
+            row(
+                "IfaceObs.carrier",
+                Observations {
+                    iface: Some(IfaceObs {
+                        carrier: None,
+                        errors_per_min: 40,
+                        ..eth0()
+                    }),
+                    ..Default::default()
+                },
+                vec![Expect::NoRule("link.down"), Expect::Fires("iface.errors")],
+            ),
+            // Errors fire iface.errors and the slow resolver brings in
+            // local_udp_path: every reader of the drop count.
+            AbsenceRow {
+                input: "IfaceObs.drops_per_min",
+                obs: Observations {
+                    iface: Some(IfaceObs {
+                        drops_per_min: None,
+                        errors_per_min: 40,
+                        ..eth0()
+                    }),
+                    ..obs_with_dns(slow_dns())
+                },
+                base: dns_base.clone(),
+                expect: vec![
+                    Expect::NotRun("interface_drops"),
+                    Expect::NotRun("drops_dominate"),
+                    Expect::NotRun("errors_dominate"),
+                ],
+            },
+            row(
+                "GatewayObs.arp_ok",
+                Observations {
+                    gateway: Some(GatewayObs {
+                        arp_ok: None,
+                        ..dead_gateway()
+                    }),
+                    ..Default::default()
+                },
+                vec![Expect::NotRun("arp_resolves"), Expect::NotRun("arp_fails")],
+            ),
+            row(
+                "GatewayObs.internet_reachable",
+                Observations {
+                    gateway: Some(GatewayObs {
+                        internet_reachable: None,
+                        ..dead_gateway()
+                    }),
+                    targets: vec![timed_out],
+                    ..Default::default()
+                },
+                vec![
+                    Expect::NotRun("nothing_beyond_the_gateway_answers_either"),
+                    Expect::NotRun("internet_reachable"),
+                ],
+            ),
+        ]
+    }
+
+    /// What the row got wrong: absent input read as evidence, and anything
+    /// that makes the row prove nothing (a check or rule that never came up).
+    fn judge(row: &AbsenceRow) -> (Vec<String>, Vec<String>) {
+        let found = detect(&row.obs, &row.base, &Thresholds::default());
+        let (mut read, mut vacuous) = (vec![], vec![]);
+        for expect in &row.expect {
+            match *expect {
+                Expect::NotRun(id) => {
+                    let checks: Vec<&CheckResult> = found
+                        .iter()
+                        .flat_map(|d| &d.causes)
+                        .flat_map(|c| &c.checks)
+                        .filter(|c| c.id == id)
+                        .collect();
+                    if checks.is_empty() {
+                        vacuous.push(format!("no detection carries {id}"));
+                    }
+                    for c in checks {
+                        if let Some(passed) = c.passed {
+                            let verb = if passed { "passed" } else { "failed" };
+                            read.push(format!("{id} {verb}: {}", c.detail));
+                        }
+                    }
+                }
+                Expect::NoRule(rule) => {
+                    if found.iter().any(|d| d.rule == rule) {
+                        read.push(format!("{rule} fired"));
+                    }
+                }
+                Expect::NoEvidence(metric, value) => {
+                    if found
+                        .iter()
+                        .flat_map(|d| &d.evidence)
+                        .any(|e| e.metric == metric && e.value == value)
+                    {
+                        read.push(format!("{metric} evidence of {value}"));
+                    }
+                }
+                Expect::Fires(rule) => {
+                    if !found.iter().any(|d| d.rule == rule) {
+                        vacuous.push(format!("{rule} did not fire"));
+                    }
+                }
+            }
+        }
+        (read, vacuous)
+    }
+
+    /// REVIEW §2 exit clause 3: no detector reads a hard-coded `None` as
+    /// evidence. A source scan cannot see the sites that invent a value
+    /// rather than unwrap one, and flags dozens of lines that are fine, so
+    /// this is a behaviour table: each row leaves one input unmeasured and
+    /// names what must then be not run, or must not happen.
+    ///
+    /// Two rows are about the sampler rather than a detector, so they live
+    /// in `live.rs`: the idle radio
+    /// (`the_sampler_gives_an_idle_radio_no_retry_share`) and missing
+    /// interface info (`the_sampler_reads_missing_interface_info_as_unknown`).
+    #[test]
+    fn no_detector_reads_an_absent_input_as_evidence() {
+        let rows = absence_rows();
+        let mut problems = vec![];
+        for input in EXPECTED_UNTIL_0_33_A {
+            if !rows.iter().any(|r| r.input == *input) {
+                problems.push(format!("{input} is expected to fail but has no row"));
+            }
+        }
+        for row in &rows {
+            let (read, vacuous) = judge(row);
+            if !vacuous.is_empty() {
+                problems.push(format!(
+                    "{} proves nothing: {}",
+                    row.input,
+                    vacuous.join("; ")
+                ));
+            }
+            match (read.is_empty(), EXPECTED_UNTIL_0_33_A.contains(&row.input)) {
+                (false, false) => problems.push(format!(
+                    "{} read as evidence: {}",
+                    row.input,
+                    read.join("; ")
+                )),
+                (true, true) => problems.push(format!(
+                    "{} now abstains; remove it from EXPECTED_UNTIL_0_33_A",
+                    row.input
+                )),
+                _ => {}
+            }
+        }
+        assert!(problems.is_empty(), "\n{}", problems.join("\n"));
     }
 
     #[test]
@@ -3709,6 +5217,28 @@ mod tests {
         let old: Observations = serde_json::from_str(r#"{"now":"2026-09-14 10:00:00"}"#).unwrap();
         assert_eq!(old.now, "2026-09-14 10:00:00");
     }
+
+    #[test]
+    fn iface_obs_from_older_recordings_still_loads() {
+        // As 0.32 wrote it, with carrier and wireless as plain booleans.
+        let old: IfaceObs = serde_json::from_str(
+            r#"{"counter_window_secs":60.0,"name":"eth0","carrier":true,"rx_errors":0,
+                "tx_errors":0,"rx_dropped":0,"tx_dropped":0,"errors_per_min":0,
+                "drops_per_min":0,"link_rate_bps":1000000000.0,"rx_bps":3100000.0,
+                "tx_bps":2600000.0,"wireless":false,"signal_dbm":null,"tx_retry_pct":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old, eth0());
+        // Unknown is written as null and read back as unknown.
+        let unknown = IfaceObs {
+            carrier: None,
+            wireless: None,
+            ..eth0()
+        };
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(json["carrier"].is_null() && json["wireless"].is_null());
+        assert_eq!(serde_json::from_value::<IfaceObs>(json).unwrap(), unknown);
+    }
 }
 
 #[cfg(test)]
@@ -3731,7 +5261,7 @@ mod target_tests {
         })
     }
 
-    fn healthy() -> TargetObs {
+    pub(super) fn healthy() -> TargetObs {
         TargetObs {
             stale_after_secs: None,
             attempts: vec![],
@@ -3883,6 +5413,29 @@ mod target_tests {
     }
 
     #[test]
+    fn an_unread_clock_offset_is_unsupported_off_linux() {
+        let mut t = healthy();
+        t.tls_stage = err(StageError::CertExpired);
+        t.http_stage = None;
+        t.context.clock_offset_secs = None;
+        let d = detect_one(t);
+        let check = d
+            .causes
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|k| k.id == "clock_offset_large")
+            .expect("the clock cause is listed");
+        // Linux reads chrony and only misses a sample; the other platforms
+        // never read the local NTP status at all.
+        let expected = if cfg!(target_os = "linux") {
+            Availability::NotMeasured
+        } else {
+            Availability::Unsupported
+        };
+        assert_eq!(check.why_not, Some(expected));
+    }
+
+    #[test]
     fn an_untrusted_issuer_behind_a_proxy_reads_as_interception() {
         let mut t = healthy();
         t.tls_stage = err(StageError::CertUntrusted);
@@ -3964,5 +5517,51 @@ mod target_tests {
             })
             .unwrap();
         assert_eq!(top.id, "server_stage_slow");
+    }
+
+    #[test]
+    fn a_slow_connect_on_a_plain_http_target_says_it_has_no_tls_stage() {
+        let mut base = crate::diagnose::fixture::baselines();
+        for (metric, mean) in [("target.resolve_ms", 2.0), ("target.connect_ms", 12.0)] {
+            base.seed("api", metric, mean, mean / 10.0, 2_400);
+        }
+        let mut t = healthy();
+        t.port = 80;
+        t.tls = false;
+        t.tls_stage = None;
+        t.connect = ok(900.0);
+        let why = |t: TargetObs| {
+            let obs = Observations {
+                targets: vec![t],
+                ..Default::default()
+            };
+            let d = detect(&obs, &base, &Thresholds::default()).remove(0);
+            assert_eq!(d.rule, "target.slow_stage");
+            d.causes
+                .iter()
+                .flat_map(|c| &c.checks)
+                .map(|k| (k.id.clone(), (k.why_not.clone(), k.detail.clone())))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let checks = why(t.clone());
+        assert_eq!(
+            checks["tls_stage_above_baseline"],
+            (
+                Some(Availability::NotApplicable),
+                "this target has no tls stage".to_string()
+            )
+        );
+        // A stage the target has, timed but with no baseline yet, is still
+        // learning.
+        assert_eq!(
+            checks["server_stage_above_baseline"].0,
+            Some(Availability::Learning)
+        );
+        // A tls target whose probe returned no tls time was not measured.
+        t.tls = true;
+        assert_eq!(
+            why(t)["tls_stage_above_baseline"].0,
+            Some(Availability::NotMeasured)
+        );
     }
 }

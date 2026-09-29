@@ -1310,14 +1310,11 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
         }
     }
     if let Some(iface) = &obs.iface {
-        m.insert(
-            "iface.carrier".to_string(),
-            if iface.carrier { 1.0 } else { 0.0 },
-        );
-        m.insert(
-            "iface.error_rate".to_string(),
-            (iface.errors_per_min + iface.drops_per_min) as f64,
-        );
+        // Unknown carrier stays out, so link.down's verify cannot pass on it.
+        if let Some(up) = iface.carrier {
+            m.insert("iface.carrier".to_string(), if up { 1.0 } else { 0.0 });
+        }
+        m.insert("iface.error_rate".to_string(), iface.error_rate() as f64);
         if let Some(u) = iface.utilisation_pct() {
             m.insert("iface.utilisation".to_string(), u);
         }
@@ -1404,7 +1401,7 @@ fn metric_values(obs: &Observations) -> HashMap<String, f64> {
 mod tests {
     use super::*;
     use crate::diagnose::baseline::NetworkFingerprint;
-    use crate::diagnose::detectors::{DnsObs, GatewayObs, SocketObs};
+    use crate::diagnose::detectors::{DnsObs, GatewayObs, IfaceObs, SocketObs};
 
     fn base() -> BaselineStore {
         let mut b = BaselineStore::new(NetworkFingerprint::new(
@@ -2015,6 +2012,34 @@ mod tests {
         assert!(engine.get(&id).unwrap().state.is_open());
         clock.advance_secs(21);
         engine.observe(&obs(1.0), &base);
+        assert!(!engine.get(&id).unwrap().state.is_open());
+    }
+
+    /// Interface info that goes missing, as it does when a USB adapter is
+    /// pulled, is not the link coming back. link.down verifies only on a
+    /// carrier that was read.
+    #[test]
+    fn an_unknown_carrier_does_not_close_link_down() {
+        let (mut engine, clock) = engine_at("2026-09-03 06:48:10");
+        let base = base();
+        let link = |carrier| Observations {
+            iface: Some(IfaceObs {
+                carrier,
+                ..crate::diagnose::fixture::observations_at(0).iface.unwrap()
+            }),
+            ..Default::default()
+        };
+        assert!(!metric_values(&link(None)).contains_key("iface.carrier"));
+        engine.observe(&link(Some(false)), &base);
+        let id = engine.primary()[0].id.clone();
+        for _ in 0..10 {
+            clock.advance_secs(10);
+            engine.observe(&link(None), &base);
+        }
+        assert!(engine.get(&id).unwrap().state.is_open());
+        engine.observe(&link(Some(true)), &base);
+        clock.advance_secs(31);
+        engine.observe(&link(Some(true)), &base);
         assert!(!engine.get(&id).unwrap().state.is_open());
     }
 

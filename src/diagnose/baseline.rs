@@ -476,8 +476,9 @@ impl BaselineStore {
         self.learning(least)
     }
 
-    /// Seed a ready-made baseline. Used by the fixture and by tests; nothing
-    /// on the live path calls it. `samples` is credited as observation time at
+    /// Seed a ready-made baseline. Used by the fixture and by tests, and on a
+    /// live `App` only by the lab driver (`diagnose::lab`), which refuses to
+    /// run outside a temp home. `samples` is credited as observation time at
     /// the v1 cadence so seeded fixtures stay ready.
     pub fn seed(&mut self, subject: &str, metric: &str, mean: f64, sigma: f64, samples: u32) {
         let key = self.current.key();

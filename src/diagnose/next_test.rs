@@ -997,7 +997,7 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnose::issue::{Cause, CheckResult};
+    use crate::diagnose::issue::{Availability, Cause, CheckResult};
 
     fn issue(rule: &str, causes: Vec<Cause>) -> Issue {
         let d = crate::diagnose::detectors::Observations::default();
@@ -1032,17 +1032,32 @@ mod tests {
                 Cause::new(
                     "upstream_slow",
                     "u",
-                    vec![CheckResult::skipped("a", "a", "")],
+                    vec![CheckResult::not_run(
+                        "a",
+                        "a",
+                        Availability::NotMeasured,
+                        "",
+                    )],
                 ),
                 Cause::new(
                     "resolver_overloaded",
                     "o",
-                    vec![CheckResult::skipped("b", "b", "")],
+                    vec![CheckResult::not_run(
+                        "b",
+                        "b",
+                        Availability::NotMeasured,
+                        "",
+                    )],
                 ),
                 Cause::new(
                     "local_udp_path",
                     "l",
-                    vec![CheckResult::skipped("c", "c", "")],
+                    vec![CheckResult::not_run(
+                        "c",
+                        "c",
+                        Availability::NotMeasured,
+                        "",
+                    )],
                 ),
             ],
         )

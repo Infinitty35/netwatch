@@ -167,6 +167,7 @@ pub const CAUSES: &[CauseSpec] = &[
         checks: &[
             "alt_resolver_over_the_same_path_is_also_slow",
             "interface_drops",
+            "local_drop_counters",
         ],
     },
     CauseSpec {
@@ -226,7 +227,7 @@ pub const CAUSES: &[CauseSpec] = &[
     CauseSpec {
         rule: "tcp.retrans_burst",
         cause: "packet_loss",
-        checks: &["retransmits_observed"],
+        checks: &["retransmits_observed", "socket_rtt_below_queueing_line"],
     },
     CauseSpec {
         rule: "tcp.zero_window",
@@ -413,7 +414,7 @@ mod tests {
         for n in [
             "CheckResult::pass(",
             "CheckResult::fail(",
-            "CheckResult::skipped(",
+            "CheckResult::not_run(",
             "stage_check(",
         ] {
             source_checks.extend(literal_ids(n));

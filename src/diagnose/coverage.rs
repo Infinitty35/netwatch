@@ -7,44 +7,9 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Availability {
-    Available,
-    Learning,
-    NotMeasured,
-    Unsupported,
-    Stale,
-    NotConfigured,
-    NoSubjects,
-    NotApplicable,
-    AwaitingTest,
-    PermissionDenied,
-    CollectorFailed,
-    NotImplemented,
-    #[serde(other)]
-    Unknown,
-}
-
-impl Availability {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Available => "ready",
-            Self::Learning => "learning",
-            Self::NotMeasured => "not measured",
-            Self::Unsupported => "unsupported",
-            Self::Stale => "stale",
-            Self::NotConfigured => "not configured",
-            Self::NoSubjects => "no subjects",
-            Self::NotApplicable => "not applicable",
-            Self::AwaitingTest => "awaiting test",
-            Self::PermissionDenied => "permission denied",
-            Self::CollectorFailed => "collector failed",
-            Self::NotImplemented => "not implemented",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+/// Defined beside `CheckResult`, which carries it as `why_not`, so `issue.rs`
+/// still needs nothing but serde and fmt.
+pub use super::issue::Availability;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleCoverage {
@@ -206,6 +171,19 @@ impl Coverage {
                 ),
             }
         };
+        // Behind a local stub the resolver RTT is measured, so the rule stays
+        // available, but what it times is the stub answering root NS from its
+        // cache. The reason says so rather than implying the upstream is fast.
+        let stub = obs
+            .dns
+            .as_ref()
+            .filter(|d| d.rtt_p50_ms.is_some() && d.is_local_stub())
+            .map(|d| {
+                format!(
+                    "limited: measures the local stub at {}, not the upstream",
+                    d.resolver
+                )
+            });
         let mut coverage = Self { rules: rules::CATALOGUE.iter().map(|rule| {
             let (status, reason) = if let RuleStatus::Planned(reason) = rule.status {
                 (NotImplemented, reason)
@@ -214,12 +192,16 @@ impl Coverage {
                 "tcp.connect_failures" | "tcp.timewait_exhaustion" => obs.kernel.as_ref().map(|o| o.coverage(rule.id)).unwrap_or((if cfg!(target_os = "linux") { CollectorFailed } else { Unsupported }, "namespace TCP accounting unavailable")),
                 "egress.drift" | "egress.policy_violation" => obs.egress.as_ref().map(|o| o.coverage(rule.id)).unwrap_or((NotMeasured, "no fresh egress observation")),
                 "iface.errors" if obs.iface.as_ref().and_then(|i| i.counter_window_secs).is_some_and(|s| s < 60.0) => (Learning, "collecting a full elapsed minute of interface counter changes"),
+                "link.down" if obs.iface.as_ref().is_some_and(|i| i.carrier.is_none()) => (NotMeasured, "no interface info, so carrier state is unknown"),
+                "iface.errors" if obs.iface.as_ref().is_some_and(|i| i.drops_per_min.is_none()) => (Available, "interface error counters present; drops not counted on macOS"),
                 "link.down" | "iface.errors" => present(obs.iface.is_some(), "interface counters not measured"),
                 "iface.saturated" => present(obs.iface.as_ref().and_then(|i| i.utilisation_pct()).is_some(), "link rate or interface counters missing"),
-                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| !i.wireless) => (NotApplicable, "selected interface is not wireless"),
-                "wifi.weak_signal" => present(obs.iface.as_ref().is_some_and(|i| i.wireless && (i.signal_dbm.is_some() || i.tx_retry_pct.is_some())), "wireless signal/retries not measured"),
+                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| i.wireless == Some(false)) => (NotApplicable, "selected interface is not wireless"),
+                "wifi.weak_signal" if obs.iface.as_ref().is_some_and(|i| i.wireless.is_none()) => (NotMeasured, "not known whether the selected interface is wireless"),
+                "wifi.weak_signal" => present(obs.iface.as_ref().is_some_and(|i| i.wireless == Some(true) && (i.signal_dbm.is_some() || i.tx_retry_pct.is_some())), "wireless signal/retries not measured"),
                 "gateway.unreachable" => present(obs.gateway.as_ref().is_some_and(|g| g.addr.is_some() && g.internet_reachable.is_some()), "gateway and corroborating internet probe required"),
                 "gateway.rtt_spike" => baseline(obs.gateway.as_ref().and_then(|g| g.rtt_ms), obs.gateway.as_ref().and_then(|g| g.addr.as_deref()), "gateway.rtt"),
+                "dns.slow_resolver" if stub.is_some() => (Available, stub.as_deref().unwrap_or_default()),
                 "dns.slow_resolver" => present(obs.dns.as_ref().and_then(|d| d.rtt_p50_ms).is_some(), "resolver RTT not measured; absolute threshold remains usable without a baseline"),
                 "dns.failing" | "dns.truncation_retry" => present(obs.dns.as_ref().is_some_and(|d| d.queries > 0), "no DNS query outcomes measured"),
                 "dns.hijack_suspect" => present(obs.dns.as_ref().and_then(|d| d.cross.as_ref()).is_some(), "resolver cross-check not measured"),
@@ -530,6 +512,22 @@ mod tests {
                 .status,
             Availability::Learning
         );
+    }
+
+    #[test]
+    fn unknown_wireless_is_not_measured_not_not_applicable() {
+        let weak_signal = |wireless| {
+            let mut obs = fixture::observations_at(300);
+            obs.iface.as_mut().unwrap().wireless = wireless;
+            Coverage::from_observations(&obs, &fixture::baselines())
+                .rules
+                .into_iter()
+                .find(|r| r.rule == "wifi.weak_signal")
+                .unwrap()
+                .status
+        };
+        assert_eq!(weak_signal(Some(false)), Availability::NotApplicable);
+        assert_eq!(weak_signal(None), Availability::NotMeasured);
     }
 
     #[test]

@@ -21,6 +21,9 @@ use super::detectors::{
     SocketObs, SocketVerdict, Thresholds,
 };
 use crate::app::App;
+use crate::collectors::traceroute::{TracerouteResult, TracerouteStatus};
+use crate::collectors::traffic::InterfaceTraffic;
+use crate::platform::InterfaceInfo;
 
 /// Metrics fed to the baseline store every tick, each paired with the rule
 /// that consumes it.
@@ -52,6 +55,17 @@ fn link_rate_bps(iface: &str) -> Option<f64> {
 fn parse_link_speed(text: &str) -> Option<f64> {
     let mbps: i64 = text.trim().parse().ok()?;
     (mbps > 0).then_some(mbps as f64 * 1_000_000.0)
+}
+
+/// Frames a radio has to send in the retry window before its retry share
+/// says anything. An idle link sends a few management frames a minute, and
+/// no retries out of no frames is not 0%.
+pub(super) const WIFI_MIN_FRAMES: u64 = 1_000;
+
+/// Retries as a percentage of the frames sent over the same window, or
+/// `None` under [`WIFI_MIN_FRAMES`].
+fn retry_share(d_retries: u64, d_packets: u64) -> Option<f64> {
+    (d_packets >= WIFI_MIN_FRAMES).then(|| d_retries as f64 * 100.0 / d_packets as f64)
 }
 
 /// One probe result destined for the baseline store.
@@ -209,7 +223,13 @@ impl LiveSampler {
         let cfg = &app.config_collector.config;
         let mut out = Vec::new();
 
-        if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), health.dns_rtt_ms) {
+        // Learn the statistic the rule judges. `dns.slow_resolver` compares
+        // the rolling p50 of the probe history against this baseline, so the
+        // baseline has to be fed that p50 — feeding it the latest single probe
+        // taught it a noisier, lower number than the one it was later asked
+        // to judge, and the 3σ test drifted with the difference.
+        let dns_p50 = dns_p50_to_learn(health.dns_rtt_ms, &health.dns_rtt_history);
+        if let (Some(resolver), Some(rtt)) = (cfg.primary_dns(), dns_p50) {
             if health.completed.dns_target.as_ref() == Some(&resolver) {
                 if let Some(at) = self.fresh_reading("dns", health.completed.dns) {
                     out.push(Reading::new(resolver, "dns.rtt_p50", rtt, at));
@@ -372,8 +392,9 @@ impl LiveSampler {
         if !crate::collectors::health::ProbeTimes::fresh(completed, 15) {
             return None;
         }
+        let completed = completed?;
         if let Some((at, cached)) = &self.interface_sample {
-            if Some(*at) == completed && cached.name == app.capture_interface {
+            if *at == completed && cached.name == app.capture_interface {
                 return Some(cached.clone());
             }
         }
@@ -381,51 +402,66 @@ impl LiveSampler {
             .iter()
             .find(|i| i.name == app.capture_interface)?;
         let info = app.interface_info.iter().find(|i| i.name == t.name);
+        let observed = self.iface_obs(t, info, completed, crate::platform::IFACE_DROPS_COUNTED);
+        self.interface_sample = Some((completed, observed.clone()));
+        Some(observed)
+    }
 
+    /// One interface's observation from its counters and whatever the
+    /// platform said about it, with the per-minute windows moved on to
+    /// `completed`. `drops_counted` is [`crate::platform::IFACE_DROPS_COUNTED`]
+    /// in the app, and a parameter so tests can run the macOS case anywhere.
+    fn iface_obs(
+        &mut self,
+        t: &InterfaceTraffic,
+        info: Option<&InterfaceInfo>,
+        completed: Instant,
+        drops_counted: bool,
+    ) -> IfaceObs {
         let errors = t.rx_errors + t.tx_errors;
         let drops = t.rx_drops + t.tx_drops;
         let history = self
             .iface_history
             .entry(t.name.clone())
             .or_insert_with(|| IfaceCounters::new(errors, drops));
-        let (errors_per_min, drops_per_min) = history.observe(completed?, errors, drops);
+        let (errors_per_min, drops_per_min) = history.observe(completed, errors, drops);
         let counter_window_secs = Some(
-            completed?
+            completed
                 .saturating_duration_since(history.started_at)
                 .as_secs_f64()
                 .min(60.0),
         );
 
-        let wireless = info.and_then(|i| i.is_wireless).unwrap_or(false);
+        // No info is unknown, not "carrier up, wired", and info that does
+        // not say whether the link is a radio leaves just that unknown.
+        let wireless = info.and_then(|i| i.is_wireless);
         // Retries as a share of frames sent over the same minute. Both are
-        // lifetime counters, so the rate is delta over delta.
-        let tx_retry_pct = t.tx_retries.map(|retries| {
+        // lifetime counters, so the rate is delta over delta. The window
+        // moves every tick, idle or not, so it is already full when traffic
+        // starts.
+        let tx_retry_pct = t.tx_retries.and_then(|retries| {
             let (d_retries, d_packets) = self
                 .wifi_history
                 .entry(t.name.clone())
                 .or_insert_with(|| IfaceCounters::new(retries, t.tx_packets))
-                .observe(completed.unwrap(), retries, t.tx_packets);
-            if d_packets == 0 {
-                0.0
-            } else {
-                d_retries as f64 / d_packets as f64 * 100.0
-            }
+                .observe(completed, retries, t.tx_packets);
+            retry_share(d_retries, d_packets)
         });
 
-        let observed = IfaceObs {
+        IfaceObs {
             name: t.name.clone(),
-            carrier: info.map(|i| i.is_up).unwrap_or(true),
+            carrier: info.map(|i| i.is_up),
             rx_errors: t.rx_errors,
             tx_errors: t.tx_errors,
             rx_dropped: t.rx_drops,
             tx_dropped: t.tx_drops,
             counter_window_secs,
             errors_per_min,
-            drops_per_min,
+            drops_per_min: drops_counted.then_some(drops_per_min),
             // Wired only. A wifi PHY rate moves with every retrain and is
             // not the rate the link can carry, so on wifi the saturation
             // rule stays dormant rather than crying wolf.
-            link_rate_bps: if wireless {
+            link_rate_bps: if wireless == Some(true) {
                 None
             } else {
                 link_rate_bps(&t.name)
@@ -435,9 +471,7 @@ impl LiveSampler {
             tx_retry_pct,
             rx_bps: t.rx_rate,
             tx_bps: t.tx_rate,
-        };
-        self.interface_sample = Some((completed.unwrap(), observed.clone()));
-        Some(observed)
+        }
     }
 
     fn paths(&mut self, app: &App) -> Vec<PathObs> {
@@ -445,6 +479,24 @@ impl LiveSampler {
             Ok(r) => r.clone(),
             Err(_) => return vec![],
         };
+        self.paths_from(&result)
+    }
+
+    fn paths_from(&mut self, result: &TracerouteResult) -> Vec<PathObs> {
+        // A trace in progress has cleared the previous one's hops, but that
+        // trace is still the newest measurement of its path and stands until
+        // its 120 s run out. Dropping it for the tick a re-trace takes read as
+        // the path vanishing, which reset an opening path.rtt_spike's
+        // confirmation and a closing one's verify hold on every trace: with
+        // periodic traces, the rule could neither open nor close.
+        if result.status == TracerouteStatus::Running {
+            if let Some((at, path)) = self.path_samples.get(&result.target) {
+                if crate::collectors::health::ProbeTimes::fresh(Some(*at), 120) {
+                    self.completed.path = Some(*at);
+                    return vec![path.clone()];
+                }
+            }
+        }
         self.completed.path = result.completed;
         if result.target.is_empty()
             || result.hops.is_empty()
@@ -561,18 +613,20 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     let addr = cfg.gateway.clone()?;
     let health = app.health_prober.status();
 
-    // `HealthProber` starts every series at 100% loss, so the loss figure
-    // alone cannot distinguish "unreachable" from "not probed yet" — and on a
-    // fresh start that difference is a `critical` finding against a working
-    // router. The history deques are the honest signal: they are empty until
-    // a probe has actually published a result.
+    // No observation until a probe has actually measured something: the
+    // history deques only record measurements, and `gateway_loss` says when
+    // the latest cycle could not be sent at all. On a fresh start, or on a
+    // host where ICMP is blocked and the router answers no TCP port, there is
+    // nothing here to judge — not a `critical` finding against a working
+    // router.
     if health.gateway_rtt_history.is_empty()
         || !crate::collectors::health::ProbeTimes::fresh(health.completed.gateway, 30)
         || health.completed.gateway_target.as_ref() != Some(&addr)
     {
         return None;
     }
-    let icmp_ok = health.gateway_rtt_ms.is_some() && health.gateway_loss_pct < 100.0;
+    let loss_pct = health.gateway_loss.pct()?;
+    let icmp_ok = health.gateway_rtt_ms.is_some() && loss_pct < 100.0;
 
     // Corroborating evidence for a gateway verdict, on the same footing:
     // unknown until the internet probe has run at least once.
@@ -581,12 +635,15 @@ fn gateway(app: &App) -> Option<GatewayObs> {
     {
         None
     } else {
-        Some(health.internet_rtt_ms.is_some() && health.internet_loss_pct < 100.0)
+        health
+            .internet_loss
+            .pct()
+            .map(|p| health.internet_rtt_ms.is_some() && p < 100.0)
     };
     Some(GatewayObs {
         addr: Some(addr),
         rtt_ms: health.gateway_rtt_ms,
-        loss_pct: health.gateway_loss_pct,
+        loss_pct,
         internet_reachable,
         // No ARP probe yet, so this stays unknown. Mirroring the ICMP result
         // here made the checks assert "no arp reply from the gateway" about a
@@ -607,6 +664,10 @@ fn dns(app: &App) -> Option<DnsObs> {
     {
         return None;
     }
+
+    // A resolver the probe could not query (a scoped link-local address, no
+    // socket) is not a resolver failing 100% of queries; it is no observation.
+    let failure_rate_pct = health.dns_loss.pct()?;
 
     let samples: Vec<f64> = health.dns_rtt_history.iter().flatten().copied().collect();
     // One sample per probe, so the window is samples × the probe interval —
@@ -654,7 +715,7 @@ fn dns(app: &App) -> Option<DnsObs> {
         resolver,
         rtt_p50_ms: percentile(&samples, 0.5).or(health.dns_rtt_ms),
         rtt_p95_ms: percentile(&samples, 0.95),
-        failure_rate_pct: health.dns_loss_pct,
+        failure_rate_pct,
         truncation_rate_pct,
         queries: replies.max(health.dns_rtt_history.len() as u32),
         failed: health
@@ -688,6 +749,20 @@ fn nat(app: &App) -> Option<NatObs> {
 
 /// Nearest-rank percentile. `None` on an empty sample set rather than 0.0 —
 /// "no measurement" and "zero milliseconds" are different claims.
+/// The DNS p50 the baseline may learn from this cycle, or `None` when the
+/// cycle got no reply. The p50 comes from the history, which still holds the
+/// replies from before an outage; learning it while the resolver is silent
+/// would advance the baseline on timings that did not happen again, and
+/// narrow its spread with every failed probe.
+fn dns_p50_to_learn(
+    latest: Option<f64>,
+    history: &std::collections::VecDeque<Option<f64>>,
+) -> Option<f64> {
+    let latest = latest?;
+    let samples: Vec<f64> = history.iter().flatten().copied().collect();
+    percentile(&samples, 0.5).or(Some(latest))
+}
+
 fn percentile(values: &[f64], p: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -735,6 +810,49 @@ mod tests {
         assert!(sampler
             .fresh_reading("dns", Some(now + std::time::Duration::from_nanos(1)))
             .is_some());
+    }
+
+    #[test]
+    fn a_trace_in_progress_keeps_the_last_path() {
+        use crate::collectors::traceroute::TracerouteHop;
+        let hop = |n: u8, ip: &str, rtt: f64| TracerouteHop {
+            hop_number: n,
+            host: None,
+            ip: Some(ip.into()),
+            rtt_ms: vec![Some(rtt); 3],
+        };
+        let done = Instant::now();
+        let mut result = TracerouteResult {
+            completed: Some(done),
+            completed_at: "2026-09-27 12:00:00".into(),
+            target: "1.1.1.1".into(),
+            status: TracerouteStatus::Done,
+            hops: vec![hop(1, "192.0.2.2", 0.1), hop(2, "1.1.1.1", 80.0)],
+            reached: Some(true),
+        };
+        let mut sampler = LiveSampler::new();
+        let traced = sampler.paths_from(&result);
+        assert_eq!(traced.len(), 1);
+
+        // What TracerouteRunner::run leaves while the next trace runs: the
+        // last trace stands, as the same sample rather than a new one, so it
+        // neither drops out of a confirmation nor counts toward one twice.
+        result.status = TracerouteStatus::Running;
+        result.completed = None;
+        result.hops.clear();
+        assert_eq!(sampler.paths_from(&result), traced);
+        assert_eq!(sampler.completed.path, Some(done));
+
+        // Past its 120 s it stands for nothing, running trace or not.
+        sampler.path_samples.get_mut("1.1.1.1").unwrap().0 =
+            done - std::time::Duration::from_secs(121);
+        assert!(sampler.paths_from(&result).is_empty());
+        assert_eq!(sampler.completed.path, None);
+
+        // Nor does a trace of another target.
+        sampler.path_samples.get_mut("1.1.1.1").unwrap().0 = done;
+        result.target = "9.9.9.9".into();
+        assert!(sampler.paths_from(&result).is_empty());
     }
 
     #[test]
@@ -813,6 +931,121 @@ mod tests {
         }
     }
 
+    /// Counters for one interface at one moment, everything else zero.
+    fn traffic(name: &str, tx_packets: u64, tx_retries: Option<u64>) -> InterfaceTraffic {
+        InterfaceTraffic {
+            name: name.into(),
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            rx_bytes_total: 0,
+            tx_bytes_total: 0,
+            rx_packets: 0,
+            tx_packets,
+            rx_errors: 0,
+            tx_errors: 0,
+            rx_drops: 0,
+            tx_drops: 0,
+            signal_dbm: None,
+            tx_retries,
+            rx_history: Default::default(),
+            tx_history: Default::default(),
+            sample_times: Default::default(),
+        }
+    }
+
+    fn info(name: &str, is_wireless: Option<bool>) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.into(),
+            ipv4: None,
+            ipv6: None,
+            mac: None,
+            mtu: None,
+            is_up: true,
+            is_wireless,
+        }
+    }
+
+    /// C04's missing-info row, through the sampler. An interface the
+    /// platform gave no info for used to read as carrier up and wired.
+    #[test]
+    fn the_sampler_reads_missing_interface_info_as_unknown() {
+        let mut sampler = LiveSampler::new();
+        let t = traffic("nwtest0", 0, None);
+        let obs = sampler.iface_obs(&t, None, Instant::now(), true);
+        assert_eq!((obs.carrier, obs.wireless), (None, None));
+        // Info that does not say whether the link is a radio leaves only
+        // that unknown.
+        let obs = sampler.iface_obs(&t, Some(&info("nwtest0", None)), Instant::now(), true);
+        assert_eq!((obs.carrier, obs.wireless), (Some(true), None));
+    }
+
+    /// Where the platform counts no drops (macOS), the recording says so
+    /// with a null rather than a 0. Both cases run on every platform.
+    #[test]
+    fn the_sampler_records_no_drop_rate_where_drops_are_not_counted() {
+        let t = traffic("nwtest0", 0, None);
+        for counted in [true, false] {
+            let obs = LiveSampler::new().iface_obs(&t, None, Instant::now(), counted);
+            assert_eq!(obs.drops_per_min.is_some(), counted);
+            let json = serde_json::to_value(&obs).unwrap();
+            assert_eq!(json["drops_per_min"].is_null(), !counted, "{json}");
+        }
+    }
+
+    #[test]
+    fn an_idle_radio_has_no_retry_share() {
+        assert_eq!(retry_share(0, 0), None, "no frames is not 0%");
+        assert_eq!(retry_share(40, 999), None, "one frame short");
+    }
+
+    #[test]
+    fn a_busy_radio_reports_its_share() {
+        assert_eq!(retry_share(70, 1_000), Some(7.0));
+        assert_eq!(retry_share(0, 5_000), Some(0.0), "a busy clean link is 0%");
+    }
+
+    /// C04's idle-radio row, through the sampler. A radio that sends nothing
+    /// for a minute has no retry share, where it used to read 0%. The window
+    /// keeps moving while it idles, so the share appears once traffic has
+    /// sent enough frames.
+    #[test]
+    fn the_sampler_gives_an_idle_radio_no_retry_share() {
+        use crate::diagnose::coverage::{Availability, Coverage};
+        let mut sampler = LiveSampler::new();
+        let wlan0 = info("wlan0", Some(true));
+        let start = Instant::now();
+        let at = |s: u64| start + std::time::Duration::from_secs(s);
+        let mut idle_minute = None;
+        for s in 0..=60 {
+            let idle = traffic("wlan0", 5_000, Some(300));
+            let obs = sampler.iface_obs(&idle, Some(&wlan0), at(s), true);
+            assert_eq!(obs.tx_retry_pct, None, "idle, second {s}");
+            idle_minute = Some(obs);
+        }
+        // With no signal level either, the rule has nothing to judge.
+        let coverage = Coverage::from_observations(
+            &Observations {
+                iface: idle_minute,
+                ..Default::default()
+            },
+            &crate::diagnose::fixture::baselines(),
+        );
+        let weak_signal = coverage
+            .rules
+            .iter()
+            .find(|r| r.rule == "wifi.weak_signal")
+            .unwrap();
+        assert_eq!(weak_signal.status, Availability::NotMeasured);
+        assert_eq!(weak_signal.reason, "wireless signal/retries not measured");
+        // 50 frames a second, 5 of them retried: 1,000 frames by second 20.
+        for s in 1..=20 {
+            let busy = traffic("wlan0", 5_000 + 50 * s, Some(300 + 5 * s));
+            let obs = sampler.iface_obs(&busy, Some(&wlan0), at(60 + s), true);
+            let want = (s >= 20).then_some(10.0);
+            assert_eq!(obs.tx_retry_pct, want, "busy, second {s}");
+        }
+    }
+
     #[test]
     fn subnet_of_collapses_a_host_address() {
         assert_eq!(subnet_of("192.168.8.42"), "192.168.8.0/24");
@@ -870,6 +1103,22 @@ mod tests {
                 verify.metric
             );
         }
+    }
+
+    #[test]
+    fn a_dns_cycle_without_a_reply_teaches_the_baseline_nothing() {
+        let history: std::collections::VecDeque<Option<f64>> =
+            [Some(12.0), Some(14.0), Some(13.0), None].into();
+        // The resolver stopped answering: the history still has old replies,
+        // but this cycle measured nothing.
+        assert_eq!(dns_p50_to_learn(None, &history), None);
+        // A reply this cycle learns the p50 the rule judges.
+        assert_eq!(dns_p50_to_learn(Some(13.0), &history), Some(13.0));
+        // A first reply with no history yet learns that reply.
+        assert_eq!(
+            dns_p50_to_learn(Some(9.0), &std::collections::VecDeque::new()),
+            Some(9.0)
+        );
     }
 
     #[test]
