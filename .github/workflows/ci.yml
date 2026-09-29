@@ -113,8 +113,20 @@ jobs:
       - name: Build the probe example
         run: cargo build --example diagnose_probe
 
+      # The same AppArmor restriction the health lab lifts: without this the
+      # unshare below is refused, and before pipefail the tee hid that, so
+      # this job was green without ever running the lab.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: Run the fault lab
-        run: unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py | tee fault-lab.json
+        shell: bash
+        run: |
+          set -o pipefail
+          unshare --user --map-root-user --net python3 tests/diagnose/fault_lab.py | tee fault-lab.json
 
       - name: Keep the results
         if: always()

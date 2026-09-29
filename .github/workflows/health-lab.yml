@@ -61,6 +61,15 @@ jobs:
       - name: Build the examples
         run: cargo build --examples
 
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+      # which refuses the uid_map write every unshare in the lab needs
+      # ("write failed /proc/self/uid_map: Operation not permitted").
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       # Answers one question before the lab relies on it: will this runner
       # give an unprivileged user a user, network and mount namespace in which
       # sysfs can be remounted and a netem qdisc added? It fails rather than
