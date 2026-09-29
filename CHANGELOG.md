@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.33.0] - 2026-09-29
 
 Diagnose stops reading what it did not measure as evidence. A check that
 could not run now says why instead of passing, a probe that sent nothing no
